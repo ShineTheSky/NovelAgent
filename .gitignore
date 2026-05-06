@@ -22,3 +22,15 @@ web/dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# 文件
+待办事项.md
+需求文档.md
+项目计划.md
+验收测试.md
+
+#输出
+workspace/
+
+#测试
+tests/
