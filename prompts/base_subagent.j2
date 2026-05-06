@@ -1,0 +1,15 @@
+
+
+{% include 'partials/safety_prompt.j2' %}
+
+{% include 'partials/tools_prompt.j2' %}
+
+{% if memory_enabled %}
+{% include 'partials/memory_prompt.j2' %}
+{% endif %}
+
+{% include 'dynamic/project_info.j2' %}
+
+{{ extra_context }}
+
+{{ role_definition }}

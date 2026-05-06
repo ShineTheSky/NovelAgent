@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip --version)",
+      "Bash(npm --version)",
+      "Bash(pip list *)",
+      "Bash(pip install *)",
+      "Bash(python *)",
+      "Bash(npm create *)",
+      "Bash(timeout 5 curl -s -N -X POST \"http://localhost:8000/api/sessions/47cce273-2504-43cb-8091-f41203b321e5/message\" -H \"Content-Type: application/json\" -d '{\"content\":\"你好\",\"action\":\"send\"}')",
+      "Bash(timeout 5 curl -s -N -X POST \"http://localhost:8000/api/sessions/47cce273-2504-43cb-8091-f41203b321e5/message\" -H \"Content-Type: application/json\" --data-raw '{\"content\":\"hello\",\"action\":\"send\"}')",
+      "Bash(npx vite *)",
+      "Bash(curl -s -X POST \"http://localhost:8000/api/projects/ff77ac7f-3171-4421-9ddb-070cb0cbe39c/sessions\" -H \"Content-Type: application/json\" -d '{}')",
+      "Bash(timeout 60 curl -s -N -X POST \"http://localhost:8000/api/sessions/a209b939-40b9-4e5f-a209-3541cb69720d/message\" -H \"Content-Type: application/json\" -d @/tmp/memtest.json)",
+      "Bash(timeout 90 curl -s -N -X POST \"http://localhost:8000/api/sessions/a209b939-40b9-4e5f-a209-3541cb69720d/message\" -H \"Content-Type: application/json\" --data-raw '{\"content\":\"请记住：我的主角令狐冲最喜欢的食物是叫花鸡，这个设定很重要\",\"action\":\"send\"}')",
+      "Bash(npx tsc *)"
+    ]
+  }
+}

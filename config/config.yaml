@@ -1,0 +1,36 @@
+# NovelAgent2 主配置文件
+
+# 项目工作目录（所有文件操作限制在此目录内，相对路径相对于项目根目录）
+working_dir: "./workspace"
+
+# 安全配置
+security:
+  bash:
+    working_dir: "./workspace"
+    command_timeout: 30        # 秒
+    max_output_size: 10240     # 字节（10KB）
+
+  # Write/Edit 自动放行规则（glob模式）
+  write_allow_rules:
+    - pattern: "chapters/**"
+    - pattern: ".memory/characters/**"
+    - pattern: ".memory/plots/**"
+    - pattern: ".memory/world/**"
+    - pattern: ".memory/user_prefs.md"
+    - pattern: "outline.md"
+
+# 会话配置
+session:
+  token_limit: 150000           # 消息列表Token上限
+  compression_threshold: 0.8    # 压缩触发阈值（80%）
+  max_turns: 20                # 单次任务最大循环轮次
+
+# Agent Loop 配置
+agent:
+  loop_detection_threshold: 3  # 连续相同工具调用视为循环
+  auto_memory_interval: 5      # 自动记忆轮询间隔（轮）
+
+# 日志配置
+logging:
+  level: "INFO"                 # DEBUG / INFO / WARNING / ERROR
+  format: "json"                # json / text
