@@ -10,11 +10,14 @@ from novelagent.tools.base import ToolContext, ToolResult, PermissionResult
 from novelagent.context.message_manager import Message, MessageManager
 from novelagent.security.audit import audit_log
 from novelagent.core.llm_turn import build_assistant_message
+from novelagent.trace.recorder import TraceRecorder
+from novelagent.memory.memory_manager import MemoryManager
 
 
 class AgentLoop:
     def __init__(self, llm_client, tool_registry, permission_checker, context_builder, memory_manager,
-                 config: dict | None = None, subagent_runner=None):
+                 config: dict | None = None, subagent_runner=None, trace_recorder: TraceRecorder | None = None,
+                 post_turn_analyzer=None, preference_context_provider=None, rag_store=None):
         self.llm = llm_client
         self.tools = tool_registry
         self.security = permission_checker
@@ -27,17 +30,65 @@ class AgentLoop:
         self.loop_threshold = self._config.get("loop_detection_threshold", 3)
         self.auto_memory_interval = self._config.get("auto_memory_interval", 5)
         self.working_dir = self._config.get("working_dir", "./workspace")
+        self.trace = trace_recorder
+        self.post_turn_analyzer = post_turn_analyzer
+        self.preference_context_provider = preference_context_provider
+        self.rag_store = rag_store
 
     async def run(self, request: InternalRequest, session: Session, project_info: dict | None = None) -> ResponseChunk:
         trace_id = hashlib.md5(f"{session.session_id}{time.time()}".encode()).hexdigest()[:8]
+        if self.trace:
+            trace_id = await self.trace.start(session.session_id, session.project_id, request.content)
+
+        async def record(event_type: str, actor: str, payload: dict | None = None,
+                         parent_event_id: str | None = None, duration_ms: float | None = None):
+            if not self.trace:
+                return None
+            try:
+                return await self.trace.record(trace_id, event_type, actor, payload, parent_event_id, duration_ms)
+            except Exception as exc:
+                print(f"[trace] record failed: {exc}", flush=True)
+                return None
+
+        async def finish(status: str, answer: str = "", token_count: int = 0):
+            if not self.trace:
+                return
+            try:
+                await self.trace.finish(trace_id, status, answer, token_count)
+            except Exception as exc:
+                print(f"[trace] finish failed: {exc}", flush=True)
         pi = project_info or {}
 
+        # 记忆属于具体小说项目。Trace 生成的原子记忆写入同一目录，
+        # 后续请求可通过现有预取链路重新取回。
+        import os as _os
+        project_memory = MemoryManager(_os.path.join(self.working_dir, session.project_id), self.llm)
+
         # 1. Async memory prefetch
-        prefetch_task = asyncio.create_task(self.memory.on_user_input(request.content))
+        prefetch_task = asyncio.create_task(project_memory.on_user_input(request.content))
 
         # 2. Get memory index
-        memory_md = self.memory.get_index_content()
+        memory_md = project_memory.get_index_content()
         tools_prompt = self.tools.get_tools_prompt()
+        preference_context = ""
+        if self.preference_context_provider:
+            try:
+                preference_context = await self.preference_context_provider.render(session.project_id)
+            except Exception as exc:
+                print(f"[trace] preference context failed: {exc}", flush=True)
+
+        # Retrieve project-scoped reference material before building the prompt.
+        # This is intentionally best-effort: an empty or unavailable library
+        # must never prevent ordinary writing from working.
+        rag_context = ""
+        rag_results = []
+        if self.rag_store:
+            try:
+                rag_context, rag_results = await self.rag_store.format_context(
+                    session.project_id, request.content, limit=5,
+                )
+            except Exception as exc:
+                print(f"[rag] retrieval failed: {exc}", flush=True)
 
         # 3. Build context (sync with prefetch)
         history_msgs = [Message.from_dict(m) for m in session.messages] if session.messages else []
@@ -50,7 +101,17 @@ class AgentLoop:
             memory_md_content=memory_md,
             tools_description=tools_prompt,
             history_messages=history_msgs + [current_user_msg],
+            preference_context=preference_context,
         )
+        await record("context_built", "system", {
+            "history_message_count": len(history_msgs),
+            "memory_index_present": bool(memory_md),
+            "confirmed_preference_count": preference_context.count("\n-") + (1 if preference_context.startswith("-") else 0),
+            "rag_result_count": len(rag_results),
+        })
+
+        if rag_context:
+            ctx.messages.insert(-1, Message(role="system", content=rag_context))
 
         # 4. Wait for prefetch (1.5s timeout)
         memory_injection = []
@@ -64,7 +125,6 @@ class AgentLoop:
             pass
 
         # 5. Tool context — working_dir 指向具体项目目录
-        import os as _os
         project_working_dir = _os.path.join(self.working_dir, session.project_id)
         tool_ctx = ToolContext(
             session_id=session.session_id,
@@ -82,6 +142,7 @@ class AgentLoop:
             t0 = time.time()
             print(f"[compress] 进入循环前触发压缩: {pre_check_tokens} tokens", flush=True)
             yield ResponseChunk(type="thinking", data={"content": "上下文过长，正在压缩…"})
+            await record("context_compression", "system", {"before_token_count": pre_check_tokens})
             # 发送完整消息历史给 LLM 生成摘要
             try:
                 non_system = [m for m in ctx.messages if m.role != "system"]
@@ -118,11 +179,16 @@ class AgentLoop:
         while turn < self.max_turns:
             turn += 1
             if session.stop_requested:
+                await record("interrupted", "user", {"reason": "stop_requested"})
+                await finish("interrupted")
                 yield ResponseChunk(type="done", data={"finish_reason": "interrupted", "message": "用户中断"})
                 return
 
             llm_messages = ctx.to_llm_messages()
             tool_schemas = self.tools.get_schemas()
+            await record("llm_request", "main_agent", {
+                "turn": turn, "position": "main_loop", "message_count": len(llm_messages), "tool_count": len(tool_schemas),
+            })
 
             # Debug: 打印请求消息
             import sys
@@ -155,7 +221,9 @@ class AgentLoop:
                         print(f"[LLM:main] 请求消息数={len(llm_messages)}", flush=True)
                         for i, m in enumerate(llm_messages[-6:]):
                             print(f"  [{i}] {json.dumps(m, ensure_ascii=False)[:200]}", flush=True)
-                        yield ResponseChunk(type="error", data={"message": chunk.error})
+                        await record("error", "main_agent", {"message": chunk.error, "turn": turn})
+                        await finish("failed")
+                        yield ResponseChunk(type="error", data={"message": chunk.error, "trace_id": trace_id})
                         return
                     elif chunk.type == "done":
                         break
@@ -163,9 +231,17 @@ class AgentLoop:
                 import traceback
                 print(f"[LLM] 调用异常: {e}", flush=True)
                 traceback.print_exc()
-                yield ResponseChunk(type="error", data={"message": f"LLM调用失败: {e}"})
+                await record("error", "main_agent", {"message": str(e), "turn": turn})
+                await finish("failed")
+                yield ResponseChunk(type="error", data={"message": f"LLM调用失败: {e}", "trace_id": trace_id})
                 return
 
+            await record("assistant_turn", "main_agent", {
+                "turn": turn,
+                "content": full_response,
+                "reasoning_content": full_reasoning,
+                "tool_names": [call.tool_name for call in current_tool_calls],
+            })
             print(f"[LLM:main] 循环结束: turn={turn}, text_len={len(full_response)}, tool_calls={len(current_tool_calls)}", flush=True)
 
             # No tool calls → final answer
@@ -182,6 +258,7 @@ class AgentLoop:
             for tc in current_tool_calls:
                 tool_name = tc.tool_name
                 params = tc.tool_input
+                tool_event_id = await record("tool_call", "main_agent", {"tool": tool_name, "params": params, "turn": turn})
 
                 # Security check
                 tool = self.tools.get(tool_name)
@@ -189,6 +266,8 @@ class AgentLoop:
 
                 if perm == PermissionResult.BLOCK:
                     error_msg = f"操作被安全策略禁止: {tool_name}"
+                    await record("permission", "system", {"tool": tool_name, "decision": "block"}, tool_event_id)
+                    await record("tool_result", "tool", {"tool": tool_name, "success": False, "error": error_msg}, tool_event_id)
                     yield ResponseChunk(type="error", data={"message": error_msg})
                     ctx.messages.append(Message(role="tool_result", content=error_msg, tool_call_id=tool_name))
                     continue
@@ -200,6 +279,7 @@ class AgentLoop:
                         "tool": tool_name,
                         "params_summary": str(params)[:200],
                     })
+                    await record("permission", "system", {"tool": tool_name, "decision": "ask", "params_summary": str(params)[:200]}, tool_event_id)
                     # 阻塞等待用户确认
                     await session.permission_event.wait()
                     if not session.permission_granted:
@@ -207,9 +287,12 @@ class AgentLoop:
                         yield ResponseChunk(type="tool_result", data={
                             "tool": tool_name, "success": False, "error": error_msg,
                         })
+                        await record("permission_response", "user", {"tool": tool_name, "allowed": False}, tool_event_id)
+                        await record("tool_result", "tool", {"tool": tool_name, "success": False, "error": error_msg}, tool_event_id)
                         ctx.messages.append(Message(role="tool_result", content=error_msg, tool_call_id=tool_name))
                         continue
                     # 用户同意 → 记录到会话内批准列表
+                    await record("permission_response", "user", {"tool": tool_name, "allowed": True}, tool_event_id)
                     tool_ctx.mark_allowed(f"{tool_name}:{hashlib.md5(str(params).encode()).hexdigest()[:8]}")
 
                 # Execute tool — AskUserQuestion pauses and waits for user
@@ -217,6 +300,7 @@ class AgentLoop:
                     yield ResponseChunk(type="question_ask", data={
                         "questions": params.get("questions", []),
                     })
+                    await record("question_ask", "main_agent", {"questions": params.get("questions", [])}, tool_event_id)
                     session.question_event = asyncio.Event()
                     session.question_answers = None
                     await session.question_event.wait()
@@ -231,6 +315,8 @@ class AgentLoop:
                         "success": True,
                         "data": json.dumps(answers, ensure_ascii=False),
                     })
+                    await record("user_answer", "user", {"answers": answers}, tool_event_id)
+                    await record("tool_result", "tool", {"tool": tool_name, "success": True, "data": answers}, tool_event_id)
                     continue
 
                 # Execute tool — SubAgent gets special streaming treatment
@@ -246,7 +332,12 @@ class AgentLoop:
                         show_result = preset_config.get("show_result", False) if preset_config else False
                     t0 = time.time()
                     subagent_result_text = ""
-                    async for sub_chunk in self.subagent_runner.spawn_and_run(preset, task, session, inherit, extra_context="", attachments=attachments):
+                    async for sub_chunk in self.subagent_runner.spawn_and_run(
+                        preset, task, session, inherit,
+                        extra_context=rag_context,
+                        attachments=attachments,
+                    ):
+                        await record(f"subagent_{sub_chunk.type}", f"subagent:{preset}", sub_chunk.data, tool_event_id)
                         if sub_chunk.type == "subagent_done":
                             subagent_result_text = sub_chunk.data.get("result", "")
                             # 转发subagent_done让前端显示完成消息+结果预览
@@ -271,6 +362,12 @@ class AgentLoop:
                           "BLOCK" if perm == PermissionResult.BLOCK else "ALLOWED",
                           result.data if result.success else result.error,
                           duration)
+                await record("tool_result", "tool", {
+                    "tool": tool_name,
+                    "success": result.success,
+                    "data": result.data if result.success else "",
+                    "error": result.error if not result.success else "",
+                }, tool_event_id, duration)
 
                 # SubAgent的结果已通过subagent_done事件推送给前端，不再重复发送tool_result
                 if tool_name != "SubAgent":
@@ -302,46 +399,26 @@ class AgentLoop:
                 loop_count = getattr(self, '_loop_count', 0) + 1
                 self._loop_count = loop_count
                 if loop_count >= self.loop_threshold:
+                    await record("loop_detected", "system", {"turn": turn})
+                    await finish("interrupted")
                     yield ResponseChunk(type="done", data={"finish_reason": "loop_detected"})
                     return
             else:
                 self._loop_count = 0
             last_tool_calls = current_tool_calls
 
-        # 7. Auto memory — 每轮结束后台提取记忆
-        if self.subagent_runner:
-            import asyncio as _asyncio
-            _asyncio.create_task(self._extract_memories(session))
-
-        # 8. Done
+        # 7. The analyzer derives trace-backed atomic memories after the immutable trace is complete.
         token_count = self.context_builder.token_counter.count_messages(ctx.to_llm_messages())
         session.messages = [m.to_dict() for m in ctx.messages]
+        await record("completed", "system", {"turns": turn, "token_count": token_count})
+        await finish("completed", final_text, token_count)
+        if self.post_turn_analyzer:
+            asyncio.create_task(self.post_turn_analyzer.analyze(trace_id, session.project_id))
+
+        # 8. Done
         yield ResponseChunk(type="done", data={
             "finish_reason": "complete",
             "turns": turn,
             "token_count": token_count,
+            "trace_id": trace_id,
         })
-
-    async def _extract_memories(self, session):
-        """后台异步运行 memory_extractor 子Agent 提取记忆"""
-        try:
-            filtered_session = Session(
-                session_id=session.session_id,
-                project_id=session.project_id,
-                messages=[m for m in session.messages
-                          if m.get('role') in ('user', 'assistant')
-                          and not m.get('tool_calls')
-                          and m.get('content', '').strip()],
-            )
-            # memory.md 作为 extra_context 动态注入模板末尾
-            memory_index = self.memory.get_index_content()
-            async for chunk in self.subagent_runner.spawn_and_run(
-                "memory_extractor",
-                "回顾以上对话，提取需要长期记忆的信息。如果没有值得记忆的内容，只回复'无'。",
-                filtered_session,
-                inherit_history=True,
-                extra_context=f"## 当前记忆索引\n{memory_index}",
-            ):
-                pass
-        except Exception as e:
-            print(f"[memory_extractor] 失败: {e}", flush=True)

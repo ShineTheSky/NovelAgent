@@ -25,6 +25,7 @@ Web UI (React) ← SSE → FastAPI Server → Agent Loop (ReAct)
 | 第5层 安全层 | 三层权限检查、Bash命令两级分类、路径沙箱、审计 |
 | 第6层 上下文层 | System Prompt管理、消息列表、Token计算、LLM摘要压缩 |
 | 第7层 记忆层 | 文件化存储(.memory/)、memory.md索引、异步预取、memory_extractor子Agent |
+| 参考资料层 | 项目级文章导入、段落分块、本地BM25检索、写作上下文注入 |
 
 ## 快速开始
 
@@ -149,6 +150,15 @@ Write/Edit 默认弹窗确认。以下情况自动放行：
 | `/api/sessions/{id}/permission-response` | POST | 权限确认响应 |
 | `/api/sessions/{id}/question-response` | POST | AskUserQuestion 问答响应 |
 | `/api/sessions/{id}/accept-edits` | POST | 切换 acceptEdits 模式 |
+| `/api/projects/{id}/rag/documents` | GET/POST | 查看或导入参考文章（TXT/Markdown文本） |
+| `/api/projects/{id}/rag/documents/{document_id}` | DELETE | 删除参考文章及其分块 |
+| `/api/projects/{id}/rag/search?q=...` | GET | 手动检索参考片段 |
+
+### 参考资料库（RAG）
+
+在项目页点击“资料库”，可导入 TXT 或 Markdown 文章。系统会按段落切分为约 900 字的小块，并保留约 120 字重叠内容。发送写作、续写或润色请求时，系统会在当前项目的资料库中自动检索最多 5 个相关片段，作为只读参考注入主 Agent 和子 Agent 上下文。
+
+当前检索器使用本地 BM25，不需要额外的向量数据库或 embedding API，适合离线使用；后续可以在 `novelagent/rag/store.py` 中替换为向量检索实现。
 
 ### SSE 事件类型
 

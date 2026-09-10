@@ -8,6 +8,7 @@ import type {
   StreamEvent,
 } from '../types/chat';
 import type { LLMPositionUpdate, LLMSettings, ProviderSettingsUpdate } from '../types/llm';
+import type { MemoryPattern, TraceMemory } from '../types/insights';
 
 const BASE = '/api';
 
@@ -17,6 +18,24 @@ export interface FileNode {
   type: 'file' | 'directory';
   size?: number;
   children?: FileNode[];
+}
+
+export interface RagDocument {
+  document_id: string;
+  title: string;
+  source_name: string;
+  created_at?: string;
+  chunk_count: number;
+}
+
+export interface RagSearchResult {
+  chunk_id: string;
+  document_id: string;
+  chunk_index: number;
+  content: string;
+  title: string;
+  source_name: string;
+  score: number;
 }
 
 export class ApiError extends Error {
@@ -222,6 +241,26 @@ export function fetchFileContent(projectId: string, filePath: string, signal?: A
   );
 }
 
+export function listRagDocuments(projectId: string) {
+  return requestJson<RagDocument[]>(`/projects/${resourceId(projectId)}/rag/documents`);
+}
+
+export function importRagDocument(projectId: string, title: string, content: string, sourceName = '') {
+  return requestJson<RagDocument>(`/projects/${resourceId(projectId)}/rag/documents`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title, content, source_name: sourceName }),
+  });
+}
+
+export function deleteRagDocument(projectId: string, documentId: string) {
+  return requestJson<void>(`/projects/${resourceId(projectId)}/rag/documents/${resourceId(documentId)}`, { method: 'DELETE' });
+}
+
+export function searchRag(projectId: string, query: string) {
+  return requestJson<RagSearchResult[]>(`/projects/${resourceId(projectId)}/rag/search?q=${encodeURIComponent(query)}&limit=5`);
+}
+
 export function getLLMSettings() {
   return requestJson<LLMSettings>('/settings/llm');
 }
@@ -240,6 +279,18 @@ export function saveProviderSettings(providers: Record<string, ProviderSettingsU
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ providers }),
   });
+}
+
+export function fetchMemoryPatterns(projectId: string) {
+  return requestJson<MemoryPattern[]>(`/projects/${resourceId(projectId)}/memory-patterns`);
+}
+
+export function fetchTraceMemories(projectId: string) {
+  return requestJson<TraceMemory[]>(`/projects/${resourceId(projectId)}/trace-memories`);
+}
+
+export function fetchTraceMemory(projectId: string, memoryId: string) {
+  return requestJson<TraceMemory>(`/projects/${resourceId(projectId)}/trace-memories/${resourceId(memoryId)}`);
 }
 
 export type { Message };

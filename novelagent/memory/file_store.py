@@ -37,15 +37,15 @@ class FileStore:
                     except yaml.YAMLError:
                         pass
 
-        # Build frontmatter
-        frontmatter = {
-            "type": existing.get("type", ""),
-            "tags": existing.get("tags", []),
-            "summary": existing.get("summary", ""),
-            "created": existing.get("created", now),
-            "updated": now,
-            "status": existing.get("status", "active"),
-        }
+        # 保留 Trace 来源等扩展元数据。旧实现会在二次写入时丢弃它们，
+        # 导致记忆无法回溯到产生它的交互。
+        frontmatter = dict(existing)
+        frontmatter.setdefault("type", "")
+        frontmatter.setdefault("tags", [])
+        frontmatter.setdefault("summary", "")
+        frontmatter.setdefault("created", now)
+        frontmatter.setdefault("status", "active")
+        frontmatter["updated"] = now
 
         # Extract frontmatter from new content if provided
         body = content

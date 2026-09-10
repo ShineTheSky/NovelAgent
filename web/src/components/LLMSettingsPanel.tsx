@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { createPortal } from 'react-dom';
 import { getLLMSettings, saveLLMSettings, saveProviderSettings } from '../api/client';
 import type { LLMPositionSetting, LLMSettings } from '../types/llm';
 
@@ -7,7 +8,12 @@ type SettingsTab = 'providers' | 'agents';
 interface ProviderDraft {
   baseUrl: string;
   apiKey: string;
+  modelsText: string;
   storage: 'persistent' | 'temporary';
+}
+
+function parseModelNames(value: string) {
+  return value.split(/[\n,]/).map(model => model.trim()).filter(Boolean);
 }
 
 function errorText(error: unknown) {
@@ -34,6 +40,7 @@ export function LLMSettingsPanel() {
       setProviderDrafts(Object.fromEntries(data.providers.map(provider => [provider.key, {
         baseUrl: provider.base_url,
         apiKey: '',
+        modelsText: provider.models.map(model => model.model).join('\n'),
         storage: provider.has_temporary_key ? 'temporary' : 'persistent',
       }])));
     } catch (requestError) {
@@ -76,7 +83,7 @@ export function LLMSettingsPanel() {
     try {
       const apiKey = draft.apiKey.trim();
       const result = await saveProviderSettings({
-        [key]: { base_url: draft.baseUrl, storage: draft.storage, ...(apiKey ? { api_key: apiKey } : {}) },
+        [key]: { base_url: draft.baseUrl, models: parseModelNames(draft.modelsText), storage: draft.storage, ...(apiKey ? { api_key: apiKey } : {}) },
       });
       setMessage(result.message);
       await loadSettings();
@@ -108,17 +115,17 @@ export function LLMSettingsPanel() {
 
   return (
     <>
-      <button type="button" onClick={showPanel} className="text-xs text-gray-500 hover:text-purple-600 transition-colors" aria-label="打开模型设置">模型设置</button>
-      {open && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="llm-settings-title">
-          <div className="w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded-2xl bg-white p-6 shadow-2xl mx-4">
-            <div className="mb-5 flex items-start justify-between gap-4">
+      <button type="button" onClick={showPanel} className="rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-xs text-gray-600 shadow-sm hover:border-purple-200 hover:text-purple-600 transition-colors" aria-label="打开模型设置">模型设置</button>
+      {open && createPortal(
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="llm-settings-title">
+          <div className="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded-2xl bg-white p-6 pr-14 shadow-2xl mx-4">
+            <div className="mb-5">
               <div>
                 <h2 id="llm-settings-title" className="font-semibold text-gray-800">模型设置</h2>
                 <p className="mt-1 text-xs text-gray-400">先配置公司 API，再为不同 Agent 选择对应的 provider 和模型。</p>
               </div>
-              <button type="button" onClick={() => setOpen(false)} aria-label="关闭模型设置" className="text-gray-400 hover:text-gray-600">✕</button>
             </div>
+            <button type="button" onClick={() => setOpen(false)} aria-label="关闭模型设置" className="absolute right-4 top-4 flex h-8 w-8 items-center justify-center rounded-lg text-gray-400 hover:bg-gray-100 hover:text-gray-700">✕</button>
 
             <div className="mb-4 flex gap-1 rounded-xl bg-gray-100 p-1" role="tablist" aria-label="模型设置分类">
               <button type="button" role="tab" aria-selected={activeTab === 'providers'} onClick={() => setActiveTab('providers')} className={`flex-1 rounded-lg px-3 py-2 text-sm transition-colors ${activeTab === 'providers' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>1. 公司 API</button>
@@ -131,9 +138,9 @@ export function LLMSettingsPanel() {
 
             {!loading && settings && activeTab === 'providers' && (
               <div className="space-y-3" role="tabpanel">
-                <p className="text-xs leading-relaxed text-gray-500">可选择仅保存在本次服务运行的内存中，或保存到本机后端 `.env`。页面不会回显已保存的密钥。</p>
+                <p className="text-xs leading-relaxed text-gray-500">在这里一起配置 API 地址、密钥和该 API 可调用的模型。模型名会用于下一个“Agent 模型路由”页；页面不会回显已保存的密钥。</p>
                 {settings.providers.map(provider => {
-                  const draft = providerDrafts[provider.key] ?? { baseUrl: provider.base_url, apiKey: '', storage: provider.has_temporary_key ? 'temporary' : 'persistent' };
+                  const draft = providerDrafts[provider.key] ?? { baseUrl: provider.base_url, apiKey: '', modelsText: provider.models.map(model => model.model).join('\n'), storage: provider.has_temporary_key ? 'temporary' : 'persistent' };
                   return (
                     <div key={provider.key} className="rounded-xl border border-gray-100 bg-gray-50 p-3">
                       <div className="mb-2 flex items-center justify-between gap-3">
@@ -158,6 +165,11 @@ export function LLMSettingsPanel() {
                         </label>
                         <button type="button" onClick={() => void saveProvider(provider.key)} disabled={savingProvider !== null} className="self-end rounded-lg bg-purple-600 px-3 py-1.5 text-sm text-white hover:bg-purple-700 disabled:opacity-50">{savingProvider === provider.key ? '保存中…' : '保存'}</button>
                       </div>
+                      <label className="mt-3 block text-xs text-gray-500">
+                        可用模型
+                        <textarea value={draft.modelsText} onChange={event => updateProviderDraft(provider.key, { modelsText: event.target.value })} rows={2} placeholder={'每行一个模型名，例如：\ngpt-5.6-sol'} className="mt-1 w-full resize-y rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-sm leading-5 text-gray-700 outline-none focus:border-purple-400" />
+                        <span className="mt-1 block text-[11px] text-gray-400">每行一个模型名，也可用英文逗号分隔。至少配置一个模型。</span>
+                      </label>
                     </div>
                   );
                 })}
@@ -166,7 +178,7 @@ export function LLMSettingsPanel() {
 
             {!loading && settings && activeTab === 'agents' && (
               <div className="space-y-3" role="tabpanel">
-                <p className="text-xs leading-relaxed text-gray-500">仅显示已内置模型选项的 provider。先在“公司 API”中保存对应 Key，再切换路由。</p>
+                <p className="text-xs leading-relaxed text-gray-500">仅显示已在“公司 API”中配置模型名的 Provider。修改模型列表后，先保存公司 API，再切换路由。</p>
                 {Object.entries(settings.positions).map(([key, position]) => {
                   const selectableProviders = settings.providers.filter(provider => provider.models.length > 0);
                   const provider = selectableProviders.find(item => item.key === position.provider);
@@ -200,7 +212,8 @@ export function LLMSettingsPanel() {
               </div>
             )}
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
     </>
   );

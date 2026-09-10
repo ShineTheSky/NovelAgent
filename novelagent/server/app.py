@@ -22,7 +22,12 @@ from novelagent.context.builder import ContextBuilder
 from novelagent.memory.memory_manager import MemoryManager
 from novelagent.core.agent_loop import AgentLoop
 from novelagent.core.subagent import SubAgentRunner
-from novelagent.server.routes import projects, sessions, files, settings
+from novelagent.trace.store import TraceStore
+from novelagent.trace.recorder import TraceRecorder
+from novelagent.trace.analyzer import PostTurnAnalyzer, PreferenceContextProvider
+from novelagent.server.routes import projects, sessions, files, settings, traces
+from novelagent.server.routes import rag
+from novelagent.rag.store import RagStore
 
 
 def load_config() -> dict:
@@ -69,6 +74,11 @@ def create_app() -> FastAPI:
     permission_checker = PermissionChecker(working_dir)
     context_builder = ContextBuilder("prompts", token_limit=session_cfg.get("token_limit", 150_000))
     memory_manager = MemoryManager(working_dir, llm_client)
+    trace_store = TraceStore()
+    trace_recorder = TraceRecorder(trace_store)
+    post_turn_analyzer = PostTurnAnalyzer(llm_client, working_dir, trace_store)
+    preference_context_provider = PreferenceContextProvider(trace_store)
+    rag_store = RagStore()
 
     agent_config = {
         **session_cfg,
@@ -83,20 +93,28 @@ def create_app() -> FastAPI:
         if tool.name == "SubAgent":
             tool.presets_path = str(get_project_root() / "config" / "subagent_presets.yaml")
             tool._presets_cache = None  # 清除旧缓存
-    agent_loop = AgentLoop(llm_client, registry, permission_checker, context_builder, memory_manager, agent_config, subagent_runner)
+    agent_loop = AgentLoop(
+        llm_client, registry, permission_checker, context_builder, memory_manager, agent_config, subagent_runner,
+        trace_recorder, post_turn_analyzer, preference_context_provider,
+        rag_store,
+    )
 
     # Inject into app state
     app.state.agent_loop = agent_loop
     app.state.registry = registry
     app.state.memory_manager = memory_manager
+    app.state.trace_store = trace_store
     app.state.config = cfg
     app.state.llm_config_path = llm_config_path
+    app.state.rag_store = rag_store
 
     # Register routes
     app.include_router(projects.router)
     app.include_router(sessions.router)
     app.include_router(files.router)
     app.include_router(settings.router)
+    app.include_router(traces.router)
+    app.include_router(rag.router)
 
     # Startup
     @app.on_event("startup")

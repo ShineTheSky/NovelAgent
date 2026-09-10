@@ -36,6 +36,8 @@ export interface ProjectInfo {
   project_id: string;
   name: string;
   genre: string;
+  word_count?: number;
+  created_at?: string;
 }
 
 export interface SessionInfo {
@@ -86,5 +88,5 @@ export type StreamEvent =
   | { type: 'subagent_done'; result?: string }
   | { type: 'permission_ask'; tool: string; params_summary?: string }
   | { type: 'question_ask'; questions: Question[] }
-  | { type: 'done'; token_count?: number; finish_reason?: string }
-  | { type: 'error'; message: string };
+  | { type: 'done'; token_count?: number; finish_reason?: string; trace_id?: string }
+  | { type: 'error'; message: string; trace_id?: string };

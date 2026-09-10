@@ -22,15 +22,6 @@ SETTING_TARGETS = {
     "auto_memory": ("自动记忆", "auto_memory", None),
 }
 
-MODEL_OPTIONS = {
-    "minimax": [{"model": "MiniMax-M2.7", "label": "MiniMax M2.7"}],
-    "deepseek": [
-        {"model": "deepseek-v4-flash", "label": "DeepSeek V4 Flash"},
-        {"model": "deepseek-v4-pro", "label": "DeepSeek V4 Pro"},
-    ],
-}
-
-
 class PositionUpdate(BaseModel):
     provider: str
     model: str
@@ -43,6 +34,7 @@ class LLMSettingsUpdate(BaseModel):
 class ProviderUpdate(BaseModel):
     base_url: str
     api_key: str | None = None
+    models: list[str] | None = None
     storage: Literal["persistent", "temporary"] = "persistent"
 
 
@@ -87,6 +79,26 @@ def _validate_base_url(value: str) -> str:
     return value.strip().rstrip("/")
 
 
+def _validate_model_names(value: list[str]) -> list[str]:
+    """规范化用户为某个 API 配置的模型名列表。"""
+    if not value or len(value) > 30:
+        raise HTTPException(status_code=400, detail="请配置 1 到 30 个模型名")
+
+    normalized: list[str] = []
+    for model in value:
+        name = model.strip()
+        if not name or len(name) > 128 or "\n" in name or "\r" in name:
+            raise HTTPException(status_code=400, detail=f"无效的模型名: {model!r}")
+        if name not in normalized:
+            normalized.append(name)
+    return normalized
+
+
+def _provider_model_names(provider: dict) -> list[str]:
+    models = provider.get("models", [])
+    return [model.strip() for model in models if isinstance(model, str) and model.strip()]
+
+
 @router.get("/llm")
 async def get_llm_settings(request: Request):
     """返回可安全展示给浏览器的 provider 和模型设置。"""
@@ -113,7 +125,10 @@ async def get_llm_settings(request: Request):
                 "base_url": llm_client.get_runtime_provider_base_url(key) or value.get("base_url", ""),
                 "is_configured": bool(os.environ.get(value.get("api_key_env", ""))),
                 "has_temporary_key": llm_client.has_runtime_provider_settings(key),
-                "models": MODEL_OPTIONS.get(key, []),
+                "models": [
+                    {"model": model, "label": model}
+                    for model in (llm_client.get_runtime_provider_models(key) or _provider_model_names(value))
+                ],
             }
             for key, value in providers.items()
         ],
@@ -138,15 +153,16 @@ async def update_provider_settings(body: ProviderSettingsUpdate, request: Reques
     has_persistent_update = False
     for key, setting in body.providers.items():
         base_url = _validate_base_url(setting.base_url)
+        models = _validate_model_names(setting.models) if setting.models is not None else _provider_model_names(providers[key])
         api_key = setting.api_key.strip() if setting.api_key is not None else ""
         if setting.storage == "temporary":
             if not api_key or len(api_key) > 512 or "\n" in api_key or "\r" in api_key:
                 raise HTTPException(status_code=400, detail=f"{providers[key].get('name', key)} 的 API Key 无效")
-            llm_client.set_runtime_provider_settings(key, base_url, api_key)
+            llm_client.set_runtime_provider_settings(key, base_url, api_key, models)
             temporary_providers.append(providers[key].get("name", key))
             continue
 
-        provider_overrides[key] = {"base_url": base_url}
+        provider_overrides[key] = {"base_url": base_url, "models": models}
         has_persistent_update = True
         llm_client.clear_runtime_provider_settings(key)
         if setting.api_key is not None:
@@ -179,8 +195,12 @@ async def update_llm_settings(body: LLMSettingsUpdate, request: Request):
     for setting in body.positions.values():
         if setting.provider not in providers:
             raise HTTPException(status_code=400, detail=f"不支持的 provider: {setting.provider}")
-        if not setting.model.strip() or len(setting.model) > 128 or "\n" in setting.model:
+        model = setting.model.strip()
+        if not model or len(model) > 128 or "\n" in model:
             raise HTTPException(status_code=400, detail=f"无效的模型名: {setting.model!r}")
+        available_models = request.app.state.agent_loop.llm.get_runtime_provider_models(setting.provider) or _provider_model_names(providers[setting.provider])
+        if model not in available_models:
+            raise HTTPException(status_code=400, detail=f"模型 {model!r} 未在 {providers[setting.provider].get('name', setting.provider)} 的 API 配置中启用")
 
     overrides = _load_yaml(config_path.with_name("llm_overrides.yaml"))
     position_overrides = overrides.setdefault("positions", {})

@@ -33,6 +33,7 @@ class ContextBuilder:
         tools_description: str = "",
         history_messages: list[Message] | None = None,
         memory_injection: list[str] | None = None,
+        preference_context: str = "",
     ) -> Context:
         # Build System Prompt
         system_prompt = self.prompt_manager.render("base_system.j2", {
@@ -43,6 +44,7 @@ class ContextBuilder:
                 "word_count": project_word_count,
             },
             "memory_md_content": memory_md_content or "暂无记忆索引",
+            "preference_context": preference_context,
             "tools_description": tools_description,
         })
 

@@ -174,13 +174,10 @@ export function useChat() {
       setShowNewProject(false);
       setNewProjectName('');
       await loadSessions(project.project_id);
-      const session = await createSession(project.project_id);
-      setSessions(previous => [{ session_id: session.session_id, title: '新会话', updated_at: '' }, ...previous]);
-      await loadSession(session.session_id);
     } catch (error) {
       setAppError(`创建项目失败：${errorText(error)}`);
     }
-  }, [loadSession, loadSessions, newProjectName]);
+  }, [loadSessions, newProjectName]);
 
   const handleNewSession = useCallback(async () => {
     if (!activeProject) return;

@@ -18,11 +18,16 @@ providers:
     name: DeepSeek
     base_url: https://api.deepseek.com
     api_key_env: DEEPSEEK_API_KEY
+    models:
+      - deepseek-v4-flash
+      - deepseek-v4-pro
 
   minimax:
     name: MiniMax
     base_url: https://api.minimax.chat/v1
     api_key_env: MINIMAX_API_KEY
+    models:
+      - MiniMax-M2.7
 
   openrouter:
     name: OpenRouter

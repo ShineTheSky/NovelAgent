@@ -28,5 +28,6 @@ export type LLMPositionUpdate = Pick<LLMPositionSetting, 'provider' | 'model'>;
 export interface ProviderSettingsUpdate {
   base_url: string;
   api_key?: string;
+  models: string[];
   storage: 'persistent' | 'temporary';
 }

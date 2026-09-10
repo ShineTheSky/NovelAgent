@@ -27,7 +27,7 @@ class LLMConfigLoader:
     def __init__(self, config_path: str = "config/llm_config.yaml"):
         self.config_path = config_path
         # 仅本次服务运行使用的 provider 覆盖，不落盘。
-        self._runtime_provider_settings: dict[str, dict[str, str]] = {}
+        self._runtime_provider_settings: dict[str, dict[str, object]] = {}
         dotenv_path = Path(config_path).parent.parent / ".env"
         if dotenv_path.exists():
             with open(dotenv_path, encoding="utf-8") as f:
@@ -37,11 +37,12 @@ class LLMConfigLoader:
                         key, _, value = line.partition("=")
                         os.environ[key.strip()] = value.strip().strip("\"'")
 
-    def set_runtime_provider_settings(self, provider: str, base_url: str, api_key: str) -> None:
-        """设置仅存于当前进程内存的 provider 凭据与地址。"""
+    def set_runtime_provider_settings(self, provider: str, base_url: str, api_key: str, models: list[str]) -> None:
+        """设置仅存于当前进程内存的 provider 凭据、地址和模型列表。"""
         self._runtime_provider_settings[provider] = {
             "base_url": base_url,
             "api_key": api_key,
+            "models": models,
         }
 
     def clear_runtime_provider_settings(self, provider: str) -> None:
@@ -52,7 +53,13 @@ class LLMConfigLoader:
 
     def get_runtime_provider_base_url(self, provider: str) -> str | None:
         settings = self._runtime_provider_settings.get(provider)
-        return settings.get("base_url") if settings else None
+        base_url = settings.get("base_url") if settings else None
+        return base_url if isinstance(base_url, str) else None
+
+    def get_runtime_provider_models(self, provider: str) -> list[str] | None:
+        settings = self._runtime_provider_settings.get(provider)
+        models = settings.get("models") if settings else None
+        return list(models) if isinstance(models, list) else None
 
     def load(self) -> dict:
         with open(self.config_path, encoding="utf-8") as f:
@@ -80,8 +87,14 @@ class LLMConfigLoader:
             with open(provider_override_path, encoding="utf-8") as f:
                 overrides = yaml.safe_load(f) or {}
             for name, override in overrides.get("providers", {}).items():
-                if name in providers and isinstance(override, dict) and isinstance(override.get("base_url"), str):
-                    providers[name] = {**providers[name], "base_url": override["base_url"]}
+                if name in providers and isinstance(override, dict):
+                    safe_override = {
+                        field: override[field]
+                        for field in ("base_url", "models")
+                        if field in override
+                        and (isinstance(override[field], str) if field == "base_url" else isinstance(override[field], list))
+                    }
+                    providers[name] = {**providers[name], **safe_override}
 
         return {**config, "positions": positions, "providers": providers}
 

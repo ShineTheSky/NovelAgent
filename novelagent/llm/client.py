@@ -35,8 +35,8 @@ class LLMClient:
         self._pending_tool_name = None
         self._pending_tool_args = None
 
-    def set_runtime_provider_settings(self, provider: str, base_url: str, api_key: str) -> None:
-        self.loader.set_runtime_provider_settings(provider, base_url, api_key)
+    def set_runtime_provider_settings(self, provider: str, base_url: str, api_key: str, models: list[str]) -> None:
+        self.loader.set_runtime_provider_settings(provider, base_url, api_key, models)
 
     def clear_runtime_provider_settings(self, provider: str) -> None:
         self.loader.clear_runtime_provider_settings(provider)
@@ -46,6 +46,9 @@ class LLMClient:
 
     def get_runtime_provider_base_url(self, provider: str) -> str | None:
         return self.loader.get_runtime_provider_base_url(provider)
+
+    def get_runtime_provider_models(self, provider: str) -> list[str] | None:
+        return self.loader.get_runtime_provider_models(provider)
 
     async def chat(
         self,
