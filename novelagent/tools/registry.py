@@ -27,9 +27,12 @@ class ToolRegistry:
     def get_schemas(self) -> list[dict]:
         return [t.get_schema() for t in self._tools.values()]
 
-    def get_tools_prompt(self) -> str:
+    def get_tools_prompt(self, tool_names: list[str] | None = None) -> str:
+        tools = self._tools.values()
+        if tool_names is not None:
+            tools = [self._tools[name] for name in tool_names if name in self._tools]
         lines = ["## 可用工具"]
-        for tool in self._tools.values():
+        for tool in tools:
             params_desc = self._format_parameters(tool.parameters)
             lines.append(f"\n### {tool.name}")
             lines.append(f"{tool.description}")

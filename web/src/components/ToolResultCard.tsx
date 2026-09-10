@@ -3,6 +3,7 @@ import { EditToggle, EditPanel } from './EditCard';
 
 export function ToolResultCard({ toolName, content }: { toolName: string; content: string }) {
   const [expanded, setExpanded] = useState(false);
+  const [editExpanded, setEditExpanded] = useState(false);
   const cleanName = toolName.replace(/^🤖\s?/, '');
 
   if (cleanName === 'Edit') {
@@ -13,13 +14,13 @@ export function ToolResultCard({ toolName, content }: { toolName: string; conten
     const oldText = oldMatch ? oldMatch[1].trim() : '';
     const newText = newMatch ? newMatch[1].trim() : '';
     const maxLines = Math.max(oldText.split('\n').length, newText.split('\n').length);
-    const [editFolded, setEditFolded] = useState(maxLines > 12);
+    const editFolded = maxLines > 12 && !editExpanded;
 
     return (
       <div className="my-2 w-full">
         <div className="flex items-center justify-between mb-2">
           <span className="text-xs text-blue-500 font-medium bg-blue-50 px-2 py-0.5 rounded-full">✎ Edit</span>
-          {maxLines > 12 && <EditToggle maxLines={maxLines} folded={editFolded} onToggle={() => setEditFolded(!editFolded)} />}
+          {maxLines > 12 && <EditToggle maxLines={maxLines} folded={editFolded} onToggle={() => setEditExpanded(value => !value)} />}
         </div>
         <div className="grid grid-cols-2 gap-2">
           {oldText && <EditPanel label="旧" text={oldText} color="red" folded={editFolded} />}

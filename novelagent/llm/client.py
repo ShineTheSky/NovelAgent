@@ -35,6 +35,18 @@ class LLMClient:
         self._pending_tool_name = None
         self._pending_tool_args = None
 
+    def set_runtime_provider_settings(self, provider: str, base_url: str, api_key: str) -> None:
+        self.loader.set_runtime_provider_settings(provider, base_url, api_key)
+
+    def clear_runtime_provider_settings(self, provider: str) -> None:
+        self.loader.clear_runtime_provider_settings(provider)
+
+    def has_runtime_provider_settings(self, provider: str) -> bool:
+        return self.loader.has_runtime_provider_settings(provider)
+
+    def get_runtime_provider_base_url(self, provider: str) -> str | None:
+        return self.loader.get_runtime_provider_base_url(provider)
+
     async def chat(
         self,
         position: str,
@@ -158,6 +170,7 @@ class LLMClient:
                         self._check_status(response.status_code, messages_url, body, headers)
                         async for line in response.aiter_lines():
                             if line.startswith("data: "):
+                                print(f"[SSE{self._log_tag}] {line}", flush=True)
                                 data_str = line[6:]
                                 if data_str == "[DONE]":
                                     yield LLMResponse(type="done", finish_reason="stop")

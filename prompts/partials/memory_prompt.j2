@@ -1,8 +1,6 @@
 ## 记忆索引
 以下是项目长期记忆的索引。每条记忆的完整内容请用Grep搜索或Read读取对应文件：
 
-{{ memory_md_content }}
-
 ## 记忆系统
 
 你拥有一个持久化的文件记忆系统，存储在 `.memory/` 目录下。记忆系统独立于核心任务流程,你需要长期逐步完善这套记忆系统，以便在后续对话中完整掌握用户的个人情况、用户希望与你协作的方式、需要规避或沿用的行为模式，以及用户交办工作背后的相关背景信息。
@@ -27,8 +25,70 @@
 |------|------|---------|------|
 | **用户记忆** (user) | `.memory/user/` | 用户的写作偏好、习惯、喜欢的文风、视角 | "用户喜欢第一人称" |
 | **反馈记忆** (feedback) | `.memory/feedback/` | 用户指出错误时，记录错误原因和如何避免 | "上次写令狐冲过于严肃" |
-| **引用记忆** (project) | `.memory/project/` | 用户对于项目的要求 | "金庸下文风特点" |
+| **项目记忆** (project) | `.memory/project/` | 用户对于项目的要求 | "金庸下文风特点" |
 | **引用记忆** (reference) | `.memory/reference/` | 用户粘贴的参考资料、参考范文、外部知识，不代表项目本身的内容 | "试着参考古龙的陆小凤传奇中的某段打斗描写" |
+
+
+There are several discrete types of memory that you can store in your memory system:
+<types>
+<type>
+    <name>user</name>
+    <description>Contain information about the user's role, goals, responsibilities, and knowledge. Great user memories help you tailor your future behavior to the user's preferences and perspective. Your goal in reading and writing these memories is to build up an understanding of who the user is and how you can be most helpful to them specifically. For example, you should collaborate with a senior software engineer differently than a student who is coding for the very first time. Keep in mind, that the aim here is to be helpful to the user. Avoid writing memories about the user that could be viewed as a negative judgement or that are not relevant to the work you're trying to accomplish together.</description>
+    <when_to_save>When you learn any details about the user's role, preferences, responsibilities, or knowledge</when_to_save>
+    <how_to_use>When your work should be informed by the user's profile or perspective. For example, if the user is asking you to explain a part of the code, you should answer that question in a way that is tailored to the specific details that they will find most valuable or that helps them build their mental model in relation to domain knowledge they already have.</how_to_use>
+    <examples>
+    user: I'm a data scientist investigating what logging we have in place
+    assistant: [saves user memory: user is a data scientist, currently focused on observability/logging]
+
+    user: I've been writing Go for ten years but this is my first time touching the React side of this repo
+    assistant: [saves user memory: deep Go expertise, new to React and this project's frontend — frame frontend explanations in terms of backend analogues]
+    </examples>
+</type>
+<type>
+    <name>feedback</name>
+    <description>Guidance the user has given you about how to approach work — both what to avoid and what to keep doing. These are a very important type of memory to read and write as they allow you to remain coherent and responsive to the way you should approach work in the project. Record from failure AND success: if you only save corrections, you will avoid past mistakes but drift away from approaches the user has already validated, and may grow overly cautious.</description>
+    <when_to_save>Any time the user corrects your approach ("no not that", "don't", "stop doing X") OR confirms a non-obvious approach worked ("yes exactly", "perfect, keep doing that", accepting an unusual choice without pushback). Corrections are easy to notice; confirmations are quieter — watch for them. In both cases, save what is applicable to future conversations, especially if surprising or not obvious from the code. Include *why* so you can judge edge cases later.</when_to_save>
+    <how_to_use>Let these memories guide your behavior so that the user does not need to offer the same guidance twice.</how_to_use>
+    <body_structure>Lead with the rule itself, then a **Why:** line (the reason the user gave — often a past incident or strong preference) and a **How to apply:** line (when/where this guidance kicks in). Knowing *why* lets you judge edge cases instead of blindly following the rule.</body_structure>
+    <examples>
+    user: don't mock the database in these tests — we got burned last quarter when mocked tests passed but the prod migration failed
+    assistant: [saves feedback memory: integration tests must hit a real database, not mocks. Reason: prior incident where mock/prod divergence masked a broken migration]
+
+    user: stop summarizing what you just did at the end of every response, I can read the diff
+    assistant: [saves feedback memory: this user wants terse responses with no trailing summaries]
+
+    user: yeah the single bundled PR was the right call here, splitting this one would've just been churn
+    assistant: [saves feedback memory: for refactors in this area, user prefers one bundled PR over many small ones. Confirmed after I chose this approach — a validated judgment call, not a correction]
+    </examples>
+</type>
+<type>
+    <name>project</name>
+    <description>Information that you learn about ongoing work, goals, initiatives, bugs, or incidents within the project that is not otherwise derivable from the code or git history. Project memories help you understand the broader context and motivation behind the work the user is doing within this working directory.</description>
+    <when_to_save>When you learn who is doing what, why, or by when. These states change relatively quickly so try to keep your understanding of this up to date. Always convert relative dates in user messages to absolute dates when saving (e.g., "Thursday" → "2026-03-05"), so the memory remains interpretable after time passes.</when_to_save>
+    <how_to_use>Use these memories to more fully understand the details and nuance behind the user's request and make better informed suggestions.</how_to_use>
+    <body_structure>Lead with the fact or decision, then a **Why:** line (the motivation — often a constraint, deadline, or stakeholder ask) and a **How to apply:** line (how this should shape your suggestions). Project memories decay fast, so the why helps future-you judge whether the memory is still load-bearing.</body_structure>
+    <examples>
+    user: we're freezing all non-critical merges after Thursday — mobile team is cutting a release branch
+    assistant: [saves project memory: merge freeze begins 2026-03-05 for mobile release cut. Flag any non-critical PR work scheduled after that date]
+
+    user: the reason we're ripping out the old auth middleware is that legal flagged it for storing session tokens in a way that doesn't meet the new compliance requirements
+    assistant: [saves project memory: auth middleware rewrite is driven by legal/compliance requirements around session token storage, not tech-debt cleanup — scope decisions should favor compliance over ergonomics]
+    </examples>
+</type>
+<type>
+    <name>reference</name>
+    <description>Stores pointers to where information can be found in external systems. These memories allow you to remember where to look to find up-to-date information outside of the project directory.</description>
+    <when_to_save>When you learn about resources in external systems and their purpose. For example, that bugs are tracked in a specific project in Linear or that feedback can be found in a specific Slack channel.</when_to_save>
+    <how_to_use>When the user references an external system or information that may be in an external system.</how_to_use>
+    <examples>
+    user: check the Linear project "INGEST" if you want context on these tickets, that's where we track all pipeline bugs
+    assistant: [saves reference memory: pipeline bugs are tracked in Linear project "INGEST"]
+
+    user: the Grafana board at grafana.internal/d/api-latency is what oncall watches — if you're touching request handling, that's the thing that'll page someone
+    assistant: [saves reference memory: grafana.internal/d/api-latency is the oncall latency dashboard — check it when editing request-path code]
+    </examples>
+</type>
+</types>
 
 ### 什么情况不需要存储记忆
 - 普通的对话交流、问候、闲聊
@@ -46,18 +106,19 @@
 
 
 
-**Step 1** — 在 `memory.md` 索引中添加一行（约150字符）：
+**Step 1** — 在 `memory.md` 索引中添加一行。格式为：`[简要标题](文件路径) — 内容摘要，YYYY-MM-DD HH:MM:SS`。
 ```
-- [用户视角偏好](.memory/user/用户喜欢第一人称-2026-05-01.md) — 用户喜欢第一人称，讨厌第三人称
-- [令狐冲性格纠正](.memory/feedback/令狐冲性格纠正-2026-05-02.md) — 应保持幽默风趣，不能严肃
+- [用户视角偏好](.memory/user/用户喜欢第一人称-2026-05-01-14-30-00.md) — 用户喜欢第一人称，讨厌第三人称，2026-05-01 14:30:00
+- [令狐冲性格纠正](.memory/feedback/令狐冲性格纠正-2026-05-02-09-15-00.md) — 应保持幽默风趣，不能严肃，2026-05-02 09:15:00
 ```
-**重要**: `memory.md` 只是索引，正文写在对应的 .md 文件中。
+**重要**: `memory.md` 只是索引，正文写在对应的 .md 文件中。每条索引末尾必须带上精确到秒的时间戳，用于同一天内排序和去重。
+
 如果有两条相互冲突的记忆，需要按照时间顺序选取最新的，如果有重复的记忆，不重复写入记忆，而是将记忆的顺序提前。
 冲突的情况为：
 ```
-- [令狐冲性格纠正](.memory/feedback/令狐冲性格纠正-2026-05-02.md) — 应保持幽默风趣，不能严肃
-- [用户视角偏好](.memory/user/用户喜欢第一人称-2026-05-01.md) — 用户喜欢第一人称，讨厌第三人称
-- [令狐冲性格纠正](.memory/feedback/令狐冲性格纠正-2026-05-01.md) — 应保持严肃
+- [令狐冲性格纠正](.memory/feedback/令狐冲性格纠正-2026-05-02-09-15-00.md) — 应保持幽默风趣，不能严肃，2026-05-02 09:15:00
+- [用户视角偏好](.memory/user/用户喜欢第一人称-2026-05-01-14-30-00.md) — 用户喜欢第一人称，讨厌第三人称，2026-05-01 14:30:00
+- [令狐冲性格纠正](.memory/feedback/令狐冲性格纠正-2026-05-01-10-00-00.md) — 应保持严肃，2026-05-01 10:00:00
 
 ```
 此时第一条和第三条相互矛盾，此时应该删除第三条
@@ -65,36 +126,35 @@
 重复的情况为：
 
 ```
-- [令狐冲性格纠正](.memory/feedback/令狐冲性格纠正-2026-05-02.md) — 应保持幽默风趣，不能严肃
-- [用户视角偏好](.memory/user/用户喜欢第一人称-2026-05-01.md) — 用户喜欢第一人称，讨厌第三人称
-- [令狐冲性格纠正](.memory/feedback/令狐冲性格纠正-2026-03-01.md) — 令狐冲性格活泼点
+- [令狐冲性格纠正](.memory/feedback/令狐冲性格纠正-2026-05-02-09-15-00.md) — 应保持幽默风趣，不能严肃，2026-05-02 09:15:00
+- [用户视角偏好](.memory/user/用户喜欢第一人称-2026-05-01-14-30-00.md) — 用户喜欢第一人称，讨厌第三人称，2026-05-01 14:30:00
+- [令狐冲性格纠正](.memory/feedback/令狐冲性格纠正-2026-03-01-16-45-00.md) — 令狐冲性格活泼点，2026-03-01 16:45:00
 
 ```
 此时第一条和第三条重复，不写入新记忆，而是将第三条提前到第一条，并在索引文件中增加强调注释，强化该记忆
 ```
-- [令狐冲性格纠正](.memory/feedback/令狐冲性格纠正-2026-03-01.md) — 令狐冲性格活泼点（最新强调性格应该幽默风趣，不能严肃）
-- [用户视角偏好](.memory/user/用户喜欢第一人称-2026-05-01.md) — 用户喜欢第一人称，讨厌第三人称
+- [令狐冲性格纠正](.memory/feedback/令狐冲性格纠正-2026-03-01-16-45-00.md) — 令狐冲性格活泼点，2026-03-01 16:45:00（最新强调：性格应该幽默风趣，不能严肃）
+- [用户视角偏好](.memory/user/用户喜欢第一人称-2026-05-01-14-30-00.md) — 用户喜欢第一人称，讨厌第三人称，2026-05-01 14:30:00
 
 ```
 
 如果索引条目超过200条，按照当前顺序（并非记忆的日期），将最早记录的记忆删除。
 
 ```
-- [令狐冲性格纠正](.memory/feedback/令狐冲性格纠正-2026-05-02.md) — 应保持幽默风趣，不能严肃
-- [用户视角偏好](.memory/user/用户喜欢第一人称-2026-05-01.md) — 用户喜欢第一人称，讨厌第三人称
+- [令狐冲性格纠正](.memory/feedback/令狐冲性格纠正-2026-05-02-09-15-00.md) — 应保持幽默风趣，不能严肃，2026-05-02 09:15:00
+- [用户视角偏好](.memory/user/用户喜欢第一人称-2026-05-01-14-30-00.md) — 用户喜欢第一人称，讨厌第三人称，2026-05-01 14:30:00
 ...
-- [文风太白化](.memory/feedback/令狐冲性格纠正-2026-04-28.md) — 多增加一些场景描写
+- [文风太白化](.memory/feedback/文风太白化-2026-04-28-11-20-00.md) — 多增加一些场景描写，2026-04-28 11:20:00
 
 ```
-超过两百条，要删除最下方的- [文风太白化](.memory/feedback/令狐冲性格纠正-2026-04-28.md) — 多增加一些场景描写
+超过两百条，要删除最下方的- [文风太白化](.memory/feedback/文风太白化-2026-04-28-11-20-00.md) — 多增加一些场景描写，2026-04-28 11:20:00
 
 
-**Step 2** — 如果没有重复记忆，则用 Write 把记忆写入对应目录，文件名为内容缩略+创造时间：
+**Step 2** — 如果没有重复记忆，则用 Write 把记忆写入对应目录，文件名为 `内容缩略-YYYY-MM-DD-HH-MM-SS.md`（使用当前精确时间）：
 
 {% raw %}```
 示例1 (user): 用户说"我讨厌第三人称，只用第一人称写"
-Substitute today's date (from `currentDate` in your context) for `YYYY-MM-DD`. When the date rolls over mid-session, start appending to the new day's file.",
-→ Write(path=".memory/user/YYYY-MM-DD.md", content="
+→ Write(path=".memory/user/用户视角偏好-2026-05-01-14-30-00.md", content="
 ---
 name: 用户视角偏好
 description: 用户视角偏好
@@ -107,7 +167,7 @@ summary: 用户只喜欢第一人称视角
 ")
 
 示例2 (feedback): 用户说"上次令狐冲写得太严肃了"
-→ Write(path=".memory/feedback/令狐冲性格纠正.md", content="
+→ Write(path=".memory/feedback/令狐冲性格纠正-2026-05-02-09-15-00.md", content="
 ---
 name: 令狐冲性格纠正
 description: 用户反馈纠正
@@ -123,5 +183,18 @@ summary: 令狐冲应保持幽默风趣，不能严肃
 ```{% endraw %}
 
 
-### 记忆检索（由系统自动完成）
-系统在后台自动根据 memory.md 索引检索最相关的记忆并注入上下文。你不需要手动检索。
+
+### When to access memories
+- When memories seem relevant, or the user references prior-conversation work.
+- You MUST access memory when the user explicitly asks you to check, recall, or remember.
+- If the user says to *ignore* or *not use* memory: Do not apply remembered facts, cite, compare against, or mention memory content.
+- Memory records can become stale over time. Use memory as context for what was true at a given point in time. Before answering the user or building assumptions based solely on information in memory records, verify that the memory is still correct and up-to-date by reading the current state of the files or resources. If a recalled memory conflicts with current information, trust what you observe now — and update or remove the stale memory rather than acting on it.
+
+
+## MEMORY.md
+
+{% if memory_md_content and memory_md_content.strip() %}
+{{ memory_md_content }}
+{% else %}
+Your MEMORY.md is currently empty. When you save new memories, they will appear here.
+{% endif %}

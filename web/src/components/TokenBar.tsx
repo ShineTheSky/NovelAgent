@@ -1,4 +1,4 @@
-export function TokenBar({ tokenCount, limit, sessionId, onCompress, disabled }: { tokenCount: number; limit: number; sessionId: string; onCompress: () => void; disabled?: boolean }) {
+export function TokenBar({ tokenCount, limit, onCompress, disabled }: { tokenCount: number; limit: number; onCompress: () => void; disabled?: boolean }) {
   const pct = Math.min(100, Math.round((tokenCount / limit) * 100));
   const threshold = 80;
   const radius = 12;
@@ -10,7 +10,7 @@ export function TokenBar({ tokenCount, limit, sessionId, onCompress, disabled }:
 
   return (
     <div className="relative group flex items-center" title={`${tokenCount.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct}%) — 超过${threshold}%自动压缩`}>
-      <button onClick={onCompress} disabled={disabled} className={`flex items-center ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}>
+      <button type="button" onClick={onCompress} disabled={disabled} className={`flex items-center ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}>
         <svg width="28" height="28" viewBox="0 0 28 28" className="transform -rotate-90">
           <circle cx="14" cy="14" r={radius} fill="none" stroke="#e5e7eb" strokeWidth="2.5" />
           <circle cx="14" cy="14" r={radius} fill="none" stroke={color} strokeWidth="2.5" strokeDasharray={circumference} strokeDashoffset={offset} strokeLinecap="round" className="transition-all duration-500" />

@@ -26,6 +26,8 @@ class LLMConfig:
 class LLMConfigLoader:
     def __init__(self, config_path: str = "config/llm_config.yaml"):
         self.config_path = config_path
+        # 仅本次服务运行使用的 provider 覆盖，不落盘。
+        self._runtime_provider_settings: dict[str, dict[str, str]] = {}
         dotenv_path = Path(config_path).parent.parent / ".env"
         if dotenv_path.exists():
             with open(dotenv_path, encoding="utf-8") as f:
@@ -35,9 +37,53 @@ class LLMConfigLoader:
                         key, _, value = line.partition("=")
                         os.environ[key.strip()] = value.strip().strip("\"'")
 
+    def set_runtime_provider_settings(self, provider: str, base_url: str, api_key: str) -> None:
+        """设置仅存于当前进程内存的 provider 凭据与地址。"""
+        self._runtime_provider_settings[provider] = {
+            "base_url": base_url,
+            "api_key": api_key,
+        }
+
+    def clear_runtime_provider_settings(self, provider: str) -> None:
+        self._runtime_provider_settings.pop(provider, None)
+
+    def has_runtime_provider_settings(self, provider: str) -> bool:
+        return provider in self._runtime_provider_settings
+
+    def get_runtime_provider_base_url(self, provider: str) -> str | None:
+        settings = self._runtime_provider_settings.get(provider)
+        return settings.get("base_url") if settings else None
+
     def load(self) -> dict:
         with open(self.config_path, encoding="utf-8") as f:
-            return yaml.safe_load(f)
+            config = yaml.safe_load(f) or {}
+
+        positions = {name: dict(value or {}) for name, value in config.get("positions", {}).items()}
+        position_override_path = Path(self.config_path).with_name("llm_overrides.yaml")
+        if position_override_path.exists():
+            with open(position_override_path, encoding="utf-8") as f:
+                overrides = yaml.safe_load(f) or {}
+            for name, override in overrides.get("positions", {}).items():
+                if name in positions and isinstance(override, dict):
+                    merged = {**positions[name], **override}
+                    if isinstance(override.get("overrides"), dict):
+                        sub_overrides = {key: dict(value or {}) for key, value in positions[name].get("overrides", {}).items()}
+                        for sub_type, sub_override in override["overrides"].items():
+                            if isinstance(sub_override, dict):
+                                sub_overrides[sub_type] = {**sub_overrides.get(sub_type, {}), **sub_override}
+                        merged["overrides"] = sub_overrides
+                    positions[name] = merged
+
+        providers = {name: dict(value or {}) for name, value in config.get("providers", {}).items()}
+        provider_override_path = Path(self.config_path).with_name("llm_provider_overrides.yaml")
+        if provider_override_path.exists():
+            with open(provider_override_path, encoding="utf-8") as f:
+                overrides = yaml.safe_load(f) or {}
+            for name, override in overrides.get("providers", {}).items():
+                if name in providers and isinstance(override, dict) and isinstance(override.get("base_url"), str):
+                    providers[name] = {**providers[name], "base_url": override["base_url"]}
+
+        return {**config, "positions": positions, "providers": providers}
 
     def get_config(self, position: str, sub_type: str = None) -> LLMConfig:
         config = self.load()
@@ -56,9 +102,10 @@ class LLMConfigLoader:
         # 3. Resolve provider info
         provider_key = pos.get("provider", defaults.get("provider", "anthropic"))
         provider_info = providers.get(provider_key, {})
-        base_url = provider_info.get("base_url", "")
+        runtime_settings = self._runtime_provider_settings.get(provider_key, {})
+        base_url = runtime_settings.get("base_url", provider_info.get("base_url", ""))
         api_key_env = provider_info.get("api_key_env", "")
-        api_key = os.environ.get(api_key_env, "")
+        api_key = runtime_settings.get("api_key", os.environ.get(api_key_env, ""))
         headers = provider_info.get("headers", {})
 
         return LLMConfig(

@@ -1,4 +1,4 @@
-import { type Message } from '../hooks/useChat';
+import type { Message } from '../types/chat';
 import { MessageBubble } from './MessageBubble';
 import { ToolCard } from './ToolCard';
 import { ToolResultCard } from './ToolResultCard';

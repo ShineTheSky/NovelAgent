@@ -2,13 +2,22 @@ import { useState } from 'react';
 import { ThinkBlock } from './ThinkBlock';
 
 export function MessageBubble({ role, content, ts }: { role: string; content: string; ts?: string }) {
-  if (!content?.trim()) return null;
+  const [copied, setCopied] = useState(false);
   const isUser = role === 'user';
   const isSystem = role === 'system';
-  const [copied, setCopied] = useState(false);
   const time = ts ? new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '';
 
-  const copy = () => { navigator.clipboard.writeText(content); setCopied(true); setTimeout(() => setCopied(false), 1500); };
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard access can be unavailable outside a secure browser context.
+    }
+  };
+
+  if (!content?.trim()) return null;
 
   if (isSystem) {
     return (
@@ -29,14 +38,10 @@ export function MessageBubble({ role, content, ts }: { role: string; content: st
   if (lastIdx < content.length) parts.push({ type: 'text', content: content.slice(lastIdx) });
   const hasThink = parts.some(p => p.type === 'think');
 
-  const Bubble = ({ text }: { text: string }) => (
-    <div className={`rounded-2xl px-4 py-3 text-base leading-relaxed whitespace-pre-wrap relative group ${isUser ? 'bg-purple-600 text-white rounded-br-md' : 'bg-white text-gray-700 border border-gray-100 rounded-bl-md shadow-sm'}`}>
+  const renderBubble = (text: string, key?: number) => (
+    <div key={key} className={`rounded-2xl px-4 py-3 text-base leading-relaxed whitespace-pre-wrap relative group ${isUser ? 'bg-purple-600 text-white rounded-br-md' : 'bg-white text-gray-700 border border-gray-100 rounded-bl-md shadow-sm'}`}>
       {text}
-      {!isUser && text.length > 50 && (
-        <button onClick={copy} aria-label={copied ? '已复制' : '复制消息'} className="absolute top-1 right-2 opacity-0 group-hover:opacity-100 text-[10px] text-gray-400 hover:text-gray-600 bg-white/80 rounded px-1.5 py-0.5 transition-opacity">
-          {copied ? '已复制' : '复制'}
-        </button>
-      )}
+      {!isUser && text.length > 50 && <button type="button" onClick={() => void copy()} aria-label={copied ? '已复制' : '复制消息'} className="absolute top-1 right-2 opacity-0 group-hover:opacity-100 text-[10px] text-gray-400 hover:text-gray-600 bg-white/80 rounded px-1.5 py-0.5 transition-opacity">{copied ? '已复制' : '复制'}</button>}
     </div>
   );
 
@@ -46,8 +51,8 @@ export function MessageBubble({ role, content, ts }: { role: string; content: st
       <div className="max-w-[80%]">
         {hasThink ? parts.map((p, i) =>
           p.type === 'think' ? <ThinkBlock key={i} text={p.content} /> :
-          p.content.trim() ? <Bubble key={i} text={p.content} /> : null
-        ) : <Bubble text={content} />}
+          p.content.trim() ? renderBubble(p.content, i) : null
+        ) : renderBubble(content)}
         {time && <div className={`text-[10px] text-gray-400 mt-0.5 ${isUser ? 'text-right mr-1' : 'ml-1'}`}>{time}</div>}
       </div>
       {isUser && <div className="w-7 h-7 rounded-full bg-purple-600 flex items-center justify-center text-xs ml-2 mt-0.5 shrink-0 text-white select-none" aria-hidden="true">U</div>}

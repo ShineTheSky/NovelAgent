@@ -22,7 +22,7 @@ from novelagent.context.builder import ContextBuilder
 from novelagent.memory.memory_manager import MemoryManager
 from novelagent.core.agent_loop import AgentLoop
 from novelagent.core.subagent import SubAgentRunner
-from novelagent.server.routes import projects, sessions
+from novelagent.server.routes import projects, sessions, files, settings
 
 
 def load_config() -> dict:
@@ -44,7 +44,12 @@ def resolve_working_dir(relative_path: str) -> str:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="NovelAgent2")
-    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     cfg = load_config()
     working_dir = resolve_working_dir(cfg.get("working_dir", "./workspace"))
@@ -54,7 +59,8 @@ def create_app() -> FastAPI:
     bash_cfg = security_cfg.get("bash", {})
 
     # Initialize components
-    llm_client = LLMClient("config/llm_config.yaml")
+    llm_config_path = str(get_project_root() / "config" / "llm_config.yaml")
+    llm_client = LLMClient(llm_config_path)
 
     registry = ToolRegistry()
     for tool in [ReadTool(), WriteTool(), EditTool(), GlobTool(), GrepTool(), BashTool(), SubAgentTool(), AskUserQuestionTool()]:
@@ -84,10 +90,13 @@ def create_app() -> FastAPI:
     app.state.registry = registry
     app.state.memory_manager = memory_manager
     app.state.config = cfg
+    app.state.llm_config_path = llm_config_path
 
     # Register routes
     app.include_router(projects.router)
     app.include_router(sessions.router)
+    app.include_router(files.router)
+    app.include_router(settings.router)
 
     # Startup
     @app.on_event("startup")

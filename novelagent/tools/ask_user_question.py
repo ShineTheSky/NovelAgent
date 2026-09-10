@@ -12,6 +12,7 @@ class AskUserQuestionTool(ToolProtocol):
         "4. Offer choices to the user about what direction to take. "
         "Usage notes: Users will always be able to select 'Other' to provide custom text input. "
         "Use multiSelect: true to allow multiple answers to be selected. "
+        "当需要询问用户问题时."
         "If you recommend a specific option, make that the first option and add '(Recommended)' at the end."
     )
 

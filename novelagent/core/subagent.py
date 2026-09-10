@@ -22,7 +22,8 @@ class SubAgentRunner:
 
     def _build_system_prompt(self, preset: dict, extra_context: str = "", attachments: list[dict] | None = None) -> str:
         from datetime import datetime
-        tools_desc = "\n".join(f"- {name}" for name in preset.get("tools", []))
+        tool_names = preset.get("tools", [])
+        tools_desc = self.tools.get_tools_prompt(tool_names) if tool_names else ""
         att_text = ""
         if attachments:
             att_lines = ["## 参考文件内容（由主Agent提供，请直接使用，无需再读文件）"]
@@ -39,7 +40,7 @@ class SubAgentRunner:
             "project": {"name": "", "genre": "", "word_count": 0},
             "memory_md_content": "",
             "memory_enabled": preset.get("memory_enabled", False),
-            "tools_description": f"可用工具: {tools_desc}" if tools_desc else "",
+            "tools_description": tools_desc,
             "extra_context": ctx,
         })
 
