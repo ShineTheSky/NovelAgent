@@ -103,6 +103,8 @@ export function LLMSettingsPanel() {
       const positions = Object.fromEntries(Object.entries(settings.positions).map(([key, value]) => [key, {
         provider: value.provider,
         model: value.model,
+        temperature: value.temperature,
+        reasoning_effort: value.reasoning_effort,
       }]));
       const result = await saveLLMSettings(positions);
       setMessage(result.message);
@@ -154,7 +156,10 @@ export function LLMSettingsPanel() {
                         </label>
                         <label className="text-xs text-gray-500">
                           API Key
-                          <input type="password" autoComplete="new-password" value={draft.apiKey} onChange={event => updateProviderDraft(provider.key, { apiKey: event.target.value })} placeholder={provider.has_temporary_key ? '临时 Key 已配置；输入以替换' : provider.is_configured ? '已配置；留空则保留' : '输入 API Key'} className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-sm text-gray-700 outline-none focus:border-purple-400" />
+                          <div className="relative mt-1">
+                            <input type="password" autoComplete="new-password" value={draft.apiKey} onChange={event => updateProviderDraft(provider.key, { apiKey: event.target.value })} placeholder={provider.has_temporary_key || provider.is_configured ? '' : '输入 API Key'} className="w-full rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-sm text-gray-700 outline-none focus:border-purple-400" />
+                            {!draft.apiKey && (provider.has_temporary_key || provider.is_configured) && <span aria-hidden="true" className="pointer-events-none absolute inset-y-0 left-2 flex items-center text-sm tracking-widest text-gray-400">••••••••</span>}
+                          </div>
                         </label>
                         <label className="text-xs text-gray-500">
                           保存方式
@@ -178,14 +183,14 @@ export function LLMSettingsPanel() {
 
             {!loading && settings && activeTab === 'agents' && (
               <div className="space-y-3" role="tabpanel">
-                <p className="text-xs leading-relaxed text-gray-500">仅显示已在“公司 API”中配置模型名的 Provider。修改模型列表后，先保存公司 API，再切换路由。</p>
+                <p className="text-xs leading-relaxed text-gray-500">每个子 Agent 独立配置，不使用共享的子 Agent 默认路由。思考强度仅在所选 API 支持时填写；不确定时保留“不设置”。</p>
                 {Object.entries(settings.positions).map(([key, position]) => {
                   const selectableProviders = settings.providers.filter(provider => provider.models.length > 0);
                   const provider = selectableProviders.find(item => item.key === position.provider);
                   return (
                     <div key={key} className="rounded-xl border border-gray-100 bg-gray-50 p-3">
                       <div className="mb-2 text-sm font-medium text-gray-700">{position.label}</div>
-                      <div className="grid grid-cols-2 gap-2">
+                      <div className="grid gap-2 sm:grid-cols-4">
                         <label className="text-xs text-gray-500">
                           公司 API
                           <select value={position.provider} onChange={event => {
@@ -199,6 +204,19 @@ export function LLMSettingsPanel() {
                           模型
                           <select value={position.model} onChange={event => updatePosition(key, { model: event.target.value })} className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-sm text-gray-700 outline-none focus:border-purple-400">
                             {provider?.models.map(item => <option key={item.model} value={item.model}>{item.label}</option>)}
+                          </select>
+                        </label>
+                        <label className="text-xs text-gray-500">
+                          温度（0–2）
+                          <input type="number" min="0" max="2" step="0.1" value={position.temperature} onChange={event => updatePosition(key, { temperature: Number(event.target.value) })} className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-sm text-gray-700 outline-none focus:border-purple-400" />
+                        </label>
+                        <label className="text-xs text-gray-500">
+                          思考强度
+                          <select value={position.reasoning_effort} onChange={event => updatePosition(key, { reasoning_effort: event.target.value as LLMPositionSetting['reasoning_effort'] })} className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-sm text-gray-700 outline-none focus:border-purple-400">
+                            <option value="">不设置</option>
+                            <option value="low">低</option>
+                            <option value="medium">中</option>
+                            <option value="high">高</option>
                           </select>
                         </label>
                       </div>

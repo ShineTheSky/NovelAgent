@@ -17,6 +17,7 @@ from novelagent.tools.grep import GrepTool
 from novelagent.tools.bash import BashTool
 from novelagent.tools.subagent_tool import SubAgentTool
 from novelagent.tools.ask_user_question import AskUserQuestionTool
+from novelagent.tools.create_trace_checkpoint import CreateTraceCheckpointTool
 from novelagent.security.permission_checker import PermissionChecker
 from novelagent.context.builder import ContextBuilder
 from novelagent.memory.memory_manager import MemoryManager
@@ -25,7 +26,7 @@ from novelagent.core.subagent import SubAgentRunner
 from novelagent.trace.store import TraceStore
 from novelagent.trace.recorder import TraceRecorder
 from novelagent.trace.analyzer import PostTurnAnalyzer, PreferenceContextProvider
-from novelagent.server.routes import projects, sessions, files, settings, traces
+from novelagent.server.routes import projects, sessions, files, novel, settings, traces
 from novelagent.server.routes import rag
 from novelagent.rag.store import RagStore
 
@@ -68,7 +69,7 @@ def create_app() -> FastAPI:
     llm_client = LLMClient(llm_config_path)
 
     registry = ToolRegistry()
-    for tool in [ReadTool(), WriteTool(), EditTool(), GlobTool(), GrepTool(), BashTool(), SubAgentTool(), AskUserQuestionTool()]:
+    for tool in [ReadTool(), WriteTool(), EditTool(), GlobTool(), GrepTool(), BashTool(), SubAgentTool(), AskUserQuestionTool(), CreateTraceCheckpointTool()]:
         registry.register(tool)
 
     permission_checker = PermissionChecker(working_dir)
@@ -112,6 +113,7 @@ def create_app() -> FastAPI:
     app.include_router(projects.router)
     app.include_router(sessions.router)
     app.include_router(files.router)
+    app.include_router(novel.router)
     app.include_router(settings.router)
     app.include_router(traces.router)
     app.include_router(rag.router)

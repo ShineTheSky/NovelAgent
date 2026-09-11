@@ -35,8 +35,19 @@ Thumbs.db
 workspace/
 
 # 本地运行数据
-data/novelagent.db
-data/novelagent.db.before-pull.sqlite
+data/*.db
+data/*.sqlite
+data/rag/
+.rag/
+workspace/**/.rag/
+
+# 本地 Embedding 模型与向量索引
+models/
+embedding_models/
+*.faiss
+*.hnsw
+*.safetensors
+pytorch_model.bin
 
 #测试
 tests/

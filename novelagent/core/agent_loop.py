@@ -28,7 +28,7 @@ class AgentLoop:
         self.max_turns = self._config.get("max_turns", 20)
         self.token_limit = self._config.get("token_limit", 150_000)
         self.loop_threshold = self._config.get("loop_detection_threshold", 3)
-        self.auto_memory_interval = self._config.get("auto_memory_interval", 5)
+        self.trace_interval = self._config.get("trace_interval", 5)
         self.working_dir = self._config.get("working_dir", "./workspace")
         self.trace = trace_recorder
         self.post_turn_analyzer = post_turn_analyzer
@@ -37,30 +37,18 @@ class AgentLoop:
 
     async def run(self, request: InternalRequest, session: Session, project_info: dict | None = None) -> ResponseChunk:
         trace_id = hashlib.md5(f"{session.session_id}{time.time()}".encode()).hexdigest()[:8]
-        if self.trace:
-            trace_id = await self.trace.start(session.session_id, session.project_id, request.content)
 
         async def record(event_type: str, actor: str, payload: dict | None = None,
                          parent_event_id: str | None = None, duration_ms: float | None = None):
-            if not self.trace:
-                return None
-            try:
-                return await self.trace.record(trace_id, event_type, actor, payload, parent_event_id, duration_ms)
-            except Exception as exc:
-                print(f"[trace] record failed: {exc}", flush=True)
-                return None
+            return None
 
         async def finish(status: str, answer: str = "", token_count: int = 0):
-            if not self.trace:
-                return
-            try:
-                await self.trace.finish(trace_id, status, answer, token_count)
-            except Exception as exc:
-                print(f"[trace] finish failed: {exc}", flush=True)
-        pi = project_info or {}
+            return None
 
-        # 记忆属于具体小说项目。Trace 生成的原子记忆写入同一目录，
-        # 后续请求可通过现有预取链路重新取回。
+        pi = project_info or {}
+        trace_checkpoint_requested = False
+
+        # 项目记忆预取仍与项目工作区绑定；自动 Trace 记忆则持久化到 SQLite。
         import os as _os
         project_memory = MemoryManager(_os.path.join(self.working_dir, session.project_id), self.llm)
 
@@ -77,7 +65,7 @@ class AgentLoop:
             except Exception as exc:
                 print(f"[trace] preference context failed: {exc}", flush=True)
 
-        # Retrieve project-scoped reference material before building the prompt.
+        # Retrieve shared reference material before building the prompt.
         # This is intentionally best-effort: an empty or unavailable library
         # must never prevent ordinary writing from working.
         rag_context = ""
@@ -85,7 +73,7 @@ class AgentLoop:
         if self.rag_store:
             try:
                 rag_context, rag_results = await self.rag_store.format_context(
-                    session.project_id, request.content, limit=5,
+                    request.content, limit=5,
                 )
             except Exception as exc:
                 print(f"[rag] retrieval failed: {exc}", flush=True)
@@ -143,6 +131,17 @@ class AgentLoop:
             print(f"[compress] 进入循环前触发压缩: {pre_check_tokens} tokens", flush=True)
             yield ResponseChunk(type="thinking", data={"content": "上下文过长，正在压缩…"})
             await record("context_compression", "system", {"before_token_count": pre_check_tokens})
+            if self.post_turn_analyzer and self.trace:
+                captured = await self.trace.store.capture_pending_trace(
+                    session.session_id, session.project_id, ctx.to_llm_messages(), pre_check_tokens,
+                )
+                if captured:
+                    await self.post_turn_analyzer.analyze(
+                        captured["trace_id"],
+                        session.project_id,
+                        captured["messages"],
+                        self.tools.get_schemas(),
+                    )
             # 发送完整消息历史给 LLM 生成摘要
             try:
                 non_system = [m for m in ctx.messages if m.role != "system"]
@@ -356,6 +355,8 @@ class AgentLoop:
                     t0 = time.time()
                     result = await self.tools.execute(tool_name, params, tool_ctx)
                     duration = (time.time() - t0) * 1000
+                if tool_name == "CreateTraceCheckpoint" and result.success:
+                    trace_checkpoint_requested = True
                 duration = (time.time() - t0) * 1000
 
                 audit_log(trace_id, tool_name, params,
@@ -410,15 +411,26 @@ class AgentLoop:
         # 7. The analyzer derives trace-backed atomic memories after the immutable trace is complete.
         token_count = self.context_builder.token_counter.count_messages(ctx.to_llm_messages())
         session.messages = [m.to_dict() for m in ctx.messages]
-        await record("completed", "system", {"turns": turn, "token_count": token_count})
-        await finish("completed", final_text, token_count)
-        if self.post_turn_analyzer:
-            asyncio.create_task(self.post_turn_analyzer.analyze(trace_id, session.project_id))
+        captured_trace = None
+        if self.trace:
+            await self.trace.store.append_session_turn(session.session_id, request.content, final_text)
+            pending_turns = await self.trace.store.pending_trace_turn_count(session.session_id)
+            if trace_checkpoint_requested or (self.trace_interval > 0 and pending_turns >= self.trace_interval):
+                captured_trace = await self.trace.store.capture_pending_trace(
+                    session.session_id, session.project_id, ctx.to_llm_messages(), token_count,
+                )
+        if self.post_turn_analyzer and captured_trace:
+            asyncio.create_task(self.post_turn_analyzer.analyze(
+                captured_trace["trace_id"],
+                session.project_id,
+                captured_trace["messages"],
+                self.tools.get_schemas(),
+            ))
 
         # 8. Done
         yield ResponseChunk(type="done", data={
             "finish_reason": "complete",
             "turns": turn,
             "token_count": token_count,
-            "trace_id": trace_id,
+            "trace_id": captured_trace["trace_id"] if captured_trace else "",
         })

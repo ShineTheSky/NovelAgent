@@ -11,9 +11,15 @@ interface SidebarProps {
     | 'setShowNewProject'
     | 'newProjectName'
     | 'setNewProjectName'
+    | 'showImportProjects'
+    | 'setShowImportProjects'
+    | 'importableProjects'
+    | 'importLoading'
     | 'loadSessions'
     | 'loadSession'
     | 'handleNewProject'
+    | 'loadImportableProjects'
+    | 'handleImportProject'
     | 'handleNewSession'
     | 'handleDeleteSession'>;
 }
@@ -57,7 +63,7 @@ export function Sidebar({ chat }: SidebarProps) {
       <div className="h-12 px-3 flex items-center justify-between shrink-0">
         <span className="text-[13px] font-medium text-gray-600">项目</span>
         <div className="flex items-center gap-1">
-          <button type="button" className="w-7 h-7 rounded-md text-gray-400 hover:bg-gray-200 hover:text-gray-700 text-lg leading-none" aria-label="项目菜单">…</button>
+          <button type="button" onClick={() => { chat.setShowImportProjects(true); void chat.loadImportableProjects(); }} className="w-7 h-7 rounded-md text-gray-400 hover:bg-gray-200 hover:text-purple-600 text-base leading-none" aria-label="导入已有项目" title="导入已有项目">⇩</button>
           <button type="button" onClick={() => chat.setShowNewProject(true)} className="w-7 h-7 rounded-md text-gray-400 hover:bg-gray-200 hover:text-gray-700 text-lg leading-none" aria-label="新建项目">+</button>
         </div>
       </div>
@@ -79,6 +85,23 @@ export function Sidebar({ chat }: SidebarProps) {
             <button type="submit" className="rounded-md bg-purple-600 px-2.5 py-1 text-xs text-white hover:bg-purple-700">创建</button>
           </div>
         </form>
+      )}
+
+      {chat.showImportProjects && (
+        <div className="mx-3 mb-2 rounded-lg border border-blue-200 bg-white p-2 shadow-sm">
+          <div className="mb-2 flex items-center justify-between text-xs font-medium text-gray-600">
+            <span>导入已有项目</span>
+            <button type="button" onClick={() => chat.setShowImportProjects(false)} className="text-gray-400 hover:text-gray-600" aria-label="关闭导入项目">×</button>
+          </div>
+          {chat.importLoading && <div className="py-2 text-center text-xs text-gray-400">正在扫描工作区…</div>}
+          {!chat.importLoading && chat.importableProjects.length === 0 && <div className="py-2 text-xs text-gray-400">没有可导入的项目。</div>}
+          {!chat.importLoading && chat.importableProjects.map(project => (
+            <button type="button" key={project.project_id} onClick={() => void chat.handleImportProject(project.project_id)} className="mb-1 w-full rounded-md border border-gray-100 px-2 py-1.5 text-left hover:border-purple-200 hover:bg-purple-50">
+              <span className="block truncate text-xs text-gray-700">{project.name}</span>
+              <span className="block truncate text-[10px] text-gray-400">{project.project_id}</span>
+            </button>
+          ))}
+        </div>
       )}
 
       <div className="flex-1 overflow-y-auto px-2 pb-4">
@@ -117,9 +140,6 @@ export function Sidebar({ chat }: SidebarProps) {
                     </div>
                   ))}
                   {chat.sessions.length === 0 && <div className="px-2 py-2 text-[11px] text-gray-400">暂无会话</div>}
-                  <button type="button" onClick={() => void chat.handleNewSession()} className="mt-1 flex w-full items-center gap-1 rounded-md px-2 py-1.5 text-xs text-gray-400 hover:bg-gray-200/70 hover:text-purple-600">
-                    <span className="text-sm leading-none">+</span> 新建会话
-                  </button>
                 </div>
               )}
             </div>

@@ -18,6 +18,7 @@ security:
     - pattern: ".memory/world/**"
     - pattern: ".memory/user_prefs.md"
     - pattern: "outline.md"
+    - pattern: "outline_*.md"
 
 # 会话配置
 session:
@@ -28,7 +29,7 @@ session:
 # Agent Loop 配置
 agent:
   loop_detection_threshold: 3  # 连续相同工具调用视为循环
-  auto_memory_interval: 5      # 自动记忆轮询间隔（轮）
+  trace_interval: 5            # 默认每 5 个完成回合生成一个聚合 Trace
 
 # 日志配置
 logging:

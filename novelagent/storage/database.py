@@ -54,6 +54,33 @@ async def init():
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS session_trace_turns (
+                session_id TEXT NOT NULL,
+                turn_no INTEGER NOT NULL,
+                user_content TEXT NOT NULL DEFAULT '',
+                assistant_content TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (session_id, turn_no),
+                FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS session_trace_state (
+                session_id TEXT PRIMARY KEY,
+                last_captured_turn INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS trace_snapshots (
+                trace_id TEXT PRIMARY KEY,
+                start_turn_no INTEGER NOT NULL,
+                end_turn_no INTEGER NOT NULL,
+                messages_json TEXT NOT NULL DEFAULT '[]',
+                FOREIGN KEY (trace_id) REFERENCES traces(trace_id)
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS trace_events (
                 event_id TEXT PRIMARY KEY,
                 trace_id TEXT NOT NULL,
@@ -113,32 +140,95 @@ async def init():
                 FOREIGN KEY (memory_id) REFERENCES trace_memories(memory_id)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS memory_pattern_summaries (
+                pattern_id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL DEFAULT '',
+                source_memory_ids_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (pattern_id) REFERENCES memory_patterns(pattern_id)
+            )
+        """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trace_events_trace ON trace_events(trace_id, sequence_no)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS trace_classifications (
+                trace_id TEXT PRIMARY KEY,
+                has_error INTEGER NOT NULL DEFAULT 0,
+                has_correction INTEGER NOT NULL DEFAULT 0,
+                has_confirmation INTEGER NOT NULL DEFAULT 0,
+                has_feedback INTEGER NOT NULL DEFAULT 0,
+                items_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (trace_id) REFERENCES traces(trace_id)
+            )
+        """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trace_memories_project ON trace_memories(project_id, kind, subtype)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_memory_patterns_project ON memory_patterns(project_id, kind, subtype, status)")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS rag_documents (
                 document_id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
                 title TEXT NOT NULL,
                 source_name TEXT DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                FOREIGN KEY (project_id) REFERENCES projects(project_id)
+                encoding TEXT NOT NULL DEFAULT 'utf-8',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS rag_chunks (
                 chunk_id TEXT PRIMARY KEY,
                 document_id TEXT NOT NULL,
-                project_id TEXT NOT NULL,
                 chunk_index INTEGER NOT NULL,
                 content TEXT NOT NULL,
                 FOREIGN KEY (document_id) REFERENCES rag_documents(document_id)
             )
         """)
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_rag_documents_project ON rag_documents(project_id, created_at)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_rag_chunks_project ON rag_chunks(project_id, document_id)")
+        await _migrate_rag_to_global(db)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_rag_documents_created ON rag_documents(created_at)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_rag_chunks_document ON rag_chunks(document_id)")
         await db.commit()
+
+
+async def _migrate_rag_to_global(db: aiosqlite.Connection) -> None:
+    """Remove the old per-project RAG scope while preserving imported documents."""
+    cursor = await db.execute("PRAGMA table_info(rag_documents)")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if "project_id" not in columns:
+        return
+
+    await db.execute("DROP INDEX IF EXISTS idx_rag_documents_project")
+    await db.execute("DROP INDEX IF EXISTS idx_rag_chunks_project")
+    await db.execute("""
+        CREATE TABLE rag_documents_global (
+            document_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            source_name TEXT DEFAULT '',
+            encoding TEXT NOT NULL DEFAULT 'unknown',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    await db.execute("""
+        INSERT INTO rag_documents_global (document_id, title, source_name, encoding, created_at)
+        SELECT document_id, title, source_name, 'unknown', created_at FROM rag_documents
+    """)
+    await db.execute("""
+        CREATE TABLE rag_chunks_global (
+            chunk_id TEXT PRIMARY KEY,
+            document_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            FOREIGN KEY (document_id) REFERENCES rag_documents_global(document_id)
+        )
+    """)
+    await db.execute("""
+        INSERT INTO rag_chunks_global (chunk_id, document_id, chunk_index, content)
+        SELECT chunk_id, document_id, chunk_index, content FROM rag_chunks
+    """)
+    await db.execute("DROP TABLE rag_chunks")
+    await db.execute("DROP TABLE rag_documents")
+    await db.execute("ALTER TABLE rag_documents_global RENAME TO rag_documents")
+    await db.execute("ALTER TABLE rag_chunks_global RENAME TO rag_chunks")
 
 
 async def get_connection() -> aiosqlite.Connection:

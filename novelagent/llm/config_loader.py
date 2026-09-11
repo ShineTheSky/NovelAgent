@@ -11,6 +11,7 @@ class LLMConfig:
     provider: str
     model: str
     temperature: float = 0.7
+    reasoning_effort: str | None = None
     max_tokens: int = 8192
     timeout: float = 60
     base_url: str = ""
@@ -125,6 +126,7 @@ class LLMConfigLoader:
             provider=provider_key,
             model=pos.get("model", ""),
             temperature=pos.get("temperature", 0.7),
+            reasoning_effort=pos.get("reasoning_effort") or None,
             max_tokens=pos.get("max_tokens", 8192),
             timeout=pos.get("timeout", 60),
             base_url=base_url,

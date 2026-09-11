@@ -15,8 +15,12 @@ router = APIRouter(prefix="/api/settings")
 
 SETTING_TARGETS = {
     "main_loop": ("主 Agent", "main_loop", None),
-    "sub_agent": ("子 Agent（默认）", "sub_agent", None),
     "chapter_writer": ("章节写作子 Agent", "sub_agent", "chapter_writer"),
+    "chapter_polisher": ("章节润色子 Agent", "sub_agent", "chapter_polisher"),
+    "reviewer": ("章节审阅子 Agent", "sub_agent", "reviewer"),
+    "character_designer": ("角色设计子 Agent", "sub_agent", "character_designer"),
+    "outliner": ("大纲规划子 Agent", "sub_agent", "outliner"),
+    "memory_extractor": ("记忆提取子 Agent", "sub_agent", "memory_extractor"),
     "memory_prefetch": ("记忆预取", "memory_prefetch", None),
     "context_compression": ("上下文压缩", "context_compression", None),
     "auto_memory": ("自动记忆", "auto_memory", None),
@@ -25,6 +29,8 @@ SETTING_TARGETS = {
 class PositionUpdate(BaseModel):
     provider: str
     model: str
+    temperature: float | None = None
+    reasoning_effort: Literal["", "low", "medium", "high"] = ""
 
 
 class LLMSettingsUpdate(BaseModel):
@@ -99,6 +105,17 @@ def _provider_model_names(provider: dict) -> list[str]:
     return [model.strip() for model in models if isinstance(model, str) and model.strip()]
 
 
+def _position_response(loader: LLMConfigLoader, label: str, position_key: str, sub_type: str | None) -> dict:
+    resolved = loader.get_config(position_key, sub_type)
+    return {
+        "label": label,
+        "provider": resolved.provider,
+        "model": resolved.model,
+        "temperature": resolved.temperature,
+        "reasoning_effort": resolved.reasoning_effort or "",
+    }
+
+
 @router.get("/llm")
 async def get_llm_settings(request: Request):
     """返回可安全展示给浏览器的 provider 和模型设置。"""
@@ -107,14 +124,11 @@ async def get_llm_settings(request: Request):
     providers = config.get("providers", {})
     positions = config.get("positions", {})
     llm_client = request.app.state.agent_loop.llm
+    loader = LLMConfigLoader(str(config_path))
 
     return {
         "positions": {
-            key: {
-                "label": label,
-                "provider": (positions[position_key].get("overrides", {}).get(sub_type, {}) if sub_type else positions[position_key]).get("provider", config.get("defaults", {}).get("provider", "")),
-                "model": (positions[position_key].get("overrides", {}).get(sub_type, {}) if sub_type else positions[position_key]).get("model", config.get("defaults", {}).get("model", "")),
-            }
+            key: _position_response(loader, label, position_key, sub_type)
             for key, (label, position_key, sub_type) in SETTING_TARGETS.items()
             if position_key in positions
         },
@@ -201,16 +215,28 @@ async def update_llm_settings(body: LLMSettingsUpdate, request: Request):
         available_models = request.app.state.agent_loop.llm.get_runtime_provider_models(setting.provider) or _provider_model_names(providers[setting.provider])
         if model not in available_models:
             raise HTTPException(status_code=400, detail=f"模型 {model!r} 未在 {providers[setting.provider].get('name', setting.provider)} 的 API 配置中启用")
+        if setting.temperature is not None and not 0 <= setting.temperature <= 2:
+            raise HTTPException(status_code=400, detail="温度必须在 0 到 2 之间")
 
     overrides = _load_yaml(config_path.with_name("llm_overrides.yaml"))
     position_overrides = overrides.setdefault("positions", {})
     for key, setting in body.positions.items():
         _, position_key, sub_type = SETTING_TARGETS[key]
         target = position_overrides.setdefault(position_key, {})
+        values = {"provider": setting.provider, "model": setting.model.strip()}
+        if setting.temperature is not None:
+            values["temperature"] = setting.temperature
+        if setting.reasoning_effort:
+            values["reasoning_effort"] = setting.reasoning_effort
         if sub_type:
-            target.setdefault("overrides", {})[sub_type] = {"provider": setting.provider, "model": setting.model.strip()}
+            sub_target = target.setdefault("overrides", {}).setdefault(sub_type, {})
+            sub_target.update(values)
+            if not setting.reasoning_effort:
+                sub_target.pop("reasoning_effort", None)
         else:
-            target.update({"provider": setting.provider, "model": setting.model.strip()})
+            target.update(values)
+            if not setting.reasoning_effort:
+                target.pop("reasoning_effort", None)
 
     _save_yaml(config_path.with_name("llm_overrides.yaml"), overrides)
-    return {"status": "ok", "message": "Agent 模型路由已保存，将在下一次调用时生效。"}
+    return {"status": "ok", "message": "每个 Agent 的模型、温度和思考强度已保存，将在下一次调用时生效。"}

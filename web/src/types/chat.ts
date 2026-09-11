@@ -40,6 +40,8 @@ export interface ProjectInfo {
   created_at?: string;
 }
 
+export type ImportableProject = Pick<ProjectInfo, 'project_id' | 'name' | 'genre' | 'word_count'>;
+
 export interface SessionInfo {
   session_id: string;
   title: string;

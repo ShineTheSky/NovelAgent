@@ -4,7 +4,7 @@ import json
 import time
 import asyncio
 from typing import AsyncIterator, Literal
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import httpx
 from novelagent.llm.config_loader import LLMConfigLoader, LLMConfig
@@ -58,9 +58,12 @@ class LLMClient:
         stream: bool = True,
         sub_type: str = None,
         tag: str = "",
+        max_tokens: int | None = None,
     ) -> AsyncIterator[LLMResponse]:
         self._log_tag = tag
         config = self.loader.get_config(position, sub_type)
+        if max_tokens is not None:
+            config = replace(config, max_tokens=max_tokens)
         body = self._build_request(config, messages, tools, stream)
 
         last_error = None
@@ -91,6 +94,9 @@ class LLMClient:
             "temperature": config.temperature,
             "stream": stream,
         }
+        # reasoning_effort 是 OpenAI 兼容接口的可选参数；未设置时完全不发送。
+        if config.reasoning_effort and not config.is_anthropic:
+            body["reasoning_effort"] = config.reasoning_effort
         # Anthropic: system prompt is separate from messages
         if config.is_anthropic:
             system_msgs = [m for m in messages if m["role"] == "system"]

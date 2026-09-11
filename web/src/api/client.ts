@@ -2,6 +2,7 @@ import type {
   CreatedSession,
   Message,
   ProjectInfo,
+  ImportableProject,
   QuestionAnswer,
   SessionDetail,
   SessionInfo,
@@ -9,6 +10,7 @@ import type {
 } from '../types/chat';
 import type { LLMPositionUpdate, LLMSettings, ProviderSettingsUpdate } from '../types/llm';
 import type { MemoryPattern, TraceMemory } from '../types/insights';
+import type { NovelDocument, NovelTree } from '../types/novel';
 
 const BASE = '/api';
 
@@ -24,8 +26,28 @@ export interface RagDocument {
   document_id: string;
   title: string;
   source_name: string;
+  encoding: string;
   created_at?: string;
   chunk_count: number;
+  character_count: number;
+  is_corrupted: boolean;
+}
+
+export interface RagChunk {
+  chunk_id: string;
+  chunk_index: number;
+  content: string;
+  character_count: number;
+}
+
+export interface RagChunkPage {
+  document_id: string;
+  title: string;
+  source_name: string;
+  total: number;
+  offset: number;
+  limit: number;
+  chunks: RagChunk[];
 }
 
 export interface RagSearchResult {
@@ -82,6 +104,18 @@ export function createProject(name: string, genre = '') {
 
 export function listProjects() {
   return requestJson<ProjectInfo[]>('/projects');
+}
+
+export function listImportableProjects() {
+  return requestJson<ImportableProject[]>('/projects/importable');
+}
+
+export function importExistingProject(projectId: string) {
+  return requestJson<ImportableProject>('/projects/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId }),
+  });
 }
 
 export function createSession(projectId: string) {
@@ -241,24 +275,39 @@ export function fetchFileContent(projectId: string, filePath: string, signal?: A
   );
 }
 
-export function listRagDocuments(projectId: string) {
-  return requestJson<RagDocument[]>(`/projects/${resourceId(projectId)}/rag/documents`);
+export function fetchNovelTree(projectId: string, signal?: AbortSignal) {
+  return requestJson<NovelTree>(`/projects/${resourceId(projectId)}/novel`, { signal });
 }
 
-export function importRagDocument(projectId: string, title: string, content: string, sourceName = '') {
-  return requestJson<RagDocument>(`/projects/${resourceId(projectId)}/rag/documents`, {
+export function fetchNovelNode(projectId: string, nodeId: string, signal?: AbortSignal) {
+  return requestJson<{ node: NovelDocument; content: string }>(
+    `/projects/${resourceId(projectId)}/novel/nodes/${resourceId(nodeId)}`,
+    { signal },
+  );
+}
+
+export function listRagDocuments() {
+  return requestJson<RagDocument[]>('/rag/documents');
+}
+
+export function importRagDocument(title: string, content: string, sourceName = '', encoding = 'utf-8') {
+  return requestJson<RagDocument>('/rag/documents', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title, content, source_name: sourceName }),
+    body: JSON.stringify({ title, content, source_name: sourceName, encoding }),
   });
 }
 
-export function deleteRagDocument(projectId: string, documentId: string) {
-  return requestJson<void>(`/projects/${resourceId(projectId)}/rag/documents/${resourceId(documentId)}`, { method: 'DELETE' });
+export function deleteRagDocument(documentId: string) {
+  return requestJson<void>(`/rag/documents/${resourceId(documentId)}`, { method: 'DELETE' });
 }
 
-export function searchRag(projectId: string, query: string) {
-  return requestJson<RagSearchResult[]>(`/projects/${resourceId(projectId)}/rag/search?q=${encodeURIComponent(query)}&limit=5`);
+export function getRagDocumentChunks(documentId: string, offset = 0, limit = 50) {
+  return requestJson<RagChunkPage>(`/rag/documents/${resourceId(documentId)}/chunks?offset=${offset}&limit=${limit}`);
+}
+
+export function searchRag(query: string) {
+  return requestJson<RagSearchResult[]>(`/rag/search?q=${encodeURIComponent(query)}&limit=5`);
 }
 
 export function getLLMSettings() {

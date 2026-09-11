@@ -16,6 +16,8 @@ export interface LLMPositionSetting {
   label: string;
   provider: string;
   model: string;
+  temperature: number;
+  reasoning_effort: '' | 'low' | 'medium' | 'high';
 }
 
 export interface LLMSettings {
@@ -23,7 +25,7 @@ export interface LLMSettings {
   providers: LLMProviderOption[];
 }
 
-export type LLMPositionUpdate = Pick<LLMPositionSetting, 'provider' | 'model'>;
+export type LLMPositionUpdate = Pick<LLMPositionSetting, 'provider' | 'model' | 'temperature' | 'reasoning_effort'>;
 
 export interface ProviderSettingsUpdate {
   base_url: string;

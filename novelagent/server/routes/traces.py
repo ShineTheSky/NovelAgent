@@ -27,6 +27,7 @@ async def get_trace(trace_id: str, request: Request):
     if trace is None:
         raise HTTPException(status_code=404, detail="Trace 不存在")
     trace["events"] = await _store(request).list_events(trace_id, limit=500)
+    trace["classification"] = await _store(request).get_trace_classification(trace_id)
     return trace
 
 
@@ -49,8 +50,9 @@ async def get_trace_memory(project_id: str, memory_id: str, request: Request):
     if memory is None:
         raise HTTPException(status_code=404, detail="记忆不存在")
     file_path = memory.get("file_path", "")
-    if not file_path.startswith(".memory/"):
-        raise HTTPException(status_code=404, detail="记忆文件不存在")
-    project_dir = Path(request.app.state.agent_loop.working_dir) / project_id
-    memory["content"] = FileStore(str(project_dir)).read(file_path.removeprefix(".memory/"))
+    if file_path.startswith(".memory/"):
+        project_dir = Path(request.app.state.agent_loop.working_dir) / project_id
+        memory["content"] = FileStore(str(project_dir)).read(file_path.removeprefix(".memory/"))
+    else:
+        memory["content"] = memory["claim"]
     return memory

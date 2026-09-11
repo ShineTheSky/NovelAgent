@@ -6,7 +6,9 @@ import {
   deleteSession,
   getSession,
   listProjects,
+  listImportableProjects,
   listSessions,
+  importExistingProject,
   permissionResponse,
   questionResponse,
   sendMessage,
@@ -18,6 +20,7 @@ import type {
   PendingAsk,
   PendingQuestion,
   ProjectInfo,
+  ImportableProject,
   QuestionAnswer,
   SessionInfo,
   StreamEvent,
@@ -46,6 +49,9 @@ export function useChat() {
   const [acceptEdits, setAcceptEdits] = useState(false);
   const [showNewProject, setShowNewProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
+  const [showImportProjects, setShowImportProjects] = useState(false);
+  const [importableProjects, setImportableProjects] = useState<ImportableProject[]>([]);
+  const [importLoading, setImportLoading] = useState(false);
   const [pendingAsk, setPendingAsk] = useState<PendingAsk | null>(null);
   const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
   const [currentAction, setCurrentAction] = useState('');
@@ -178,6 +184,34 @@ export function useChat() {
       setAppError(`创建项目失败：${errorText(error)}`);
     }
   }, [loadSessions, newProjectName]);
+
+  const loadImportableProjects = useCallback(async () => {
+    setImportLoading(true);
+    setAppError(null);
+    try {
+      setImportableProjects(await listImportableProjects());
+    } catch (error) {
+      setAppError(`读取可导入项目失败：${errorText(error)}`);
+    } finally {
+      setImportLoading(false);
+    }
+  }, []);
+
+  const handleImportProject = useCallback(async (projectId: string) => {
+    setImportLoading(true);
+    setAppError(null);
+    try {
+      const project = await importExistingProject(projectId);
+      setProjects(previous => [project, ...previous]);
+      setImportableProjects(previous => previous.filter(item => item.project_id !== projectId));
+      setShowImportProjects(false);
+      await loadSessions(project.project_id);
+    } catch (error) {
+      setAppError(`导入项目失败：${errorText(error)}`);
+    } finally {
+      setImportLoading(false);
+    }
+  }, [loadSessions]);
 
   const handleNewSession = useCallback(async () => {
     if (!activeProject) return;
@@ -436,6 +470,10 @@ export function useChat() {
     setShowNewProject,
     newProjectName,
     setNewProjectName,
+    showImportProjects,
+    setShowImportProjects,
+    importableProjects,
+    importLoading,
     pendingAsk,
     pendingQuestion,
     currentAction,
@@ -444,6 +482,8 @@ export function useChat() {
     loadSessions,
     loadSession,
     handleNewProject,
+    loadImportableProjects,
+    handleImportProject,
     handleNewSession,
     handleSend,
     handleRetry,
