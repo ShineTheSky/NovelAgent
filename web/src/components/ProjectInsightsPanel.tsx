@@ -143,16 +143,16 @@ export function ProjectInsightsPanel({ projectId }: ProjectInsightsPanelProps) {
             <div className="px-6 pt-6 pb-4 pr-14 border-b border-gray-100 shrink-0">
               <div>
                 <h2 id="project-insights-title" className="font-semibold text-gray-800">项目洞察与记忆</h2>
-                <p className="mt-1 text-xs text-gray-400">Trace 保留证据；强信号可形成 Memory；相似证据会强化 Memory，达标后成为项目 Rule。</p>
+                <p className="mt-1 text-xs text-gray-400">Evidence 保留 Trace 证据；强信号可形成 Memory；相似 Memory 聚合后成为稳定 Pattern。</p>
               </div>
             </div>
             <button type="button" onClick={() => setOpen(false)} aria-label="关闭项目洞察" className="absolute right-4 top-4 z-10 flex h-8 w-8 items-center justify-center rounded-lg text-gray-400 hover:bg-gray-100 hover:text-gray-700">✕</button>
 
             <div className="px-6 pt-4 shrink-0 flex items-center justify-between gap-3">
               <div className="flex gap-1 rounded-xl bg-gray-100 p-1" role="tablist" aria-label="项目洞察分类">
-                <button type="button" role="tab" aria-selected={tab === 'traces'} onClick={() => setTab('traces')} className={`rounded-lg px-3 py-1.5 text-sm transition-colors ${tab === 'traces' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>Trace 证据 {traces.length ? `(${traces.length})` : ''}</button>
+                <button type="button" role="tab" aria-selected={tab === 'traces'} onClick={() => setTab('traces')} className={`rounded-lg px-3 py-1.5 text-sm transition-colors ${tab === 'traces' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>Evidence {traces.length ? `(${traces.length})` : ''}</button>
                 <button type="button" role="tab" aria-selected={tab === 'memories'} onClick={() => setTab('memories')} className={`rounded-lg px-3 py-1.5 text-sm transition-colors ${tab === 'memories' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>原子记忆 {memories.length ? `(${memories.length})` : ''}</button>
-                <button type="button" role="tab" aria-selected={tab === 'rules'} onClick={() => setTab('rules')} className={`rounded-lg px-3 py-1.5 text-sm transition-colors ${tab === 'rules' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>项目规则 {activeRules.length ? `(${activeRules.length})` : ''}</button>
+                <button type="button" role="tab" aria-selected={tab === 'rules'} onClick={() => setTab('rules')} className={`rounded-lg px-3 py-1.5 text-sm transition-colors ${tab === 'rules' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>Pattern {activeRules.length ? `(${activeRules.length})` : ''}</button>
               </div>
               <button type="button" onClick={() => void load()} disabled={loading} className="text-xs text-purple-600 hover:text-purple-700 disabled:opacity-40">{loading ? '刷新中…' : '刷新'}</button>
             </div>
@@ -179,7 +179,7 @@ export function ProjectInsightsPanel({ projectId }: ProjectInsightsPanelProps) {
                       <span>强化于 {formatDate(rule.last_reinforced_at)}</span>
                     </div>
                   </article>)}
-                  {activeRules.length === 0 && <EmptyState text="暂无生效的项目规则。强烈且稳定的反馈会先成为记忆；被多次相似证据支持后才会提升为规则。" />}
+                  {activeRules.length === 0 && <EmptyState text="暂无生效的 Pattern。相似 Memory 的权重达到阈值并通过必要的 Trace 回读核验后，会聚合为稳定 Pattern。" />}
                 </div>
               )}
 

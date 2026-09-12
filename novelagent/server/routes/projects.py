@@ -62,7 +62,7 @@ async def create_project(body: CreateProjectRequest, request: Request):
     project = await models.create_project(body.name, body.genre)
 
     # Create project directory structure
-    working_dir = Path(request.app.state.config.get("working_dir", "./workspace"))
+    working_dir = Path(request.app.state.agent_loop.working_dir)
     project_dir = working_dir / project.project_id
     project_dir.mkdir(parents=True, exist_ok=True)
     (project_dir / "chapters").mkdir(exist_ok=True)
@@ -105,7 +105,7 @@ async def list_importable_projects(request: Request):
     from novelagent.storage import models
 
     registered = {project.project_id for project in await models.list_projects()}
-    working_dir = Path(request.app.state.config.get("working_dir", "./workspace"))
+    working_dir = Path(request.app.state.agent_loop.working_dir)
     if not working_dir.exists():
         return []
 
@@ -128,7 +128,7 @@ async def import_existing_project(body: ImportProjectRequest, request: Request):
     except ValueError:
         raise HTTPException(status_code=400, detail="无效的项目 ID")
 
-    working_dir = Path(request.app.state.config.get("working_dir", "./workspace"))
+    working_dir = Path(request.app.state.agent_loop.working_dir)
     candidate = _import_candidate(working_dir / project_id)
     from novelagent.storage.database import get_connection
 

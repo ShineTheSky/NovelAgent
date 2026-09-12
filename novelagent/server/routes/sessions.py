@@ -189,7 +189,7 @@ async def send_message(session_id: str, body: SendMessageRequest, request: Reque
     )
 
     # Load project info
-    working_dir = Path(request.app.state.config.get("working_dir", "./workspace"))
+    working_dir = Path(request.app.state.agent_loop.working_dir)
     project_dir = working_dir / session.project_id
     project_info = {}
     project_yaml = project_dir / "project.yaml"
@@ -212,6 +212,10 @@ async def send_message(session_id: str, body: SendMessageRequest, request: Reque
             traceback.print_exc()
             yield f"event: error\ndata: {json.dumps({'type': 'error', 'message': f'服务器内部错误: {e}', 'timestamp': ''})}\n\n"
         finally:
+            active_trace_id = getattr(session, "active_trace_id", "")
+            if active_trace_id and agent_loop.trace:
+                await agent_loop.trace.finish(active_trace_id, "interrupted")
+                session.active_trace_id = ""
             # 先释放会话锁，防止save_messages（含LLM标题生成）阻塞后续请求
             _active_locks[session_id] = 0
             if session.messages:

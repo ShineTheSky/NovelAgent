@@ -51,13 +51,13 @@ export function ProjectOverview({ project, sessions, onNewSession, onSelectSessi
 
         <div className="grid gap-3 sm:grid-cols-3 mb-8">
           <StatCard label="会话" value={sessions.length} detail="该项目下的任务" />
-          <StatCard label="项目规则" value={rules.length} detail="会注入后续上下文" />
+          <StatCard label="Pattern" value={rules.length} detail="稳定规则，会注入后续上下文" />
           <StatCard label="原子记忆" value={memories.length} detail="均可回溯到 Trace" />
         </div>
 
         <div className="grid gap-5 lg:grid-cols-2">
           <section className="rounded-xl border border-gray-100 bg-[#fafbfc] p-5">
-            <div className="mb-4 flex items-center justify-between"><h2 className="text-sm font-semibold text-gray-700">生效中的项目规则</h2><span className="text-xs text-gray-400">{rules.length} 条</span></div>
+            <div className="mb-4 flex items-center justify-between"><h2 className="text-sm font-semibold text-gray-700">生效中的 Pattern</h2><span className="text-xs text-gray-400">{rules.length} 条</span></div>
             <div className="space-y-3">
               {rules.slice(0, 4).map(rule => (
                 <div key={rule.memory_id} className="rounded-lg bg-white px-3 py-2.5 border border-gray-100">
