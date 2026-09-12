@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { fetchNovelNode, fetchNovelTree } from '../api/client';
-import type { NovelDocument, NovelTree } from '../types/novel';
+import { fetchMaterialNode, fetchMaterialTree, fetchNovelNode, fetchNovelTree } from '../api/client';
+import type { MaterialDocument, MaterialTree, NovelDocument, NovelTree } from '../types/novel';
 
 interface NovelWorkspaceProps {
   projectId: string;
 }
+
+type WorkspaceDocument = NovelDocument | MaterialDocument;
 
 function formatCount(count: number) {
   return `${count.toLocaleString()} 字`;
@@ -34,18 +36,25 @@ function DocumentButton({ document, selectedId, onSelect, indent = false }: {
 
 export function NovelWorkspace({ projectId }: NovelWorkspaceProps) {
   const [tree, setTree] = useState<NovelTree | null>(null);
-  const [selected, setSelected] = useState<NovelDocument | null>(null);
+  const [materials, setMaterials] = useState<MaterialTree | null>(null);
+  const [selected, setSelected] = useState<WorkspaceDocument | null>(null);
   const [content, setContent] = useState<string | null>(null);
   const [loadingTree, setLoadingTree] = useState(true);
   const [loadingContent, setLoadingContent] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [materialsError, setMaterialsError] = useState<string | null>(null);
   const [showNavigator, setShowNavigator] = useState(true);
   const [navigatorWidth, setNavigatorWidth] = useState(288);
+  const [showMaterials, setShowMaterials] = useState(true);
+  const [materialsWidth, setMaterialsWidth] = useState(264);
   const contentAbortRef = useRef<AbortController | null>(null);
   const workspaceRef = useRef<HTMLDivElement>(null);
   const resizingNavigatorRef = useRef(false);
   const navigatorStartXRef = useRef(0);
   const navigatorStartWidthRef = useRef(288);
+  const resizingMaterialsRef = useRef(false);
+  const materialsStartXRef = useRef(0);
+  const materialsStartWidthRef = useRef(264);
 
   useEffect(() => {
     const onMouseMove = (event: MouseEvent) => {
@@ -54,13 +63,23 @@ export function NovelWorkspace({ projectId }: NovelWorkspaceProps) {
       setNavigatorWidth(Math.max(180, Math.min(maxWidth, navigatorStartWidthRef.current + event.clientX - navigatorStartXRef.current)));
     };
     const onMouseUp = () => { resizingNavigatorRef.current = false; };
+    const onMaterialsMouseMove = (event: MouseEvent) => {
+      if (!resizingMaterialsRef.current || !workspaceRef.current) return;
+      const maxWidth = Math.max(200, workspaceRef.current.clientWidth - (showNavigator ? navigatorWidth : 32) - 280);
+      setMaterialsWidth(Math.max(200, Math.min(maxWidth, materialsStartWidthRef.current + materialsStartXRef.current - event.clientX)));
+    };
+    const onMaterialsMouseUp = () => { resizingMaterialsRef.current = false; };
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup', onMouseUp);
+    window.addEventListener('mousemove', onMaterialsMouseMove);
+    window.addEventListener('mouseup', onMaterialsMouseUp);
     return () => {
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
+      window.removeEventListener('mousemove', onMaterialsMouseMove);
+      window.removeEventListener('mouseup', onMaterialsMouseUp);
     };
-  }, []);
+  }, [navigatorWidth, showNavigator]);
 
   const loadTree = useCallback(async () => {
     setLoadingTree(true);
@@ -75,12 +94,24 @@ export function NovelWorkspace({ projectId }: NovelWorkspaceProps) {
     }
   }, [projectId]);
 
-  useEffect(() => {
-    queueMicrotask(() => { void loadTree(); });
-    return () => contentAbortRef.current?.abort();
-  }, [loadTree]);
+  const loadMaterials = useCallback(async () => {
+    setMaterialsError(null);
+    try {
+      setMaterials(await fetchMaterialTree(projectId));
+    } catch (requestError) {
+      setMaterialsError(requestError instanceof Error ? requestError.message : '创作资料加载失败');
+    }
+  }, [projectId]);
 
-  const selectDocument = async (document: NovelDocument) => {
+  useEffect(() => {
+    queueMicrotask(() => {
+      void loadTree();
+      void loadMaterials();
+    });
+    return () => contentAbortRef.current?.abort();
+  }, [loadMaterials, loadTree]);
+
+  const selectDocument = async (document: WorkspaceDocument) => {
     contentAbortRef.current?.abort();
     const controller = new AbortController();
     contentAbortRef.current = controller;
@@ -89,7 +120,9 @@ export function NovelWorkspace({ projectId }: NovelWorkspaceProps) {
     setLoadingContent(true);
     setError(null);
     try {
-      const result = await fetchNovelNode(projectId, document.id, controller.signal);
+      const result = document.type === 'material'
+        ? await fetchMaterialNode(projectId, document.id, controller.signal)
+        : await fetchNovelNode(projectId, document.id, controller.signal);
       if (!controller.signal.aborted) setContent(result.content);
     } catch (requestError) {
       if (!controller.signal.aborted) setError(requestError instanceof Error ? requestError.message : '正文加载失败');
@@ -103,6 +136,13 @@ export function NovelWorkspace({ projectId }: NovelWorkspaceProps) {
     resizingNavigatorRef.current = true;
     navigatorStartXRef.current = event.clientX;
     navigatorStartWidthRef.current = navigatorWidth;
+  };
+
+  const startMaterialsResize = (event: React.MouseEvent) => {
+    event.preventDefault();
+    resizingMaterialsRef.current = true;
+    materialsStartXRef.current = event.clientX;
+    materialsStartWidthRef.current = materialsWidth;
   };
 
   return (
@@ -178,6 +218,45 @@ export function NovelWorkspace({ projectId }: NovelWorkspaceProps) {
           </div>
         )}
       </article>
+
+      {showMaterials ? <div style={{ width: materialsWidth }} className="relative shrink-0 max-md:hidden">
+        <aside className="h-full overflow-y-auto border-l border-gray-200 bg-[#fafbfc] p-3">
+          <div className="mb-3 flex cursor-default items-center justify-between select-none">
+            <div>
+              <h2 className="text-sm font-semibold text-gray-700">创作资料</h2>
+              <p className="mt-0.5 text-[11px] text-gray-400">世界观、角色与参考设定</p>
+            </div>
+            <div className="flex items-center gap-1">
+              <button type="button" onClick={() => void loadMaterials()} className="rounded px-2 py-1 text-xs text-purple-600 hover:bg-purple-50">刷新</button>
+              <button type="button" onClick={() => setShowMaterials(false)} className="rounded px-2 py-1 text-xs text-gray-500 hover:bg-gray-200" title="隐藏创作资料">隐藏</button>
+            </div>
+          </div>
+          {materialsError && <div role="alert" className="rounded-md bg-red-50 px-2 py-2 text-xs text-red-600">{materialsError}</div>}
+          {!materialsError && materials?.groups.length === 0 && <div className="py-8 text-center text-xs text-gray-400">尚未添加世界观、角色或参考资料。</div>}
+          {!materialsError && materials?.groups.map(group => (
+            <section key={group.id} className="mb-4">
+              <h3 className="mb-1 px-2 text-xs font-medium text-gray-700">{group.title}</h3>
+              <div className="border-l border-gray-200 pl-1">
+                {group.documents.map(document => (
+                  <button
+                    key={document.id}
+                    type="button"
+                    onClick={() => void selectDocument(document)}
+                    className={`flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors ${selected?.id === document.id ? 'bg-purple-50 text-purple-700' : 'text-gray-600 hover:bg-gray-100'}`}
+                    title={document.relative_path}
+                  >
+                    <span className="min-w-0 flex-1 truncate">{document.title}</span>
+                    <span className="shrink-0 text-[10px] text-gray-400">{formatCount(document.char_count)}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
+          ))}
+        </aside>
+        <div onMouseDown={startMaterialsResize} role="separator" aria-orientation="vertical" aria-label="调整创作资料宽度" className="absolute left-0 top-0 z-10 h-full w-1.5 cursor-col-resize hover:bg-purple-300 active:bg-purple-400" />
+      </div> : <div className="flex w-8 shrink-0 items-start justify-center border-l border-gray-200 bg-[#fafbfc] pt-3 max-md:hidden">
+        <button type="button" onClick={() => setShowMaterials(true)} className="rounded px-1.5 py-1 text-xs text-purple-600 hover:bg-purple-50" title="显示创作资料">‹</button>
+      </div>}
     </div>
   );
 }

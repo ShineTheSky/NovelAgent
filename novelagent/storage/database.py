@@ -53,6 +53,9 @@ async def init():
                 finished_at TEXT
             )
         """)
+        await _ensure_column(db, "traces", "source", "TEXT NOT NULL DEFAULT 'live'")
+        await _ensure_column(db, "traces", "operation_kind", "TEXT NOT NULL DEFAULT 'conversation'")
+        await _ensure_column(db, "traces", "analysis_status", "TEXT NOT NULL DEFAULT 'pending'")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS session_trace_turns (
                 session_id TEXT NOT NULL,
@@ -64,6 +67,7 @@ async def init():
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
             )
         """)
+        await _ensure_column(db, "session_trace_turns", "events_json", "TEXT NOT NULL DEFAULT '[]'")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS session_trace_state (
                 session_id TEXT PRIMARY KEY,
@@ -78,6 +82,17 @@ async def init():
                 end_turn_no INTEGER NOT NULL,
                 messages_json TEXT NOT NULL DEFAULT '[]',
                 FOREIGN KEY (trace_id) REFERENCES traces(trace_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS historical_trace_import_state (
+                session_id TEXT PRIMARY KEY,
+                source_message_count INTEGER NOT NULL DEFAULT 0,
+                source_hash TEXT NOT NULL DEFAULT '',
+                imported_trace_count INTEGER NOT NULL DEFAULT 0,
+                skipped_incomplete_count INTEGER NOT NULL DEFAULT 0,
+                completed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (session_id) REFERENCES sessions(session_id)
             )
         """)
         await db.execute("""
@@ -110,6 +125,32 @@ async def init():
                 file_path TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 FOREIGN KEY (trace_id) REFERENCES traces(trace_id)
+            )
+        """)
+        await _ensure_column(db, "trace_memories", "importance", "REAL NOT NULL DEFAULT 0")
+        await _ensure_column(db, "trace_memories", "support_count", "INTEGER NOT NULL DEFAULT 1")
+        await _ensure_column(db, "trace_memories", "contradiction_count", "INTEGER NOT NULL DEFAULT 0")
+        await _ensure_column(db, "trace_memories", "last_reinforced_at", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "trace_memories", "target_agents_json", "TEXT NOT NULL DEFAULT '[]'")
+        await _ensure_column(db, "trace_memories", "when_text", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "trace_memories", "then_text", "TEXT NOT NULL DEFAULT ''")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS trace_memory_evidence (
+                evidence_id TEXT PRIMARY KEY,
+                trace_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                kind TEXT NOT NULL,
+                subtype TEXT NOT NULL DEFAULT '',
+                claim TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'project',
+                signal TEXT NOT NULL DEFAULT 'weak',
+                confidence REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                memory_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (trace_id) REFERENCES traces(trace_id),
+                FOREIGN KEY (memory_id) REFERENCES trace_memories(memory_id)
             )
         """)
         await db.execute("""
@@ -165,6 +206,7 @@ async def init():
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trace_memories_project ON trace_memories(project_id, kind, subtype)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_trace_memory_evidence_project ON trace_memory_evidence(project_id, status, kind)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_memory_patterns_project ON memory_patterns(project_id, kind, subtype, status)")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS rag_documents (
@@ -184,10 +226,26 @@ async def init():
                 FOREIGN KEY (document_id) REFERENCES rag_documents(document_id)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS rag_chunk_embeddings (
+                chunk_id TEXT PRIMARY KEY,
+                dimensions INTEGER NOT NULL,
+                vector_blob BLOB NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (chunk_id) REFERENCES rag_chunks(chunk_id)
+            )
+        """)
         await _migrate_rag_to_global(db)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_rag_documents_created ON rag_documents(created_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_rag_chunks_document ON rag_chunks(document_id)")
         await db.commit()
+
+
+async def _ensure_column(db: aiosqlite.Connection, table: str, column: str, definition: str) -> None:
+    cursor = await db.execute(f"PRAGMA table_info({table})")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if column not in columns:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 async def _migrate_rag_to_global(db: aiosqlite.Connection) -> None:

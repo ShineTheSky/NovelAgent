@@ -9,8 +9,8 @@ import type {
   StreamEvent,
 } from '../types/chat';
 import type { LLMPositionUpdate, LLMSettings, ProviderSettingsUpdate } from '../types/llm';
-import type { MemoryPattern, TraceMemory } from '../types/insights';
-import type { NovelDocument, NovelTree } from '../types/novel';
+import type { MemoryPattern, TraceEvidence, TraceMemory } from '../types/insights';
+import type { MaterialDocument, MaterialTree, NovelDocument, NovelTree } from '../types/novel';
 
 const BASE = '/api';
 
@@ -29,6 +29,7 @@ export interface RagDocument {
   encoding: string;
   created_at?: string;
   chunk_count: number;
+  embedding_chunk_count: number;
   character_count: number;
   is_corrupted: boolean;
 }
@@ -58,6 +59,8 @@ export interface RagSearchResult {
   title: string;
   source_name: string;
   score: number;
+  bm25_score: number;
+  embedding_score: number | null;
 }
 
 export class ApiError extends Error {
@@ -256,6 +259,18 @@ export function compressSession(sessionId: string) {
   return requestJson<{ token_count: number; message: string }>(`/sessions/${resourceId(sessionId)}/compress`, { method: 'POST' });
 }
 
+export interface HistoricalTraceImportResult {
+  status: 'imported' | 'already_imported';
+  trace_count: number;
+  candidate_turn_count: number;
+  skipped_incomplete_count: number;
+  trace_ids?: string[];
+}
+
+export function importHistoricalTraces(sessionId: string) {
+  return requestJson<HistoricalTraceImportResult>(`/sessions/${resourceId(sessionId)}/traces/import-history`, { method: 'POST' });
+}
+
 export function toggleAcceptEdits(sessionId: string, enabled: boolean) {
   return requestJson<{ session_id: string; accept_edits_mode: boolean }>(`/sessions/${resourceId(sessionId)}/accept-edits`, {
     method: 'POST',
@@ -286,8 +301,35 @@ export function fetchNovelNode(projectId: string, nodeId: string, signal?: Abort
   );
 }
 
+export function fetchMaterialTree(projectId: string, signal?: AbortSignal) {
+  return requestJson<MaterialTree>(`/projects/${resourceId(projectId)}/materials`, { signal });
+}
+
+export function fetchMaterialNode(projectId: string, nodeId: string, signal?: AbortSignal) {
+  return requestJson<{ node: MaterialDocument; content: string }>(
+    `/projects/${resourceId(projectId)}/materials/nodes/${resourceId(nodeId)}`,
+    { signal },
+  );
+}
+
 export function listRagDocuments() {
   return requestJson<RagDocument[]>('/rag/documents');
+}
+
+export function rebuildRagEmbeddings() {
+  return requestJson<RagEmbeddingJob>('/rag/embeddings/rebuild', { method: 'POST' });
+}
+
+export interface RagEmbeddingJob {
+  job_id: string;
+  status: 'running' | 'completed' | 'failed';
+  completed_chunks: number;
+  total_chunks: number;
+  error: string;
+}
+
+export function getRagEmbeddingJob(jobId: string) {
+  return requestJson<RagEmbeddingJob>(`/rag/embeddings/rebuild/${resourceId(jobId)}`);
 }
 
 export function importRagDocument(title: string, content: string, sourceName = '', encoding = 'utf-8') {
@@ -338,8 +380,27 @@ export function fetchTraceMemories(projectId: string) {
   return requestJson<TraceMemory[]>(`/projects/${resourceId(projectId)}/trace-memories`);
 }
 
+export function fetchProjectRules(projectId: string) {
+  return requestJson<TraceMemory[]>(`/projects/${resourceId(projectId)}/rules`);
+}
+
+export function fetchProjectTraces(projectId: string) {
+  return requestJson<TraceEvidence[]>(`/projects/${resourceId(projectId)}/traces`);
+}
+
+export function fetchTrace(traceId: string) {
+  return requestJson<TraceEvidence>(`/traces/${resourceId(traceId)}`);
+}
+
 export function fetchTraceMemory(projectId: string, memoryId: string) {
   return requestJson<TraceMemory>(`/projects/${resourceId(projectId)}/trace-memories/${resourceId(memoryId)}`);
+}
+
+export function downgradeTraceMemory(projectId: string, memoryId: string) {
+  return requestJson<{ action: 'rule_to_memory' | 'memory_to_trace' }>(
+    `/projects/${resourceId(projectId)}/trace-memories/${resourceId(memoryId)}/downgrade`,
+    { method: 'POST' },
+  );
 }
 
 export type { Message };

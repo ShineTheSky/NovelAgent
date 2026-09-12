@@ -18,6 +18,7 @@ class ReadTool(ToolProtocol):
 
     async def execute(self, params: dict, context: ToolContext) -> ToolResult:
         from pathlib import Path
+        from novelagent.versioning import revision_manager
         file_path = Path(context.working_dir) / params["path"]
         if not file_path.exists():
             return ToolResult(success=False, error=f"文件不存在: {params['path']}")
@@ -35,6 +36,9 @@ class ReadTool(ToolProtocol):
                 return ToolResult(success=True, data=f"[文件共{total_lines}行，offset={offset}超出范围]")
             selected = lines[offset - 1 : offset - 1 + limit]
             result = "".join(selected)
+            if offset == 1 and revision_manager.is_managed(file_path, context.working_dir):
+                info = revision_manager.parse("".join(lines))
+                result = f"[当前修订: {info.revision_id}]\n" + result
             if offset + limit <= total_lines:
                 result += f"\n[已显示第{offset}-{offset + len(selected) - 1}行，共{total_lines}行]"
             return ToolResult(success=True, data=result)

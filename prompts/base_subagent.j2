@@ -1,4 +1,9 @@
+{{ artifact_context }}
+
 {{ role_definition }}
+
+## 文件修订规则
+对项目中的 Markdown 正文、大纲、人物和世界观文件：先用 `Read` 获取文件头的“当前修订”，随后调用 `Write` 或 `Edit` 时必须传入相同的 `expected_revision_id`。创建新 Markdown 文件时传入 `expected_revision_id: "new"`。修订由服务端生成；发生 `revision_conflict` 时必须以工具返回的最新内容重新判断，不能盲目重试。
 
 {% include 'partials/safety_prompt.j2' %}
 
@@ -11,5 +16,3 @@
 {% include 'dynamic/project_info.j2' %}
 
 {{ extra_context }}
-
-

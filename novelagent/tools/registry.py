@@ -24,8 +24,9 @@ class ToolRegistry:
     def list_all(self) -> list[ToolProtocol]:
         return list(self._tools.values())
 
-    def get_schemas(self) -> list[dict]:
-        return [t.get_schema() for t in self._tools.values()]
+    def get_schemas(self, tool_names: list[str] | None = None) -> list[dict]:
+        tools = self._tools.values() if tool_names is None else [self._tools[name] for name in tool_names if name in self._tools]
+        return [tool.get_schema() for tool in tools]
 
     def get_tools_prompt(self, tool_names: list[str] | None = None) -> str:
         tools = self._tools.values()

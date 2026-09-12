@@ -1,6 +1,7 @@
 """子Agent创建与编排"""
 
 import json
+import uuid
 from novelagent.tools.subagent_tool import SubAgentTool
 from novelagent.core.session import Session, ResponseChunk
 from novelagent.tools.base import ToolContext, ToolResult
@@ -20,7 +21,10 @@ class SubAgentRunner:
         from novelagent.context.prompt_manager import PromptManager
         self.prompt_manager = PromptManager("prompts")
 
-    def _build_system_prompt(self, preset: dict, extra_context: str = "", attachments: list[dict] | None = None) -> str:
+    def _build_system_prompt(
+        self, preset: dict, extra_context: str = "", attachments: list[dict] | None = None,
+        artifact_context: str = "",
+    ) -> str:
         from datetime import datetime
         tool_names = preset.get("tools", [])
         tools_desc = self.tools.get_tools_prompt(tool_names) if tool_names else ""
@@ -33,7 +37,7 @@ class SubAgentRunner:
                 elif isinstance(att, dict):
                     att_lines.append(f"\n### {att.get('path', '')}\n{att.get('content', '')}")
             att_text = "\n".join(att_lines)
-        ctx = f"{att_text}\n\n{extra_context}" if att_text else extra_context
+        artifact = artifact_context or att_text
         return self.prompt_manager.render("base_subagent.j2", {
             "role_definition": preset.get("system_prompt", ""),
             "current_date": datetime.now().strftime("%Y-%m-%d"),
@@ -41,13 +45,16 @@ class SubAgentRunner:
             "memory_md_content": "",
             "memory_enabled": preset.get("memory_enabled", False),
             "tools_description": tools_desc,
-            "extra_context": ctx,
+            "artifact_context": artifact,
+            "extra_context": extra_context,
         })
 
     async def spawn_and_run(
         self, preset_name: str, task: str, parent_session: Session,
         inherit_history: bool | None = None, extra_context: str = "",
-        attachments: list[dict] | None = None,
+        attachments: list[dict] | None = None, artifact_context: str = "",
+        actor: str | None = None, operation_id: str = "",
+        run_id: str = "", parent_run_id: str = "", workflow: str = "",
     ):
         preset = self.presets_tool.get_preset(preset_name)
         if preset is None:
@@ -58,9 +65,20 @@ class SubAgentRunner:
         max_turns = preset.get("max_turns", 8)
         tool_names = preset.get("tools", [])
 
-        yield ResponseChunk(type="thinking", data={"content": f"启动子Agent: {preset_name} — {preset.get('description', '')}"})
+        current_run_id = run_id or uuid.uuid4().hex
+        src = {
+            "source": "subagent",
+            "run_id": current_run_id,
+            "parent_run_id": parent_run_id or None,
+            "preset": preset_name,
+            "workflow": workflow or None,
+        }
+        yield ResponseChunk(type="subagent_start", data={
+            **src,
+            "task_summary": task.strip().replace("\n", " ")[:160],
+        })
 
-        system_prompt = self._build_system_prompt(preset, extra_context, attachments)
+        system_prompt = self._build_system_prompt(preset, extra_context, attachments, artifact_context)
         initial_messages = []
         if inherit:
             parent_msgs = parent_session.messages[-20:] if len(parent_session.messages) > 20 else parent_session.messages
@@ -80,6 +98,8 @@ class SubAgentRunner:
             except Exception:
                 pass
 
+        revision_events: list[dict] = []
+
         async def execute_tool(tool_name, params, tool_call_id):
             if tool_name == "AskUserQuestion":
                 import asyncio
@@ -94,6 +114,9 @@ class SubAgentRunner:
                     session_id=parent_session.session_id,
                     project_id=parent_session.project_id,
                     working_dir=f"{self.working_dir}/{parent_session.project_id}",
+                    actor=actor or preset_name,
+                    operation_id=operation_id,
+                    revision_events=revision_events,
                 )
                 result = await tool.execute(params, sub_ctx)
                 data = result.data if isinstance(result.data, str) else json.dumps(result.data, ensure_ascii=False)
@@ -108,7 +131,6 @@ class SubAgentRunner:
                 max_turns=max_turns, tag=f":sub/{preset_name}",
                 execute_tool=execute_tool, sub_type=preset_name,
             ):
-                src = {"source": "subagent"}
                 if ev["type"] == "thinking":
                     yield ResponseChunk(type="thinking", data={**src, "content": ev["content"]})
                 elif ev["type"] == "text_delta":
@@ -120,13 +142,13 @@ class SubAgentRunner:
                 elif ev["type"] == "question_ask":
                     yield ResponseChunk(type="question_ask", data={**src, "questions": ev["questions"]})
                 elif ev["type"] == "error":
-                    yield ResponseChunk(type="error", data={"message": f"子Agent执行失败: {ev['error']}"})
+                    yield ResponseChunk(type="error", data={**src, "message": f"子Agent执行失败: {ev['error']}"})
                     return
                 elif ev["type"] == "result":
                     result_text = ev["final_text"].strip() or "(子Agent未返回内容)"
         except Exception as e:
-            yield ResponseChunk(type="error", data={"message": f"子Agent执行失败: {e}"})
+            yield ResponseChunk(type="error", data={**src, "message": f"子Agent执行失败: {e}"})
             return
 
         print(f"[sub/{preset_name}] 完成: result_len={len(result_text)} preview={result_text[:100]}...", flush=True)
-        yield ResponseChunk(type="subagent_done", data={"result": result_text})
+        yield ResponseChunk(type="subagent_done", data={**src, "result": result_text, "revision_events": revision_events})

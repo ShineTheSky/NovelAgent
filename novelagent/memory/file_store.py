@@ -1,6 +1,7 @@
 """.memory/ 文件读写"""
 
 import yaml
+import re
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -13,7 +14,7 @@ class FileStore:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
 
     def read(self, rel_path: str) -> str:
-        file_path = self.memory_dir / rel_path
+        file_path = self.memory_dir / rel_path.split("#", 1)[0]
         if not file_path.exists():
             return ""
         return file_path.read_text(encoding="utf-8")
@@ -43,6 +44,7 @@ class FileStore:
         frontmatter.setdefault("type", "")
         frontmatter.setdefault("tags", [])
         frontmatter.setdefault("summary", "")
+        frontmatter.setdefault("weight", 50)
         frontmatter.setdefault("created", now)
         frontmatter.setdefault("status", "active")
         frontmatter["updated"] = now
@@ -54,7 +56,7 @@ class FileStore:
             if len(parts) >= 3:
                 try:
                     new_fm = yaml.safe_load(parts[1]) or {}
-                    frontmatter.update({k: v for k, v in new_fm.items() if v})
+                    frontmatter.update({k: v for k, v in new_fm.items() if v is not None and v != ""})
                     body = parts[2].strip()
                 except yaml.YAMLError:
                     pass
@@ -63,7 +65,7 @@ class FileStore:
         file_content = f"---\n{fm_yaml}\n---\n\n{body}"
         file_path.write_text(file_content, encoding="utf-8")
 
-    def scan_frontmatter(self) -> list[dict]:
+    def scan_frontmatter(self, exclude_prefixes: tuple[str, ...] = ()) -> list[dict]:
         """扫描所有.md文件，提取frontmatter元信息"""
         self._ensure_dir()
         results = []
@@ -72,13 +74,55 @@ class FileStore:
                 continue
             try:
                 text = md_file.read_text(encoding="utf-8")
+                rel = str(md_file.relative_to(self.memory_dir)).replace("\\", "/")
+                if any(rel.startswith(prefix) for prefix in exclude_prefixes):
+                    continue
+                if rel == "project_rules.md":
+                    results.extend(self._scan_project_rule_entries(text))
+                    continue
                 if text.startswith("---"):
                     parts = text.split("---", 2)
                     if len(parts) >= 3:
                         fm = yaml.safe_load(parts[1]) or {}
-                        rel = str(md_file.relative_to(self.memory_dir)).replace("\\", "/")
+                        if fm.get("status") == "trace":
+                            continue
+                        fallback_date = datetime.fromtimestamp(
+                            md_file.stat().st_mtime, timezone.utc
+                        ).strftime("%Y-%m-%dT%H:%M:%S")
+                        fm.setdefault("weight", 50)
+                        fm.setdefault("created", fallback_date)
+                        fm.setdefault("updated", fallback_date)
                         fm["_path"] = ".memory/" + rel
                         results.append(fm)
             except (yaml.YAMLError, UnicodeDecodeError):
                 continue
         return results
+
+    @staticmethod
+    def _scan_project_rule_entries(text: str) -> list[dict]:
+        """Expose structured sections in project_rules.md as individual index rows."""
+        pattern = re.compile(
+            r"^## \[(?P<kind>rule|correction|decision|context)\] (?P<title>.+?)\n"
+            r"<!-- memory-entry\n(?P<meta>.*?)\n-->",
+            re.MULTILINE | re.DOTALL,
+        )
+        entries = []
+        for match in pattern.finditer(text):
+            try:
+                meta = yaml.safe_load(match.group("meta")) or {}
+            except yaml.YAMLError:
+                meta = {}
+            entry_id = str(meta.get("id", "")).strip()
+            if not entry_id:
+                continue
+            tags = meta.get("tags", [])
+            entries.append({
+                "type": f"project_{match.group('kind')}",
+                "tags": tags if isinstance(tags, list) else [],
+                "summary": str(meta.get("summary") or match.group("title")).strip(),
+                "weight": meta.get("weight", 50),
+                "created": str(meta.get("created", "")),
+                "updated": str(meta.get("updated", "")),
+                "_path": f".memory/project_rules.md#{entry_id}",
+            })
+        return entries

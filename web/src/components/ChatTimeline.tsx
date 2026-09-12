@@ -1,10 +1,10 @@
 import { useEffect, useRef } from 'react';
 import type { ReactNode } from 'react';
 import type { Message, PendingAsk, PendingQuestion, ToolCall } from '../types/chat';
+import { AgentRunCard } from './AgentRunCard';
 import { MessageBubble } from './MessageBubble';
 import { PermissionDialog } from './PermissionDialog';
 import { QuestionDialog } from './QuestionDialog';
-import { SubagentGroup } from './SubagentGroup';
 import { ToolCard } from './ToolCard';
 import { ToolResultCard } from './ToolResultCard';
 
@@ -56,25 +56,19 @@ export function ChatTimeline({
     endRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const elements: ReactNode[] = [];
-  let index = 0;
-  while (index < messages.length) {
-    const message = messages[index];
-    if (message.source === 'subagent') {
-      const grouped: Message[] = [];
-      let preset = message.preset ?? '';
-      while (index < messages.length && messages[index]?.source === 'subagent') {
-        const current = messages[index];
-        grouped.push(current);
-        if (!preset && current.preset) preset = current.preset;
-        index += 1;
-      }
-      elements.push(<SubagentGroup key={grouped[0]?.id ?? `subagent-${index}`} messages={grouped} preset={preset} />);
-      continue;
-    }
-    elements.push(<div key={message.id ?? index}><MessageItem message={message} /></div>);
-    index += 1;
+  const runs = messages.flatMap(message => message.run ? [message.run] : []);
+  const childRuns = new Map<string, typeof runs>();
+  for (const run of runs) {
+    if (!run.parentRunId) continue;
+    childRuns.set(run.parentRunId, [...(childRuns.get(run.parentRunId) ?? []), run]);
   }
+  const elements: ReactNode[] = messages.flatMap((message, index) => {
+    if (message.run) {
+      if (message.run.parentRunId && runs.some(run => run.id === message.run!.parentRunId)) return [];
+      return <AgentRunCard key={message.run.id} run={message.run} children={childRuns.get(message.run.id)} />;
+    }
+    return <div key={message.id ?? index}><MessageItem message={message} /></div>;
+  });
 
   return (
     <div className="flex-1 overflow-y-auto" role="log" aria-live="polite" aria-label="对话消息">

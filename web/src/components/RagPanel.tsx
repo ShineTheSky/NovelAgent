@@ -1,11 +1,14 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   deleteRagDocument,
   getRagDocumentChunks,
+  getRagEmbeddingJob,
   importRagDocument,
   listRagDocuments,
+  rebuildRagEmbeddings,
   searchRag,
   type RagChunkPage,
+  type RagEmbeddingJob,
   type RagDocument,
   type RagSearchResult,
 } from '../api/client';
@@ -37,7 +40,13 @@ export function RagPanel({ onClose }: RagPanelProps) {
   const [busy, setBusy] = useState(false);
   const [chunkBusy, setChunkBusy] = useState(false);
   const [error, setError] = useState('');
+  const [embeddingMessage, setEmbeddingMessage] = useState('');
+  const [embeddingJob, setEmbeddingJob] = useState<RagEmbeddingJob | null>(null);
+  const [panelOffset, setPanelOffset] = useState({ x: 0, y: 0 });
   const inputRef = useRef<HTMLInputElement>(null);
+  const dragStart = useRef<{ pointerX: number; pointerY: number; offsetX: number; offsetY: number } | null>(null);
+  const embeddedChunks = documents.reduce((total, document) => total + document.embedding_chunk_count, 0);
+  const totalChunks = documents.reduce((total, document) => total + document.chunk_count, 0);
 
   const refresh = async () => {
     try {
@@ -50,6 +59,21 @@ export function RagPanel({ onClose }: RagPanelProps) {
   };
 
   useEffect(() => { void refresh(); inputRef.current?.focus(); }, []);
+
+  useEffect(() => {
+    if (!embeddingJob || embeddingJob.status !== 'running') return;
+    const timer = window.setInterval(() => {
+      void getRagEmbeddingJob(embeddingJob.job_id).then(next => {
+        setEmbeddingJob(next);
+        if (next.status === 'completed') {
+          setEmbeddingMessage(next.total_chunks ? `已为 ${next.completed_chunks} 个分块建立向量。` : '所有分块的向量都已就绪。');
+          void refresh();
+        }
+        if (next.status === 'failed') setError(next.error || '构建向量失败');
+      }).catch(error => { setError(error instanceof Error ? error.message : '读取构建进度失败'); setEmbeddingJob(null); });
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [embeddingJob?.job_id, embeddingJob?.status]);
 
   useEffect(() => {
     if (!selectedDocumentId) { setChunkPage(null); return; }
@@ -84,6 +108,15 @@ export function RagPanel({ onClose }: RagPanelProps) {
     finally { setBusy(false); }
   };
 
+  const handleRebuildEmbeddings = async () => {
+    setError(''); setEmbeddingMessage('');
+    try {
+      setEmbeddingJob(await rebuildRagEmbeddings());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '构建向量失败');
+    }
+  };
+
   const handleDelete = async (documentId: string) => {
     setBusy(true); setError('');
     try {
@@ -101,28 +134,48 @@ export function RagPanel({ onClose }: RagPanelProps) {
     setExpandedChunkId('');
   };
 
+  const startDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if ((event.target as HTMLElement).closest('button')) return;
+    dragStart.current = { pointerX: event.clientX, pointerY: event.clientY, offsetX: panelOffset.x, offsetY: panelOffset.y };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const dragPanel = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const start = dragStart.current;
+    if (!start) return;
+    setPanelOffset({ x: start.offsetX + event.clientX - start.pointerX, y: start.offsetY + event.clientY - start.pointerY });
+  };
+
+  const stopDrag = () => { dragStart.current = null; };
+
   return (
     <div className="fixed inset-0 z-30 flex items-start justify-end bg-black/15" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
-      <section className="mr-[264px] mt-14 w-[780px] max-w-[calc(100vw-24px)] rounded-xl border border-gray-200 bg-white p-4 shadow-xl">
-        <div className="flex items-center justify-between">
-          <div><h2 className="text-sm font-semibold text-gray-800">全局参考资料库</h2><p className="mt-0.5 text-[11px] text-gray-400">资料由所有项目共享，写作时会自动检索相关片段</p></div>
+      <section style={{ transform: `translate(${panelOffset.x}px, ${panelOffset.y}px)` }} className="mr-[264px] mt-14 w-[780px] max-w-[calc(100vw-24px)] rounded-xl border border-gray-200 bg-white p-4 shadow-xl">
+        <div onPointerDown={startDrag} onPointerMove={dragPanel} onPointerUp={stopDrag} onPointerCancel={stopDrag} className="flex cursor-grab touch-none items-center justify-between active:cursor-grabbing">
+          <div><h2 className="text-sm font-semibold text-gray-800">全局参考资料库</h2><p className="mt-0.5 text-[11px] text-gray-400">BM25 与本地 Emb 混合检索，资料由所有项目共享 · Emb {embeddedChunks}/{totalChunks}</p></div>
           <button type="button" onClick={onClose} className="rounded px-2 text-lg text-gray-400 hover:bg-gray-100">×</button>
         </div>
         <label className="mt-4 flex cursor-pointer items-center justify-center rounded-lg border border-dashed border-purple-300 bg-purple-50 px-3 py-3 text-xs text-purple-700 hover:bg-purple-100">
           <input type="file" accept=".txt,.md,.markdown,.text" className="hidden" disabled={busy} onChange={event => { const file = event.target.files?.[0]; if (file) void handleImport(file); event.target.value = ''; }} />
           {busy ? '处理中…' : '选择 TXT / Markdown 文章导入'}
         </label>
+        <div className="mt-2 flex items-center justify-between gap-3 text-[11px]">
+          <span className="text-gray-400">旧资料可手动补齐 Emb；新导入资料会自动生成。</span>
+          <button type="button" onClick={() => void handleRebuildEmbeddings()} disabled={busy || embeddingJob?.status === 'running'} className="shrink-0 rounded border border-gray-200 px-2 py-1 text-gray-600 hover:border-purple-300 hover:text-purple-600 disabled:opacity-40">{embeddingJob?.status === 'running' ? '构建中…' : '构建/补齐 Emb'}</button>
+        </div>
+        {embeddingJob?.status === 'running' && <div className="mt-2"><div className="mb-1 flex justify-between text-[11px] text-gray-500"><span>正在生成向量…</span><span>{embeddingJob.total_chunks ? `${embeddingJob.completed_chunks}/${embeddingJob.total_chunks}` : '准备中…'}</span></div><div className="h-1.5 overflow-hidden rounded-full bg-gray-100"><div className="h-full rounded-full bg-purple-500 transition-all" style={{ width: `${embeddingJob.total_chunks ? Math.round(embeddingJob.completed_chunks / embeddingJob.total_chunks * 100) : 5}%` }} /></div></div>}
         <div className="mt-3 flex gap-2">
           <input ref={inputRef} value={query} onChange={event => setQuery(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void handleSearch(); }} placeholder="搜索资料库中的相似内容" className="min-w-0 flex-1 rounded-md border border-gray-200 px-2.5 py-2 text-xs outline-none focus:border-purple-400" />
           <button type="button" onClick={() => void handleSearch()} disabled={busy || !query.trim()} className="rounded-md bg-gray-800 px-3 text-xs text-white disabled:opacity-40">检索</button>
         </div>
         {error && <div className="mt-2 rounded-md bg-red-50 px-2 py-1.5 text-xs text-red-600">{error}</div>}
-        {results.length > 0 && <div className="mt-3 space-y-2 border-t border-gray-100 pt-3"><div className="text-[11px] font-medium text-gray-500">检索结果</div>{results.map(result => <article key={result.chunk_id} className="rounded-md bg-gray-50 p-2.5 text-xs text-gray-600"><div className="mb-1 font-medium text-gray-700">{result.title}</div><div className="line-clamp-4 whitespace-pre-wrap leading-5">{result.content}</div></article>)}</div>}
-        <div className="mt-4 grid min-h-[18rem] grid-cols-[minmax(0,0.9fr)_minmax(0,1.6fr)] gap-3 border-t border-gray-100 pt-3">
+        {embeddingMessage && <div className="mt-2 rounded-md bg-emerald-50 px-2 py-1.5 text-xs text-emerald-700">{embeddingMessage}</div>}
+        {results.length > 0 && <div className="mt-3 border-t border-gray-100 pt-3"><div className="mb-2 text-[11px] font-medium text-gray-500">检索结果</div><div className="max-h-[28rem] space-y-2 overflow-y-auto pr-1">{results.map(result => <article key={result.chunk_id} className="relative rounded-md bg-gray-50 p-2.5 pr-28 text-xs text-gray-600"><div className="absolute right-2 top-2 flex flex-col items-end gap-1 text-[10px] font-medium"><span className={`rounded px-1.5 py-0.5 ${scoreClass(result.score)}`}>混合 {formatScore(result.score)}</span><span className="rounded bg-violet-100 px-1.5 py-0.5 text-violet-700">Emb {result.embedding_score === null ? '—' : formatScore(result.embedding_score)}</span><span className="rounded bg-sky-100 px-1.5 py-0.5 text-sky-700">BM25 {formatScore(result.bm25_score)}</span></div><div className="mb-1 truncate pr-2 font-medium text-gray-700">{result.title}</div><div className="whitespace-pre-wrap leading-5">{result.content}</div></article>)}</div></div>}
+        {results.length === 0 && <div className="mt-4 grid min-h-[18rem] grid-cols-[minmax(0,0.9fr)_minmax(0,1.6fr)] gap-3 border-t border-gray-100 pt-3">
           <div className="min-w-0 border-r border-gray-100 pr-3">
             <div className="mb-2 text-[11px] font-medium text-gray-500">已导入资料 · {documents.length}</div>
             <div className="max-h-[22rem] space-y-1 overflow-y-auto">
-              {documents.map(document => <div key={document.document_id} className={`flex items-center gap-1 rounded-md px-2 py-2 text-xs ${selectedDocumentId === document.document_id ? 'bg-purple-50' : 'hover:bg-gray-50'}`}><button type="button" onClick={() => selectDocument(document.document_id)} className="min-w-0 flex-1 text-left"><span className="block truncate text-gray-700" title={document.source_name || document.title}>{document.title}</span><span className="mt-0.5 block text-[10px] text-gray-400">{document.chunk_count} 块 · {document.character_count.toLocaleString()} 字</span></button>{document.is_corrupted && <span className="shrink-0 text-[10px] text-red-500">需重导</span>}<button type="button" onClick={() => void handleDelete(document.document_id)} className="shrink-0 text-gray-300 hover:text-red-500" aria-label={`删除 ${document.title}`}>×</button></div>)}
+              {documents.map(document => <div key={document.document_id} className={`flex items-center gap-1 rounded-md px-2 py-2 text-xs ${selectedDocumentId === document.document_id ? 'bg-purple-50' : 'hover:bg-gray-50'}`}><button type="button" onClick={() => selectDocument(document.document_id)} className="min-w-0 flex-1 text-left"><span className="flex items-center gap-1.5"><span className="block truncate text-gray-700" title={document.source_name || document.title}>{document.title}</span><span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${document.embedding_chunk_count === document.chunk_count && document.chunk_count > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-gray-100 text-gray-500'}`}>{document.embedding_chunk_count === document.chunk_count && document.chunk_count > 0 ? 'Emb 已就绪' : '待构建 Emb'}</span></span><span className="mt-0.5 block text-[10px] text-gray-400">{document.chunk_count} 块 · {document.character_count.toLocaleString()} 字 · 向量 {document.embedding_chunk_count}/{document.chunk_count}</span></button>{document.is_corrupted && <span className="shrink-0 text-[10px] text-red-500">需重导</span>}<button type="button" onClick={() => void handleDelete(document.document_id)} className="shrink-0 text-gray-300 hover:text-red-500" aria-label={`删除 ${document.title}`}>×</button></div>)}
               {documents.length === 0 && <div className="py-3 text-center text-xs text-gray-400">还没有导入资料</div>}
             </div>
           </div>
@@ -134,8 +187,18 @@ export function RagPanel({ onClose }: RagPanelProps) {
               {!chunkBusy && !chunkPage && <div className="py-8 text-center text-xs text-gray-400">点击资料名称查看其分块</div>}
             </div>
           </div>
-        </div>
+        </div>}
       </section>
     </div>
   );
+}
+
+function scoreClass(score: number) {
+  if (score >= 0.75) return 'bg-emerald-100 text-emerald-700';
+  if (score >= 0.55) return 'bg-amber-100 text-amber-700';
+  return 'bg-rose-100 text-rose-700';
+}
+
+function formatScore(score: number) {
+  return Number(score.toFixed(2)).toString();
 }

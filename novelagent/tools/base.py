@@ -31,6 +31,9 @@ class ToolContext:
     accept_edits_mode: bool = False
     allow_rules: list[dict] = field(default_factory=list)
     previously_allowed: set[str] = field(default_factory=set)
+    operation_id: str = ""
+    actor: str = "main_agent"
+    revision_events: list[dict] = field(default_factory=list)
 
     def is_previously_allowed(self, key: str) -> bool:
         return key in self.previously_allowed

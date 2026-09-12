@@ -1,5 +1,7 @@
 """Project reference-library API."""
 
+import asyncio
+import uuid
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -26,6 +28,36 @@ async def import_document(body: ImportDocumentRequest, request: Request):
 @router.get("/rag/documents")
 async def list_documents(request: Request):
     return await request.app.state.rag_store.list_documents()
+
+
+@router.post("/rag/embeddings/rebuild")
+async def rebuild_embeddings(request: Request):
+    """Explicitly backfill vectors for documents imported before Emb was enabled."""
+    jobs = getattr(request.app.state, "rag_embedding_jobs", {})
+    job_id = f"rag_emb_{uuid.uuid4().hex}"
+    jobs[job_id] = {"job_id": job_id, "status": "running", "completed_chunks": 0, "total_chunks": 0, "error": ""}
+    request.app.state.rag_embedding_jobs = jobs
+
+    async def run() -> None:
+        job = jobs[job_id]
+        def update(completed: int, total: int) -> None:
+            job.update({"completed_chunks": completed, "total_chunks": total})
+        try:
+            result = await request.app.state.rag_store.rebuild_embeddings(update)
+            job.update({"status": "completed", "completed_chunks": result["embedded_chunks"], "total_chunks": result["missing_chunks"]})
+        except RuntimeError as exc:
+            job.update({"status": "failed", "error": str(exc)})
+
+    asyncio.create_task(run())
+    return jobs[job_id]
+
+
+@router.get("/rag/embeddings/rebuild/{job_id}")
+async def get_rebuild_status(job_id: str, request: Request):
+    job = getattr(request.app.state, "rag_embedding_jobs", {}).get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="向量构建任务不存在或服务已重启")
+    return job
 
 
 @router.delete("/rag/documents/{document_id}")

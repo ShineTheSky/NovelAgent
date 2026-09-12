@@ -25,8 +25,55 @@ export interface TraceMemory {
   claim: string;
   scope: string;
   confidence: number;
-  status: string;
+  status: 'memory' | 'rule' | 'disputed' | 'trace';
+  importance: number;
+  support_count: number;
+  contradiction_count: number;
+  last_reinforced_at: string;
+  target_agents: string[];
+  when_text: string;
+  then_text: string;
   file_path: string;
   created_at: string;
   content?: string;
+}
+
+export interface TraceEvent {
+  event_id: string;
+  sequence_no: number;
+  event_type: string;
+  actor: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface TraceClassification {
+  has_error: boolean;
+  has_correction: boolean;
+  has_confirmation: boolean;
+  has_feedback: boolean;
+  items: Array<{ event_id: string; type: 'error' | 'correction' | 'confirmation' | 'feedback'; summary: string; confidence: number }>;
+}
+
+export interface TraceEvidence {
+  trace_id: string;
+  session_id: string;
+  project_id: string;
+  user_message: string;
+  final_answer: string;
+  status: string;
+  source: 'live' | 'historical';
+  operation_kind: 'conversation' | 'routine' | 'tool_only' | 'system';
+  analysis_status: 'pending' | 'complete' | 'skipped';
+  token_count: number;
+  event_count: number;
+  started_at: string;
+  finished_at?: string;
+  has_error: boolean;
+  has_correction: boolean;
+  has_confirmation: boolean;
+  has_feedback: boolean;
+  is_classified?: boolean;
+  classification?: TraceClassification | null;
+  events?: TraceEvent[];
 }

@@ -16,7 +16,7 @@ class InternalRequest:
 
 @dataclass
 class ResponseChunk:
-    type: Literal["text_delta", "thinking", "tool_call", "tool_result", "subagent_done", "subagent_result", "permission_ask", "question_ask", "done", "error"]
+    type: Literal["text_delta", "thinking", "tool_call", "tool_result", "subagent_start", "subagent_done", "subagent_result", "permission_ask", "question_ask", "done", "error"]
     data: dict = field(default_factory=dict)
     timestamp: str = ""
 

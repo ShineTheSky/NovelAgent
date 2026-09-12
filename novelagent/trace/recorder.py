@@ -30,6 +30,11 @@ def _sanitize(value, key: str = ""):
     return value
 
 
+def sanitize_payload(value):
+    """Use the same redaction policy for deferred and immediate Trace events."""
+    return _sanitize(value)
+
+
 class TraceRecorder:
     def __init__(self, store: TraceStore | None = None):
         self.store = store or TraceStore()

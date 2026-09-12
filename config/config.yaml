@@ -3,6 +3,9 @@
 # 项目工作目录（所有文件操作限制在此目录内，相对路径相对于项目根目录）
 working_dir: "./workspace"
 
+memory:
+  global_dir: "global_memory"
+
 # 安全配置
 security:
   bash:
@@ -13,12 +16,12 @@ security:
   # Write/Edit 自动放行规则（glob模式）
   write_allow_rules:
     - pattern: "chapters/**"
-    - pattern: ".memory/characters/**"
-    - pattern: ".memory/plots/**"
-    - pattern: ".memory/world/**"
-    - pattern: ".memory/user_prefs.md"
-    - pattern: "outline.md"
-    - pattern: "outline_*.md"
+    - pattern: "outlines/**"
+    - pattern: "world/**"
+    - pattern: "characters/**"
+    - pattern: "reference/**"
+    - pattern: ".memory/project_rules.md"
+    - pattern: ".memory/references/**"
 
 # 会话配置
 session:
@@ -30,6 +33,13 @@ session:
 agent:
   loop_detection_threshold: 3  # 连续相同工具调用视为循环
   trace_interval: 5            # 默认每 5 个完成回合生成一个聚合 Trace
+
+# 仅编码 Trace 中的用户输入；高置信度常规执行会跳过 LLM 记忆分析。
+embedding:
+  enabled: true
+  model_path: "models/bge-base-zh-v1.5"
+  routine_min_similarity: 0.70
+  routine_min_margin: 0.12
 
 # 日志配置
 logging:

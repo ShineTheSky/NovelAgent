@@ -9,6 +9,7 @@ import {
   listImportableProjects,
   listSessions,
   importExistingProject,
+  importHistoricalTraces,
   permissionResponse,
   questionResponse,
   sendMessage,
@@ -17,6 +18,7 @@ import {
 } from '../api/client';
 import type {
   Message,
+  AgentRun,
   PendingAsk,
   PendingQuestion,
   ProjectInfo,
@@ -57,6 +59,7 @@ export function useChat() {
   const [currentAction, setCurrentAction] = useState('');
   const [tokenCount, setTokenCount] = useState(0);
   const [appError, setAppError] = useState<string | null>(null);
+  const [importingHistoricalTraces, setImportingHistoricalTraces] = useState(false);
 
   const controllerRef = useRef<AbortController | null>(null);
   const activeSessionRef = useRef<string | null>(null);
@@ -64,7 +67,6 @@ export function useChat() {
   const navigationIdRef = useRef(0);
   const msgIdRef = useRef(0);
   const lastUserMsgRef = useRef('');
-  const subPresetRef = useRef('');
 
   const nextMessageId = useCallback(() => ++msgIdRef.current, []);
   const appendSystemMessage = useCallback((content: string) => {
@@ -79,7 +81,12 @@ export function useChat() {
     setCurrentAction('');
     setPendingAsk(null);
     setPendingQuestion(null);
-    subPresetRef.current = '';
+  }, []);
+
+  const updateRun = useCallback((runId: string, update: (run: AgentRun) => AgentRun) => {
+    setMessages(previous => previous.map(message => message.run?.id === runId
+      ? { ...message, run: update(message.run) }
+      : message));
   }, []);
 
   useEffect(() => {
@@ -225,6 +232,22 @@ export function useChat() {
     }
   }, [activeProject, loadSession]);
 
+  const handleImportHistoricalTraces = useCallback(async () => {
+    if (!activeSession || importingHistoricalTraces) return;
+    setImportingHistoricalTraces(true);
+    setAppError(null);
+    try {
+      const result = await importHistoricalTraces(activeSession);
+      appendSystemMessage(result.status === 'already_imported'
+        ? `该会话已导入 ${result.trace_count} 条历史 Trace。`
+        : `已导入 ${result.candidate_turn_count} 轮历史对话，生成 ${result.trace_count} 条 Trace；跳过 ${result.skipped_incomplete_count} 条未完成请求。`);
+    } catch (error) {
+      setAppError(`导入历史 Trace 失败：${errorText(error)}`);
+    } finally {
+      setImportingHistoricalTraces(false);
+    }
+  }, [activeSession, appendSystemMessage, importingHistoricalTraces]);
+
   const handleStreamEvent = useCallback((event: StreamEvent, sessionId: string, streamId: number, optimisticMessageId: number) => {
     const isCurrentStream = () => activeSessionRef.current === sessionId && streamIdRef.current === streamId;
     if (!isCurrentStream()) return;
@@ -237,6 +260,11 @@ export function useChat() {
         break;
       case 'text_delta': {
         const source = event.source ?? 'main';
+        if (source === 'subagent' && event.run_id) {
+          updateRun(event.run_id, run => ({ ...run, draft: run.draft + event.delta }));
+          setCurrentAction('子 Agent 创作中…');
+          break;
+        }
         const role = source === 'subagent' ? 'subagent_assistant' : 'assistant';
         setCurrentAction(source === 'subagent' ? '子 Agent 创作中…' : '');
         setMessages(previous => {
@@ -245,7 +273,7 @@ export function useChat() {
           if (last?.role === role && !last.tool_calls?.length) {
             next[next.length - 1] = { ...last, content: last.content + event.delta };
           } else {
-            next.push({ id: nextMessageId(), role, content: event.delta, source, preset: subPresetRef.current });
+            next.push({ id: nextMessageId(), role, content: event.delta, source });
           }
           return next;
         });
@@ -253,27 +281,30 @@ export function useChat() {
       }
       case 'thinking': {
         const source = event.source ?? 'main';
-        setCurrentAction(source === 'subagent' ? '子 Agent 工作中…' : '');
-        setMessages(previous => {
-          const last = previous.at(-1);
-          if (last?.role === 'system' && last.source === source && last._thinking) {
-            return [...previous.slice(0, -1), { ...last, content: last.content + event.content }];
-          }
-          return [...previous, {
-            id: nextMessageId(),
-            role: 'system',
-            content: `${source === 'subagent' ? '🤖 子Agent: ' : '💭 '}${event.content}`,
-            source,
-            _thinking: true,
-          }];
-        });
+        if (source === 'subagent' && event.run_id) {
+          const eventId = nextMessageId();
+          updateRun(event.run_id, run => ({
+            ...run,
+            events: [...run.events, { id: eventId, type: 'thinking', content: event.content }],
+          }));
+          setCurrentAction('子 Agent 工作中…');
+          break;
+        }
+        setCurrentAction(event.content || 'AI 思考中…');
         break;
       }
       case 'tool_call':
-        if (event.source !== 'subagent' && event.tool === 'SubAgent' && typeof event.params.preset === 'string') {
-          subPresetRef.current = event.params.preset;
+        if (event.source === 'subagent' && event.run_id) {
+          const eventId = nextMessageId();
+          updateRun(event.run_id, run => ({
+            ...run,
+            events: [...run.events, { id: eventId, type: 'tool_call', tool: event.tool, params: event.params }],
+          }));
+          setCurrentAction(`子 Agent 正在执行 ${event.tool}…`);
+          break;
         }
         setCurrentAction(event.tool === 'Write' ? '正在写入文件…' : event.tool === 'SubAgent' ? '启动子 Agent…' : `正在执行 ${event.tool}…`);
+        if (event.tool === 'SubAgent') break;
         setMessages(previous => [...previous, {
           id: nextMessageId(),
           role: 'system',
@@ -281,10 +312,18 @@ export function useChat() {
           name: 'tool_call',
           tool_calls: [{ tool: event.tool, params: event.params }],
           source: event.source ?? 'main',
-          preset: subPresetRef.current,
         }]);
         break;
       case 'tool_result':
+        if (event.source === 'subagent' && event.run_id) {
+          const eventId = nextMessageId();
+          updateRun(event.run_id, run => ({
+            ...run,
+            events: [...run.events, { id: eventId, type: 'tool_result', tool: event.tool, success: event.success }],
+          }));
+          setCurrentAction('');
+          break;
+        }
         setCurrentAction('');
         setMessages(previous => [...previous, {
           id: nextMessageId(),
@@ -294,29 +333,34 @@ export function useChat() {
             : `❌ ${event.error ?? '工具执行失败'}`,
           name: `${event.source === 'subagent' ? '🤖 ' : ''}${event.tool}`,
           source: event.source ?? 'main',
-          preset: subPresetRef.current,
+        }]);
+        break;
+      case 'subagent_start':
+        setCurrentAction('子 Agent 工作中…');
+        setMessages(previous => [...previous, {
+          id: nextMessageId(),
+          role: 'agent_run',
+          content: '',
+          run: {
+            id: event.run_id,
+            preset: event.preset,
+            parentRunId: event.parent_run_id ?? undefined,
+            workflow: event.workflow ?? undefined,
+            taskSummary: event.task_summary ?? '',
+            status: 'running',
+            draft: '',
+            result: '',
+            events: [],
+          },
         }]);
         break;
       case 'subagent_result':
         setCurrentAction('');
-        setMessages(previous => [...previous, {
-          id: nextMessageId(),
-          role: 'subagent_result',
-          content: event.content,
-          name: event.preset,
-          source: 'subagent',
-          preset: event.preset,
-        }]);
+        updateRun(event.run_id, run => ({ ...run, result: event.content, draft: '' }));
         break;
       case 'subagent_done':
         setCurrentAction('');
-        subPresetRef.current = '';
-        setMessages(previous => [...previous, {
-          id: nextMessageId(),
-          role: 'system',
-          content: `✅ 子Agent完成 — ${(event.result ?? '').slice(0, 150)}…`,
-          source: 'subagent',
-        }]);
+        updateRun(event.run_id, run => ({ ...run, status: 'completed', result: event.result || run.result || run.draft, draft: '' }));
         break;
       case 'permission_ask':
         setCurrentAction('等待确认…');
@@ -353,6 +397,12 @@ export function useChat() {
         if (event.token_count !== undefined) setTokenCount(event.token_count);
         break;
       case 'error':
+        if (event.source === 'subagent' && event.run_id) {
+          updateRun(event.run_id, run => ({ ...run, status: 'failed', error: event.message }));
+          setLoading(false);
+          setCurrentAction('');
+          break;
+        }
         appendSystemMessage(`⚠️ ${event.message}`);
         setLoading(false);
         setCurrentAction('');
@@ -485,6 +535,8 @@ export function useChat() {
     loadImportableProjects,
     handleImportProject,
     handleNewSession,
+    handleImportHistoricalTraces,
+    importingHistoricalTraces,
     handleSend,
     handleRetry,
     handleStop,

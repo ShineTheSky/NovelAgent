@@ -1,6 +1,7 @@
 """Agent Loop — ReAct循环引擎"""
 
 import asyncio
+import uuid
 import hashlib
 import json
 import time
@@ -10,8 +11,9 @@ from novelagent.tools.base import ToolContext, ToolResult, PermissionResult
 from novelagent.context.message_manager import Message, MessageManager
 from novelagent.security.audit import audit_log
 from novelagent.core.llm_turn import build_assistant_message
-from novelagent.trace.recorder import TraceRecorder
+from novelagent.trace.recorder import TraceRecorder, sanitize_payload
 from novelagent.memory.memory_manager import MemoryManager
+from novelagent.core.review_workflow import ReviewPolishWorkflow
 
 
 class AgentLoop:
@@ -34,13 +36,26 @@ class AgentLoop:
         self.post_turn_analyzer = post_turn_analyzer
         self.preference_context_provider = preference_context_provider
         self.rag_store = rag_store
+        self.review_workflow = ReviewPolishWorkflow(subagent_runner, self.working_dir) if subagent_runner else None
 
     async def run(self, request: InternalRequest, session: Session, project_info: dict | None = None) -> ResponseChunk:
         trace_id = hashlib.md5(f"{session.session_id}{time.time()}".encode()).hexdigest()[:8]
+        deferred_trace_events: list[dict] = []
+        trace_event_sequence = 0
 
         async def record(event_type: str, actor: str, payload: dict | None = None,
                          parent_event_id: str | None = None, duration_ms: float | None = None):
-            return None
+            nonlocal trace_event_sequence
+            trace_event_sequence += 1
+            event_id = f"deferred_{trace_event_sequence}"
+            deferred_trace_events.append({
+                "event_id": event_id,
+                "event_type": event_type,
+                "actor": actor,
+                "payload": sanitize_payload(payload or {}),
+                "duration_ms": duration_ms,
+            })
+            return event_id
 
         async def finish(status: str, answer: str = "", token_count: int = 0):
             return None
@@ -50,14 +65,18 @@ class AgentLoop:
 
         # 项目记忆预取仍与项目工作区绑定；自动 Trace 记忆则持久化到 SQLite。
         import os as _os
-        project_memory = MemoryManager(_os.path.join(self.working_dir, session.project_id), self.llm)
+        project_memory = MemoryManager(
+            _os.path.join(self.working_dir, session.project_id),
+            self.llm,
+            self._config.get("global_memory_dir"),
+        )
 
-        # 1. Async memory prefetch
-        prefetch_task = asyncio.create_task(project_memory.on_user_input(request.content))
-
-        # 2. Get memory index
-        memory_md = project_memory.get_index_content()
-        tools_prompt = self.tools.get_tools_prompt()
+        # 1. Read memory.md once and start relevance prefetch from that same snapshot.
+        memory_md, memory_prefetch = project_memory.prepare_context(request.content)
+        prefetch_task = asyncio.create_task(memory_prefetch)
+        main_tool_names = [tool.name for tool in self.tools.list_all() if tool.name != "SearchRag"]
+        tools_prompt = self.tools.get_tools_prompt(main_tool_names)
+        main_tool_schemas = self.tools.get_schemas(main_tool_names)
         preference_context = ""
         if self.preference_context_provider:
             try:
@@ -65,20 +84,7 @@ class AgentLoop:
             except Exception as exc:
                 print(f"[trace] preference context failed: {exc}", flush=True)
 
-        # Retrieve shared reference material before building the prompt.
-        # This is intentionally best-effort: an empty or unavailable library
-        # must never prevent ordinary writing from working.
-        rag_context = ""
-        rag_results = []
-        if self.rag_store:
-            try:
-                rag_context, rag_results = await self.rag_store.format_context(
-                    request.content, limit=5,
-                )
-            except Exception as exc:
-                print(f"[rag] retrieval failed: {exc}", flush=True)
-
-        # 3. Build context (sync with prefetch)
+        # 2. Build context while memory relevance prefetch runs in parallel.
         history_msgs = [Message.from_dict(m) for m in session.messages] if session.messages else []
         current_user_msg = Message(role="user", content=request.content)
 
@@ -95,13 +101,9 @@ class AgentLoop:
             "history_message_count": len(history_msgs),
             "memory_index_present": bool(memory_md),
             "confirmed_preference_count": preference_context.count("\n-") + (1 if preference_context.startswith("-") else 0),
-            "rag_result_count": len(rag_results),
         })
 
-        if rag_context:
-            ctx.messages.insert(-1, Message(role="system", content=rag_context))
-
-        # 4. Wait for prefetch (1.5s timeout)
+        # 3. Wait for memory prefetch (1.5s timeout)
         memory_injection = []
         try:
             memories = await asyncio.wait_for(prefetch_task, timeout=1.5)
@@ -121,6 +123,8 @@ class AgentLoop:
             accept_edits_mode=session.accept_edits_mode or request.accept_edits,
             allow_rules=self._config.get("write_allow_rules", []),
             previously_allowed=session.previously_allowed,
+            operation_id=f"op_{session.session_id}_{trace_id}",
+            actor="main_agent",
         )
         ctx.tool_context = tool_ctx
 
@@ -140,7 +144,7 @@ class AgentLoop:
                         captured["trace_id"],
                         session.project_id,
                         captured["messages"],
-                        self.tools.get_schemas(),
+                        main_tool_schemas,
                     )
             # 发送完整消息历史给 LLM 生成摘要
             try:
@@ -163,6 +167,13 @@ class AgentLoop:
             summary_msg = Message(role="user", content=f"[上下文压缩] {summary}")
             ctx.messages = [summary_msg] + recent
             session.messages = [m.to_dict() for m in ctx.messages]
+            try:
+                project_memory.rebuild_index()
+            except OSError as exc:
+                # The compression result is still valid if a project folder is
+                # temporarily locked; the next successful rebuild will refresh
+                # the sliding-window snapshot.
+                print(f"[memory] rebuild after compression failed: {exc}", flush=True)
             print(f"[compress] 完成: {pre_check_tokens} → {self.context_builder.token_counter.count_messages(ctx.to_llm_messages())} tokens ({time.time()-t0:.2f}s)", flush=True)
 
         # 确保用户消息已持久化，防止ReAct循环异常退出时丢失
@@ -184,7 +195,7 @@ class AgentLoop:
                 return
 
             llm_messages = ctx.to_llm_messages()
-            tool_schemas = self.tools.get_schemas()
+            tool_schemas = main_tool_schemas
             await record("llm_request", "main_agent", {
                 "turn": turn, "position": "main_loop", "message_count": len(llm_messages), "tool_count": len(tool_schemas),
             })
@@ -329,22 +340,93 @@ class AgentLoop:
                         # 从预设配置读取默认值
                         preset_config = self.subagent_runner.presets_tool.get_preset(preset)
                         show_result = preset_config.get("show_result", False) if preset_config else False
+                    artifact_context = ""
+                    subagent_extra_context = ""
+                    # A direct user review/polish receives the same service-built ordering as
+                    # the automatic pipeline: newest body, volume outline, chapter outline.
+                    if preset in {"reviewer", "chapter_polisher"} and self.review_workflow:
+                        chapter_path = self.review_workflow.find_chapter_path(task, attachments)
+                        if chapter_path:
+                            try:
+                                artifact_context, subagent_extra_context = self.review_workflow.build_context(
+                                    session.project_id, chapter_path,
+                                )
+                            except (OSError, ValueError) as exc:
+                                print(f"[workflow] build manual context failed: {exc}", flush=True)
+                    elif preset == "chapter_writer" and self.review_workflow:
+                        chapter_path = self.review_workflow.find_chapter_path(task, attachments)
+                        if chapter_path:
+                            try:
+                                artifact_context, subagent_extra_context = self.review_workflow.build_writer_context(
+                                    session.project_id, chapter_path,
+                                )
+                                handoff_marker = "[自动审阅与润色已完成]"
+                                handoffs = [
+                                    str(message.get("content", "")).split(handoff_marker, 1)[1].strip()
+                                    for message in session.messages
+                                    if handoff_marker in str(message.get("content", ""))
+                                ]
+                                if handoffs:
+                                    subagent_extra_context += (
+                                        "\n\n## 上一次润色交接摘要（正文在固定工件区，不要重复回传）\n"
+                                        + handoffs[-1][:2_000]
+                                    )
+                            except (OSError, ValueError) as exc:
+                                print(f"[workflow] build writer context failed: {exc}", flush=True)
                     t0 = time.time()
                     subagent_result_text = ""
+                    writer_revision_events = []
+                    subagent_run_id = uuid.uuid4().hex
                     async for sub_chunk in self.subagent_runner.spawn_and_run(
                         preset, task, session, inherit,
-                        extra_context=rag_context,
-                        attachments=attachments,
+                        attachments=attachments if not artifact_context else None,
+                        extra_context=subagent_extra_context,
+                        artifact_context=artifact_context,
+                        actor=preset,
+                        operation_id=f"{tool_ctx.operation_id}:{preset}",
+                        run_id=subagent_run_id,
                     ):
                         await record(f"subagent_{sub_chunk.type}", f"subagent:{preset}", sub_chunk.data, tool_event_id)
                         if sub_chunk.type == "subagent_done":
                             subagent_result_text = sub_chunk.data.get("result", "")
+                            writer_revision_events = sub_chunk.data.get("revision_events", [])
                             # 转发subagent_done让前端显示完成消息+结果预览
                             yield sub_chunk
                             if show_result and subagent_result_text and not subagent_result_text.startswith("Error:"):
-                                yield ResponseChunk(type="subagent_result", data={"preset": preset, "content": subagent_result_text})
+                                yield ResponseChunk(type="subagent_result", data={
+                                    "source": "subagent", "run_id": subagent_run_id,
+                                    "preset": preset, "content": subagent_result_text,
+                                })
                         else:
                             yield sub_chunk  # 转发子Agent的所有事件到前端
+
+                    # Writer commits are the only automatic trigger.  Polisher commits do not recurse.
+                    workflow_summaries = []
+                    if preset == "chapter_writer" and self.review_workflow:
+                        chapter_events = [event for event in writer_revision_events if self.review_workflow.is_chapter(event.get("path", ""))]
+                        for event in chapter_events:
+                            yield ResponseChunk(type="thinking", data={"content": "章节已写入，正在自动审阅并润色…", "workflow": "auto_review"})
+                            async for workflow_chunk in self.review_workflow.run(
+                                session, event["path"], task, f"{tool_ctx.operation_id}:{event['revision_id']}",
+                                parent_run_id=subagent_run_id,
+                            ):
+                                if (
+                                    workflow_chunk.type == "subagent_done"
+                                    and workflow_chunk.data.get("workflow") == "auto_polish"
+                                ):
+                                    workflow_summaries.append(workflow_chunk.data.get("result", ""))
+                                await record(
+                                    f"workflow_{workflow_chunk.type}",
+                                    f"workflow:{workflow_chunk.data.get('workflow', 'review_polish')}",
+                                    workflow_chunk.data, tool_event_id,
+                                )
+                                yield workflow_chunk
+
+                    if workflow_summaries:
+                        # Keep only the concise post-write handoff in the coordinator history;
+                        # the full body stays in the artifact file and is never copied back here.
+                        handoff = "\n\n".join(summary[:2_000] for summary in workflow_summaries)
+                        subagent_result_text += f"\n\n[自动审阅与润色已完成]\n{handoff}"
 
                     if subagent_result_text.startswith("Error:"):
                         result = ToolResult(success=False, error=subagent_result_text)
@@ -413,7 +495,9 @@ class AgentLoop:
         session.messages = [m.to_dict() for m in ctx.messages]
         captured_trace = None
         if self.trace:
-            await self.trace.store.append_session_turn(session.session_id, request.content, final_text)
+            await self.trace.store.append_session_turn(
+                session.session_id, request.content, final_text, deferred_trace_events,
+            )
             pending_turns = await self.trace.store.pending_trace_turn_count(session.session_id)
             if trace_checkpoint_requested or (self.trace_interval > 0 and pending_turns >= self.trace_interval):
                 captured_trace = await self.trace.store.capture_pending_trace(
@@ -424,7 +508,7 @@ class AgentLoop:
                 captured_trace["trace_id"],
                 session.project_id,
                 captured_trace["messages"],
-                self.tools.get_schemas(),
+                main_tool_schemas,
             ))
 
         # 8. Done

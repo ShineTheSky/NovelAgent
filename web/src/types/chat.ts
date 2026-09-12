@@ -4,7 +4,8 @@ export type MessageRole =
   | 'system'
   | 'tool_result'
   | 'subagent_assistant'
-  | 'subagent_result';
+  | 'subagent_result'
+  | 'agent_run';
 
 export type JsonRecord = Record<string, unknown>;
 export type QuestionAnswer = string | string[];
@@ -30,6 +31,29 @@ export interface Message {
   preset?: string;
   reasoning_content?: string;
   _thinking?: boolean;
+  run?: AgentRun;
+}
+
+export interface AgentRunEvent {
+  id: number;
+  type: 'thinking' | 'tool_call' | 'tool_result';
+  content?: string;
+  tool?: string;
+  params?: JsonRecord;
+  success?: boolean;
+}
+
+export interface AgentRun {
+  id: string;
+  preset: string;
+  parentRunId?: string;
+  workflow?: string;
+  taskSummary: string;
+  status: 'running' | 'completed' | 'failed';
+  draft: string;
+  result: string;
+  error?: string;
+  events: AgentRunEvent[];
 }
 
 export interface ProjectInfo {
@@ -82,13 +106,14 @@ export interface PendingQuestion {
 
 export type StreamEvent =
   | { type: 'conflict' }
-  | { type: 'text_delta'; delta: string; source?: 'main' | 'subagent' }
-  | { type: 'thinking'; content: string; source?: 'main' | 'subagent' }
-  | { type: 'tool_call'; tool: string; params: JsonRecord; source?: 'main' | 'subagent' }
-  | { type: 'tool_result'; tool: string; success: boolean; data?: unknown; error?: string; source?: 'main' | 'subagent' }
-  | { type: 'subagent_result'; preset: string; content: string }
-  | { type: 'subagent_done'; result?: string }
+  | { type: 'text_delta'; delta: string; source?: 'main' | 'subagent'; run_id?: string }
+  | { type: 'thinking'; content: string; source?: 'main' | 'subagent'; run_id?: string }
+  | { type: 'tool_call'; tool: string; params: JsonRecord; source?: 'main' | 'subagent'; run_id?: string }
+  | { type: 'tool_result'; tool: string; success: boolean; data?: unknown; error?: string; source?: 'main' | 'subagent'; run_id?: string }
+  | { type: 'subagent_start'; source: 'subagent'; run_id: string; parent_run_id?: string | null; preset: string; workflow?: string | null; task_summary?: string }
+  | { type: 'subagent_result'; run_id: string; preset: string; content: string }
+  | { type: 'subagent_done'; run_id: string; preset: string; result?: string }
   | { type: 'permission_ask'; tool: string; params_summary?: string }
   | { type: 'question_ask'; questions: Question[] }
   | { type: 'done'; token_count?: number; finish_reason?: string; trace_id?: string }
-  | { type: 'error'; message: string; trace_id?: string };
+  | { type: 'error'; message: string; trace_id?: string; source?: 'main' | 'subagent'; run_id?: string };

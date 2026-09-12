@@ -31,3 +31,24 @@ export interface NovelTree {
   project_id: string;
   volumes: NovelVolume[];
 }
+
+export interface MaterialDocument {
+  id: string;
+  type: 'material';
+  title: string;
+  path: string;
+  relative_path: string;
+  char_count: number;
+  updated_at: string;
+}
+
+export interface MaterialGroup {
+  id: string;
+  title: string;
+  documents: MaterialDocument[];
+}
+
+export interface MaterialTree {
+  project_id: string;
+  groups: MaterialGroup[];
+}

@@ -73,6 +73,7 @@ export default function App() {
           )}
           <div className="flex shrink-0 items-center gap-2">
             {chat.activeSession && <TokenBar tokenCount={chat.tokenCount} limit={150000} onCompress={chat.handleCompress} disabled={chat.loading} />}
+            {chat.activeSession && <button type="button" onClick={() => void chat.handleImportHistoricalTraces()} disabled={chat.loading || chat.importingHistoricalTraces} className="rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-xs text-gray-600 shadow-sm hover:border-purple-200 hover:text-purple-600 disabled:cursor-not-allowed disabled:opacity-40">{chat.importingHistoricalTraces ? '导入中…' : '生成历史 Trace'}</button>}
             <ProjectInsightsPanel projectId={chat.activeProject} />
             <button type="button" onClick={() => setShowRag(true)} className="rounded-md border border-gray-200 px-2.5 py-1.5 text-xs text-gray-600 hover:border-purple-300 hover:text-purple-600">资料库</button>
             <LLMSettingsPanel />

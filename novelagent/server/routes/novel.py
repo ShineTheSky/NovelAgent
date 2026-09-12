@@ -8,11 +8,17 @@ from fastapi import APIRouter, HTTPException, Request
 
 router = APIRouter(prefix="/api")
 
-VOLUME_OUTLINE_PATTERN = re.compile(r"^outline_(\d+)\.0\.0\.md$")
-CHAPTER_OUTLINE_PATTERN = re.compile(r"^outline_(\d+)\.(\d+)\.0\.md$")
-SECTION_PATTERN = re.compile(r"^content_(\d+)\.(\d+)\.(\d+)\.md$")
-LEGACY_CHAPTER_PATTERN = re.compile(r"^ch(\d+)\.md$", re.IGNORECASE)
+VOLUME_OUTLINE_PATTERN = re.compile(r"^outlines/outline_(\d+)\.0\.0\.md$")
+CHAPTER_OUTLINE_PATTERN = re.compile(r"^outlines/outline_(\d+)\.(\d+)\.0\.md$")
+SECTION_PATTERN = re.compile(r"^chapters/content_(\d+)\.(\d+)\.(\d+)\.md$")
 HEADING_PATTERN = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
+METADATA_TITLE_PATTERN = re.compile(r"^\|\s*\*{0,2}(卷标题|章标题)\*{0,2}\s*\|\s*(.+?)\s*\|\s*$", re.MULTILINE)
+MATERIAL_DIRECTORIES = (
+    ("world", "世界观"),
+    ("characters", "角色"),
+    ("reference", "设定集 / 参考资料"),
+)
+MATERIAL_EXTENSIONS = {".md", ".txt"}
 
 
 def _project_dir(project_id: str, request: Request) -> Path:
@@ -30,9 +36,20 @@ def _fallback_title(kind: str, volume: int, chapter: int = 0, section: int = 0) 
     return f"第 {volume} 卷第 {chapter} 章第 {section} 节"
 
 
+def _display_title(content: str, kind: str, fallback: str) -> str:
+    expected_label = "卷标题" if kind == "volume_outline" else "章标题" if kind == "chapter_outline" else ""
+    if expected_label:
+        for label, value in METADATA_TITLE_PATTERN.findall(content):
+            if label == expected_label:
+                return re.sub(r"\*{1,2}|`", "", value).strip()
+    heading = HEADING_PATTERN.search(content)
+    if heading:
+        return re.sub(r"^(?:卷纲|章纲)\s*[：:]\s*", "", heading.group(1)).strip()
+    return fallback
+
+
 def _document(project_dir: Path, path: Path, kind: str, volume: int, chapter: int = 0, section: int = 0) -> dict:
     content = path.read_text(encoding="utf-8")
-    heading = HEADING_PATTERN.search(content)
     stat = path.stat()
     return {
         "id": f"{kind}:{volume}.{chapter}.{section}",
@@ -40,11 +57,46 @@ def _document(project_dir: Path, path: Path, kind: str, volume: int, chapter: in
         "volume": volume,
         "chapter": chapter or None,
         "section": section or None,
-        "title": heading.group(1) if heading else _fallback_title(kind, volume, chapter, section),
+        "title": _display_title(content, kind, _fallback_title(kind, volume, chapter, section)),
         "path": path.relative_to(project_dir).as_posix(),
         "char_count": len(re.sub(r"\s+", "", content)),
         "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
     }
+
+
+def _material_document(project_dir: Path, path: Path, category_path: Path) -> dict:
+    content = path.read_text(encoding="utf-8")
+    stat = path.stat()
+    heading = HEADING_PATTERN.search(content)
+    relative_path = path.relative_to(category_path).as_posix()
+    return {
+        "id": f"material:{path.relative_to(project_dir).as_posix()}",
+        "type": "material",
+        "title": heading.group(1).strip() if heading else path.stem,
+        "path": path.relative_to(project_dir).as_posix(),
+        "relative_path": relative_path,
+        "char_count": len(re.sub(r"\s+", "", content)),
+        "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+    }
+
+
+def _build_material_tree(project_dir: Path) -> tuple[list[dict], dict[str, tuple[dict, Path]]]:
+    groups: dict[str, dict] = {}
+    documents: dict[str, tuple[dict, Path]] = {}
+
+    for relative_directory, title in MATERIAL_DIRECTORIES:
+        category_path = project_dir / relative_directory
+        if not category_path.is_dir():
+            continue
+        group = groups.setdefault(title, {"id": title, "title": title, "documents": []})
+        for path in sorted(category_path.rglob("*"), key=lambda item: item.as_posix().lower()):
+            if not path.is_file() or path.suffix.lower() not in MATERIAL_EXTENSIONS or path.name.startswith("."):
+                continue
+            document = _material_document(project_dir, path, category_path)
+            group["documents"].append(document)
+            documents[document["id"]] = (document, path)
+
+    return list(groups.values()), documents
 
 
 def _build_novel_tree(project_dir: Path) -> tuple[dict, dict[str, tuple[dict, Path]]]:
@@ -64,9 +116,10 @@ def _build_novel_tree(project_dir: Path) -> tuple[dict, dict[str, tuple[dict, Pa
             "sections": [],
         })
 
-    for path in project_dir.glob("outline_*.md"):
-        volume_match = VOLUME_OUTLINE_PATTERN.match(path.name)
-        chapter_match = CHAPTER_OUTLINE_PATTERN.match(path.name)
+    for path in project_dir.glob("outlines/**/*.md"):
+        relative_path = path.relative_to(project_dir).as_posix()
+        volume_match = VOLUME_OUTLINE_PATTERN.match(relative_path)
+        chapter_match = CHAPTER_OUTLINE_PATTERN.match(relative_path)
         if volume_match:
             volume = int(volume_match.group(1))
             document = _document(project_dir, path, "volume_outline", volume)
@@ -82,38 +135,14 @@ def _build_novel_tree(project_dir: Path) -> tuple[dict, dict[str, tuple[dict, Pa
             node["title"] = document["title"]
             documents[document["id"]] = (document, path)
 
-    legacy_outline = project_dir / "outline.md"
-    if legacy_outline.exists() and not ensure_volume(1)["outline"]:
-        document = _document(project_dir, legacy_outline, "volume_outline", 1)
-        volume = ensure_volume(1)
-        volume["outline"] = document
-        volume["title"] = document["title"]
-        documents[document["id"]] = (document, legacy_outline)
-
-    chapters_dir = project_dir / "chapters"
-    if chapters_dir.exists():
-        for path in chapters_dir.glob("content_*.md"):
-            match = SECTION_PATTERN.match(path.name)
-            if not match:
-                continue
-            volume, chapter, section = (int(value) for value in match.groups())
-            document = _document(project_dir, path, "section", volume, chapter, section)
-            ensure_chapter(volume, chapter)["sections"].append(document)
-            documents[document["id"]] = (document, path)
-
-        for path in chapters_dir.glob("ch*.md"):
-            match = LEGACY_CHAPTER_PATTERN.match(path.name)
-            if not match:
-                continue
-            chapter = int(match.group(1))
-            node = ensure_chapter(1, chapter)
-            # 新版 content_1.X.1.md 优先；旧版 chXX.md 仅用于兼容已有项目。
-            if node["sections"]:
-                continue
-            document = _document(project_dir, path, "section", 1, chapter, 1)
-            node["title"] = document["title"]
-            node["sections"].append(document)
-            documents[document["id"]] = (document, path)
+    for path in project_dir.glob("chapters/content_*.md"):
+        match = SECTION_PATTERN.match(path.relative_to(project_dir).as_posix())
+        if not match:
+            continue
+        volume, chapter, section = (int(value) for value in match.groups())
+        document = _document(project_dir, path, "section", volume, chapter, section)
+        ensure_chapter(volume, chapter)["sections"].append(document)
+        documents[document["id"]] = (document, path)
 
     result = []
     for volume in sorted(volumes.values(), key=lambda item: item["volume"]):
@@ -145,5 +174,25 @@ async def get_novel_node(project_id: str, node_id: str, request: Request):
     item = documents.get(node_id)
     if item is None:
         raise HTTPException(status_code=404, detail="小说节点不存在")
+    document, path = item
+    return {"node": document, "content": path.read_text(encoding="utf-8")}
+
+
+@router.get("/projects/{project_id}/materials")
+async def get_material_tree(project_id: str, request: Request):
+    """读取世界观、角色与参考资料，供小说工作区右侧资料栏展示。"""
+    project_dir = _project_dir(project_id, request)
+    groups, _ = _build_material_tree(project_dir)
+    return {"project_id": project_id, "groups": groups}
+
+
+@router.get("/projects/{project_id}/materials/nodes/{node_id:path}")
+async def get_material_node(project_id: str, node_id: str, request: Request):
+    """读取资料栏中一个已索引的创作资料文件。"""
+    project_dir = _project_dir(project_id, request)
+    _, documents = _build_material_tree(project_dir)
+    item = documents.get(node_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="创作资料不存在")
     document, path = item
     return {"node": document, "content": path.read_text(encoding="utf-8")}

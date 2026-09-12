@@ -18,6 +18,7 @@ from novelagent.tools.bash import BashTool
 from novelagent.tools.subagent_tool import SubAgentTool
 from novelagent.tools.ask_user_question import AskUserQuestionTool
 from novelagent.tools.create_trace_checkpoint import CreateTraceCheckpointTool
+from novelagent.tools.search_rag import SearchRagTool
 from novelagent.security.permission_checker import PermissionChecker
 from novelagent.context.builder import ContextBuilder
 from novelagent.memory.memory_manager import MemoryManager
@@ -26,6 +27,9 @@ from novelagent.core.subagent import SubAgentRunner
 from novelagent.trace.store import TraceStore
 from novelagent.trace.recorder import TraceRecorder
 from novelagent.trace.analyzer import PostTurnAnalyzer, PreferenceContextProvider
+from novelagent.trace.materializer import TraceMemoryMaterializer
+from novelagent.trace.embedding_gate import EmbeddingGate
+from novelagent.embeddings.local_model import LocalEmbeddingModel
 from novelagent.server.routes import projects, sessions, files, novel, settings, traces
 from novelagent.server.routes import rag
 from novelagent.rag.store import RagStore
@@ -61,6 +65,7 @@ def create_app() -> FastAPI:
     working_dir = resolve_working_dir(cfg.get("working_dir", "./workspace"))
     session_cfg = cfg.get("session", {})
     agent_cfg = cfg.get("agent", {})
+    embedding_cfg = cfg.get("embedding", {})
     security_cfg = cfg.get("security", {})
     bash_cfg = security_cfg.get("bash", {})
 
@@ -68,8 +73,10 @@ def create_app() -> FastAPI:
     llm_config_path = str(get_project_root() / "config" / "llm_config.yaml")
     llm_client = LLMClient(llm_config_path)
 
+    embedding_model = LocalEmbeddingModel(str(get_project_root() / embedding_cfg.get("model_path", "models/bge-base-zh-v1.5")))
+    rag_store = RagStore(embedding_model)
     registry = ToolRegistry()
-    for tool in [ReadTool(), WriteTool(), EditTool(), GlobTool(), GrepTool(), BashTool(), SubAgentTool(), AskUserQuestionTool(), CreateTraceCheckpointTool()]:
+    for tool in [ReadTool(), WriteTool(), EditTool(), GlobTool(), GrepTool(), BashTool(), SubAgentTool(), AskUserQuestionTool(), CreateTraceCheckpointTool(), SearchRagTool(rag_store)]:
         registry.register(tool)
 
     permission_checker = PermissionChecker(working_dir)
@@ -77,14 +84,22 @@ def create_app() -> FastAPI:
     memory_manager = MemoryManager(working_dir, llm_client)
     trace_store = TraceStore()
     trace_recorder = TraceRecorder(trace_store)
-    post_turn_analyzer = PostTurnAnalyzer(llm_client, working_dir, trace_store)
+    embedding_gate = EmbeddingGate(
+        str(get_project_root() / embedding_cfg.get("model_path", "models/bge-base-zh-v1.5")),
+        enabled=embedding_cfg.get("enabled", True),
+        routine_min_similarity=float(embedding_cfg.get("routine_min_similarity", 0.70)),
+        routine_min_margin=float(embedding_cfg.get("routine_min_margin", 0.12)),
+    )
+    embedding_gate.embedding_model = embedding_model
+    trace_memory_materializer = TraceMemoryMaterializer(working_dir)
+    post_turn_analyzer = PostTurnAnalyzer(llm_client, working_dir, trace_store, embedding_gate, trace_memory_materializer)
     preference_context_provider = PreferenceContextProvider(trace_store)
-    rag_store = RagStore()
 
     agent_config = {
         **session_cfg,
         **agent_cfg,
         "working_dir": working_dir,
+        "global_memory_dir": str(get_project_root() / cfg.get("memory", {}).get("global_dir", "global_memory")),
         "write_allow_rules": security_cfg.get("write_allow_rules", []),
     }
 
@@ -105,6 +120,7 @@ def create_app() -> FastAPI:
     app.state.registry = registry
     app.state.memory_manager = memory_manager
     app.state.trace_store = trace_store
+    app.state.trace_memory_materializer = trace_memory_materializer
     app.state.config = cfg
     app.state.llm_config_path = llm_config_path
     app.state.rag_store = rag_store

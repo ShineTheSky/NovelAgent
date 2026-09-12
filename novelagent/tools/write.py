@@ -1,10 +1,32 @@
 """Write工具"""
 
+import re
 from pathlib import Path
 from novelagent.tools.base import ToolProtocol, ToolResult, ToolContext, PermissionResult
+from novelagent.versioning import RevisionConflict, revision_manager
 
 PROTECTED_DIRS = [".git", ".claude/settings", ".env", ".memory/memory.md"]
 INTERNAL_EDITABLES = [".claude/plans/", ".claude/scratchpad.md"]
+
+
+def layout_error(path: str) -> str | None:
+    """Reject malformed creative-file paths before an agent can recreate legacy layouts."""
+    normalized = path.replace("\\", "/").lstrip("./")
+    canonical = (
+        re.fullmatch(r"outlines/outline_\d+\.0\.0\.md", normalized)
+        or re.fullmatch(r"outlines/outline_\d+\.\d+\.0\.md", normalized)
+        or re.fullmatch(r"chapters/content_\d+\.\d+\.\d+\.md", normalized)
+        or re.fullmatch(r"(?:world|characters|reference)/.+\.md", normalized)
+    )
+    if canonical:
+        return None
+    if normalized.startswith(("outlines/", "manuscript/", "materials/", "chapters/", "world/", "characters/", "reference/", "project/characters/")) or normalized == "outline.md" or normalized.startswith("outline_"):
+        return (
+            "项目创作文件必须使用规范路径：卷纲为 outlines/outline_X.0.0.md，"
+            "章纲为 outlines/outline_X.X.0.md，正文为 chapters/content_X.X.n.md，"
+            "资料为 world/、characters/ 或 reference/。"
+        )
+    return None
 
 
 class WriteTool(ToolProtocol):
@@ -15,18 +37,43 @@ class WriteTool(ToolProtocol):
         "properties": {
             "path": {"type": "string", "description": "文件路径（相对项目根目录）"},
             "content": {"type": "string", "description": "要写入的完整内容"},
+            "expected_revision_id": {"type": "string", "description": "受版本保护的 Markdown 文件必须提供：Read 返回的当前修订；新文件使用 new"},
         },
         "required": ["path", "content"],
     }
 
     async def execute(self, params: dict, context: ToolContext) -> ToolResult:
+        error = layout_error(params["path"])
+        if error:
+            return ToolResult(success=False, error=error)
         file_path = Path(context.working_dir) / params["path"]
         try:
+            if revision_manager.is_managed(file_path, context.working_dir):
+                info = await revision_manager.commit(
+                    file_path, params["content"], params.get("expected_revision_id"),
+                    actor=context.actor, operation_id=context.operation_id,
+                )
+                context.revision_events.append({
+                    "path": params["path"], "revision_id": info.revision_id,
+                    "parent_revision_id": info.metadata.get("parent_revision_id"),
+                    "updated_by": context.actor,
+                    "operation_id": context.operation_id,
+                })
+                return ToolResult(success=True, data=(
+                    f"文件已写入: {params['path']}\n当前修订: {info.revision_id}\n"
+                    f"父修订: {info.metadata.get('parent_revision_id') or '无（新文件）'}"
+                ))
             file_path.parent.mkdir(parents=True, exist_ok=True)
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(params["content"])
             content = params["content"]
             return ToolResult(success=True, data=f"文件已写入: {params['path']}\n\n--- 写入内容 ---\n{content}")
+        except RevisionConflict as conflict:
+            return ToolResult(success=False, error=(
+                f"revision_conflict: 期望版本 {params.get('expected_revision_id') or '(缺失)'}，"
+                f"当前版本 {conflict.info.revision_id}。请读取并基于最新内容重试。\n\n"
+                f"--- 最新内容 ---\n{conflict.info.body}"
+            ))
         except Exception as e:
             return ToolResult(success=False, error=str(e))
 
