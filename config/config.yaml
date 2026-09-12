@@ -29,7 +29,7 @@ session:
 # Agent Loop 配置
 agent:
   loop_detection_threshold: 3  # 连续相同工具调用视为循环
-  trace_interval: 5            # 默认每 5 个完成回合生成一个聚合 Trace
+  # 每个用户请求独立生成一条 Trace；不再按回合聚合。
 
 # 日志配置
 logging:

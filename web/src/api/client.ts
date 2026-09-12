@@ -9,7 +9,7 @@ import type {
   StreamEvent,
 } from '../types/chat';
 import type { LLMPositionUpdate, LLMSettings, ProviderSettingsUpdate } from '../types/llm';
-import type { MemoryPattern, TraceMemory } from '../types/insights';
+import type { Evidence, MemoryPattern, TraceMemory } from '../types/insights';
 import type { NovelDocument, NovelTree } from '../types/novel';
 
 const BASE = '/api';
@@ -330,16 +330,32 @@ export function saveProviderSettings(providers: Record<string, ProviderSettingsU
   });
 }
 
+export function fetchEvidence(projectId: string) {
+  return requestJson<Evidence[]>(`/projects/${resourceId(projectId)}/evidence`);
+}
+
+export function fetchMemories(projectId: string) {
+  return requestJson<TraceMemory[]>(`/projects/${resourceId(projectId)}/memories`);
+}
+
+export function fetchMemory(projectId: string, memoryId: string) {
+  return requestJson<TraceMemory>(`/projects/${resourceId(projectId)}/memories/${resourceId(memoryId)}`);
+}
+
 export function fetchMemoryPatterns(projectId: string) {
   return requestJson<MemoryPattern[]>(`/projects/${resourceId(projectId)}/memory-patterns`);
 }
 
-export function fetchTraceMemories(projectId: string) {
-  return requestJson<TraceMemory[]>(`/projects/${resourceId(projectId)}/trace-memories`);
+export function reviewMemoryPattern(projectId: string, patternId: string, status: 'confirmed' | 'disputed', confidence: number) {
+  return requestJson<MemoryPattern>(`/projects/${resourceId(projectId)}/memory-patterns/${resourceId(patternId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status, confidence }),
+  });
 }
 
-export function fetchTraceMemory(projectId: string, memoryId: string) {
-  return requestJson<TraceMemory>(`/projects/${resourceId(projectId)}/trace-memories/${resourceId(memoryId)}`);
-}
+// Compatibility aliases for older components.
+export const fetchTraceMemories = fetchMemories;
+export const fetchTraceMemory = fetchMemory;
 
 export type { Message };

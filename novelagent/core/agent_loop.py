@@ -36,17 +36,29 @@ class AgentLoop:
         self.rag_store = rag_store
 
     async def run(self, request: InternalRequest, session: Session, project_info: dict | None = None) -> ResponseChunk:
-        trace_id = hashlib.md5(f"{session.session_id}{time.time()}".encode()).hexdigest()[:8]
+        trace_id = await self.trace.start(session.session_id, session.project_id, request.content) if self.trace else ""
+        session.active_trace_id = trace_id
+        trace_finished = False
 
         async def record(event_type: str, actor: str, payload: dict | None = None,
                          parent_event_id: str | None = None, duration_ms: float | None = None):
+            if self.trace and trace_id:
+                return await self.trace.record(trace_id, event_type, actor, payload, parent_event_id, duration_ms)
             return None
 
         async def finish(status: str, answer: str = "", token_count: int = 0):
-            return None
+            nonlocal trace_finished
+            if self.trace and trace_id and not trace_finished:
+                await self.trace.finish(trace_id, status, answer, token_count)
+                trace_finished = True
+                if getattr(session, "active_trace_id", "") == trace_id:
+                    session.active_trace_id = ""
+
+        def queue_analysis() -> None:
+            if self.post_turn_analyzer and trace_id:
+                asyncio.create_task(self.post_turn_analyzer.analyze(trace_id, session.project_id))
 
         pi = project_info or {}
-        trace_checkpoint_requested = False
 
         # 项目记忆预取仍与项目工作区绑定；自动 Trace 记忆则持久化到 SQLite。
         import os as _os
@@ -91,6 +103,13 @@ class AgentLoop:
             history_messages=history_msgs + [current_user_msg],
             preference_context=preference_context,
         )
+        def session_snapshot() -> list[dict]:
+            transient_prefixes = ("[相关参考资料]", "[相关记忆]")
+            return [
+                message.to_dict() for message in ctx.messages
+                if not (message.role == "system" and message.content.startswith(transient_prefixes))
+            ]
+
         await record("context_built", "system", {
             "history_message_count": len(history_msgs),
             "memory_index_present": bool(memory_md),
@@ -131,17 +150,7 @@ class AgentLoop:
             print(f"[compress] 进入循环前触发压缩: {pre_check_tokens} tokens", flush=True)
             yield ResponseChunk(type="thinking", data={"content": "上下文过长，正在压缩…"})
             await record("context_compression", "system", {"before_token_count": pre_check_tokens})
-            if self.post_turn_analyzer and self.trace:
-                captured = await self.trace.store.capture_pending_trace(
-                    session.session_id, session.project_id, ctx.to_llm_messages(), pre_check_tokens,
-                )
-                if captured:
-                    await self.post_turn_analyzer.analyze(
-                        captured["trace_id"],
-                        session.project_id,
-                        captured["messages"],
-                        self.tools.get_schemas(),
-                    )
+            # Session 压缩只影响可恢复上下文；Trace 原始事件独立保留。
             # 发送完整消息历史给 LLM 生成摘要
             try:
                 non_system = [m for m in ctx.messages if m.role != "system"]
@@ -162,11 +171,11 @@ class AgentLoop:
             recent = non_system[-4:] if len(non_system) > 4 else non_system
             summary_msg = Message(role="user", content=f"[上下文压缩] {summary}")
             ctx.messages = [summary_msg] + recent
-            session.messages = [m.to_dict() for m in ctx.messages]
+            session.messages = session_snapshot()
             print(f"[compress] 完成: {pre_check_tokens} → {self.context_builder.token_counter.count_messages(ctx.to_llm_messages())} tokens ({time.time()-t0:.2f}s)", flush=True)
 
-        # 确保用户消息已持久化，防止ReAct循环异常退出时丢失
-        session.messages = [m.to_dict() for m in ctx.messages]
+        # Session 只保存可恢复消息，检索注入会在下一请求重新计算。
+        session.messages = session_snapshot()
         # 重置中断标记，防止上次中断影响本次请求
         session.stop_requested = False
 
@@ -180,7 +189,8 @@ class AgentLoop:
             if session.stop_requested:
                 await record("interrupted", "user", {"reason": "stop_requested"})
                 await finish("interrupted")
-                yield ResponseChunk(type="done", data={"finish_reason": "interrupted", "message": "用户中断"})
+                queue_analysis()
+                yield ResponseChunk(type="done", data={"finish_reason": "interrupted", "message": "用户中断", "trace_id": trace_id})
                 return
 
             llm_messages = ctx.to_llm_messages()
@@ -222,6 +232,7 @@ class AgentLoop:
                             print(f"  [{i}] {json.dumps(m, ensure_ascii=False)[:200]}", flush=True)
                         await record("error", "main_agent", {"message": chunk.error, "turn": turn})
                         await finish("failed")
+                        queue_analysis()
                         yield ResponseChunk(type="error", data={"message": chunk.error, "trace_id": trace_id})
                         return
                     elif chunk.type == "done":
@@ -232,6 +243,7 @@ class AgentLoop:
                 traceback.print_exc()
                 await record("error", "main_agent", {"message": str(e), "turn": turn})
                 await finish("failed")
+                queue_analysis()
                 yield ResponseChunk(type="error", data={"message": f"LLM调用失败: {e}", "trace_id": trace_id})
                 return
 
@@ -355,8 +367,6 @@ class AgentLoop:
                     t0 = time.time()
                     result = await self.tools.execute(tool_name, params, tool_ctx)
                     duration = (time.time() - t0) * 1000
-                if tool_name == "CreateTraceCheckpoint" and result.success:
-                    trace_checkpoint_requested = True
                 duration = (time.time() - t0) * 1000
 
                 audit_log(trace_id, tool_name, params,
@@ -387,8 +397,8 @@ class AgentLoop:
                     tool_call_id=tc_id,
                 ))
 
-            # 每轮结束后更新 + 立即同步持久化
-            session.messages = [m.to_dict() for m in ctx.messages]
+            # 每轮结束后更新可恢复的 Session 快照；Trace 事件独立保存。
+            session.messages = session_snapshot()
             try:
                 from novelagent.storage import models
                 await models.save_messages(session.session_id, session.messages, session.token_count, llm_client=self.llm)
@@ -402,35 +412,25 @@ class AgentLoop:
                 if loop_count >= self.loop_threshold:
                     await record("loop_detected", "system", {"turn": turn})
                     await finish("interrupted")
-                    yield ResponseChunk(type="done", data={"finish_reason": "loop_detected"})
+                    queue_analysis()
+                    yield ResponseChunk(type="done", data={"finish_reason": "loop_detected", "trace_id": trace_id})
                     return
             else:
                 self._loop_count = 0
             last_tool_calls = current_tool_calls
 
-        # 7. The analyzer derives trace-backed atomic memories after the immutable trace is complete.
+        # 7. Finish this request's independent Trace, then analyze its immutable events in background.
         token_count = self.context_builder.token_counter.count_messages(ctx.to_llm_messages())
-        session.messages = [m.to_dict() for m in ctx.messages]
-        captured_trace = None
-        if self.trace:
-            await self.trace.store.append_session_turn(session.session_id, request.content, final_text)
-            pending_turns = await self.trace.store.pending_trace_turn_count(session.session_id)
-            if trace_checkpoint_requested or (self.trace_interval > 0 and pending_turns >= self.trace_interval):
-                captured_trace = await self.trace.store.capture_pending_trace(
-                    session.session_id, session.project_id, ctx.to_llm_messages(), token_count,
-                )
-        if self.post_turn_analyzer and captured_trace:
-            asyncio.create_task(self.post_turn_analyzer.analyze(
-                captured_trace["trace_id"],
-                session.project_id,
-                captured_trace["messages"],
-                self.tools.get_schemas(),
-            ))
+        session.token_count = token_count
+        session.messages = session_snapshot()
+        await record("analysis_queued", "system", {"event_count_scope": "current_trace"})
+        await finish("completed", final_text, token_count)
+        queue_analysis()
 
         # 8. Done
         yield ResponseChunk(type="done", data={
             "finish_reason": "complete",
             "turns": turn,
             "token_count": token_count,
-            "trace_id": captured_trace["trace_id"] if captured_trace else "",
+            "trace_id": trace_id,
         })

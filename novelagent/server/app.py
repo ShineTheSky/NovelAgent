@@ -17,15 +17,14 @@ from novelagent.tools.grep import GrepTool
 from novelagent.tools.bash import BashTool
 from novelagent.tools.subagent_tool import SubAgentTool
 from novelagent.tools.ask_user_question import AskUserQuestionTool
-from novelagent.tools.create_trace_checkpoint import CreateTraceCheckpointTool
 from novelagent.security.permission_checker import PermissionChecker
 from novelagent.context.builder import ContextBuilder
-from novelagent.memory.memory_manager import MemoryManager
+from novelagent.memory.memory_manager import MemoryManager, PatternContextProvider
 from novelagent.core.agent_loop import AgentLoop
 from novelagent.core.subagent import SubAgentRunner
 from novelagent.trace.store import TraceStore
 from novelagent.trace.recorder import TraceRecorder
-from novelagent.trace.analyzer import PostTurnAnalyzer, PreferenceContextProvider
+from novelagent.trace.analyzer import PostTurnAnalyzer
 from novelagent.server.routes import projects, sessions, files, novel, settings, traces
 from novelagent.server.routes import rag
 from novelagent.rag.store import RagStore
@@ -69,7 +68,8 @@ def create_app() -> FastAPI:
     llm_client = LLMClient(llm_config_path)
 
     registry = ToolRegistry()
-    for tool in [ReadTool(), WriteTool(), EditTool(), GlobTool(), GrepTool(), BashTool(), SubAgentTool(), AskUserQuestionTool(), CreateTraceCheckpointTool()]:
+    tools = [ReadTool(), WriteTool(), EditTool(), GlobTool(), GrepTool(), BashTool(), SubAgentTool(), AskUserQuestionTool()]
+    for tool in tools:
         registry.register(tool)
 
     permission_checker = PermissionChecker(working_dir)
@@ -78,7 +78,7 @@ def create_app() -> FastAPI:
     trace_store = TraceStore()
     trace_recorder = TraceRecorder(trace_store)
     post_turn_analyzer = PostTurnAnalyzer(llm_client, working_dir, trace_store)
-    preference_context_provider = PreferenceContextProvider(trace_store)
+    preference_context_provider = PatternContextProvider(working_dir)
     rag_store = RagStore()
 
     agent_config = {

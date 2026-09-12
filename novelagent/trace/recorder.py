@@ -51,5 +51,10 @@ class TraceRecorder:
             )
 
     async def finish(self, trace_id: str, status: str, final_answer: str = "", token_count: int = 0) -> None:
+        await self.record(trace_id, "trace_finished", "system", {
+            "status": status,
+            "final_answer_length": len(final_answer),
+            "token_count": token_count,
+        })
         await self.store.finish_trace(trace_id, status, final_answer, token_count)
         self._states.pop(trace_id, None)

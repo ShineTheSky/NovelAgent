@@ -1,192 +1,65 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { fetchMemoryPatterns, fetchTraceMemories, fetchTraceMemory } from '../api/client';
-import type { MemoryPattern, PatternStatus, TraceMemory } from '../types/insights';
+import { fetchEvidence, fetchMemories, fetchMemoryPatterns, reviewMemoryPattern } from '../api/client';
+import type { Evidence, MemoryPattern, TraceMemory } from '../types/insights';
 
-type InsightTab = 'patterns' | 'memories';
+type InsightTab = 'evidence' | 'memory' | 'pattern';
 
-const statusMeta: Record<PatternStatus, { label: string; className: string }> = {
-  confirmed: { label: '已确认', className: 'bg-emerald-100 text-emerald-700' },
-  tentative: { label: '待观察', className: 'bg-amber-100 text-amber-700' },
-  ready_for_review: { label: '待审核', className: 'bg-blue-100 text-blue-700' },
-  disputed: { label: '有冲突', className: 'bg-rose-100 text-rose-700' },
-};
+const kindLabel: Record<string, string> = { preference: '用户偏好', issue: '问题记录', project_fact: '项目记忆' };
+const patternStatus: Record<string, string> = { tentative: '待观察', ready_for_review: '待审核', confirmed: '已确认', disputed: '有冲突' };
 
-const kindLabel: Record<string, string> = {
-  preference: '用户偏好',
-  issue: '问题规律',
-  project_fact: '项目记忆',
-};
+function errorText(error: unknown) { return error instanceof Error ? error.message : '加载项目洞察失败'; }
+function formatDate(value: string) { return value ? value.replace('T', ' ').slice(0, 16) : ''; }
 
-function errorText(error: unknown) {
-  return error instanceof Error ? error.message : '加载项目洞察失败';
-}
-
-function formatDate(value: string) {
-  return value ? value.replace('T', ' ').slice(0, 16) : '';
-}
-
-interface ProjectInsightsPanelProps {
-  projectId: string | null;
-}
+interface ProjectInsightsPanelProps { projectId: string | null; }
 
 export function ProjectInsightsPanel({ projectId }: ProjectInsightsPanelProps) {
   const [open, setOpen] = useState(false);
-  const [tab, setTab] = useState<InsightTab>('patterns');
-  const [patterns, setPatterns] = useState<MemoryPattern[]>([]);
+  const [tab, setTab] = useState<InsightTab>('evidence');
+  const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [memories, setMemories] = useState<TraceMemory[]>([]);
+  const [patterns, setPatterns] = useState<MemoryPattern[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [expandedMemoryId, setExpandedMemoryId] = useState<string | null>(null);
-  const [memoryContents, setMemoryContents] = useState<Record<string, string>>({});
-  const [contentLoadingId, setContentLoadingId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!projectId) return;
-    setLoading(true);
-    setError(null);
+    setLoading(true); setError(null);
     try {
-      const [nextPatterns, nextMemories] = await Promise.all([
-        fetchMemoryPatterns(projectId),
-        fetchTraceMemories(projectId),
-      ]);
-      setPatterns(nextPatterns);
-      setMemories(nextMemories);
-    } catch (requestError) {
-      setError(errorText(requestError));
-    } finally {
-      setLoading(false);
-    }
+      const [nextEvidence, nextMemories, nextPatterns] = await Promise.all([fetchEvidence(projectId), fetchMemories(projectId), fetchMemoryPatterns(projectId)]);
+      setEvidence(nextEvidence); setMemories(nextMemories); setPatterns(nextPatterns);
+    } catch (requestError) { setError(errorText(requestError)); }
+    finally { setLoading(false); }
   }, [projectId]);
 
-  const showPanel = () => {
+  useEffect(() => { if (open) void load(); }, [load, open]);
+
+  const review = async (pattern: MemoryPattern, status: 'confirmed' | 'disputed') => {
     if (!projectId) return;
-    setOpen(true);
-    setTab('patterns');
+    try { await reviewMemoryPattern(projectId, pattern.pattern_id, status, pattern.confidence); await load(); }
+    catch (reviewError) { setError(errorText(reviewError)); }
   };
 
-  useEffect(() => {
-    if (open) void load();
-  }, [load, open]);
-
-  const toggleMemory = async (memory: TraceMemory) => {
-    if (expandedMemoryId === memory.memory_id) {
-      setExpandedMemoryId(null);
-      return;
-    }
-    setExpandedMemoryId(memory.memory_id);
-    if (memoryContents[memory.memory_id] !== undefined || !projectId) return;
-    setContentLoadingId(memory.memory_id);
-    try {
-      const detail = await fetchTraceMemory(projectId, memory.memory_id);
-      setMemoryContents(current => ({ ...current, [memory.memory_id]: detail.content ?? memory.claim }));
-    } catch (requestError) {
-      setMemoryContents(current => ({ ...current, [memory.memory_id]: `⚠️ ${errorText(requestError)}` }));
-    } finally {
-      setContentLoadingId(null);
-    }
-  };
-
-  const confirmedCount = useMemo(() => patterns.filter(pattern => pattern.status === 'confirmed').length, [patterns]);
-
-  return (
-    <>
-      <button
-        type="button"
-        onClick={showPanel}
-        disabled={!projectId}
-        className="rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-xs text-gray-600 shadow-sm hover:border-purple-200 hover:text-purple-600 transition-colors disabled:cursor-not-allowed disabled:opacity-40"
-        aria-label="打开项目洞察与记忆"
-      >项目洞察</button>
-      {open && createPortal(
-        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="project-insights-title">
-          <div className="relative w-full max-w-3xl max-h-[85vh] overflow-hidden rounded-2xl bg-white shadow-2xl mx-4 flex flex-col">
-            <div className="px-6 pt-6 pb-4 pr-14 border-b border-gray-100 shrink-0">
-              <div>
-                <h2 id="project-insights-title" className="font-semibold text-gray-800">项目洞察与记忆</h2>
-                <p className="mt-1 text-xs text-gray-400">Trace 保留证据；Memory 记录单次结论；规律由多条 Memory 归纳而来。</p>
-              </div>
-            </div>
-            <button type="button" onClick={() => setOpen(false)} aria-label="关闭项目洞察" className="absolute right-4 top-4 z-10 flex h-8 w-8 items-center justify-center rounded-lg text-gray-400 hover:bg-gray-100 hover:text-gray-700">✕</button>
-
-            <div className="px-6 pt-4 shrink-0 flex items-center justify-between gap-3">
-              <div className="flex gap-1 rounded-xl bg-gray-100 p-1" role="tablist" aria-label="项目洞察分类">
-                <button type="button" role="tab" aria-selected={tab === 'patterns'} onClick={() => setTab('patterns')} className={`rounded-lg px-3 py-1.5 text-sm transition-colors ${tab === 'patterns' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>学习规律 {confirmedCount ? `(${confirmedCount})` : ''}</button>
-                <button type="button" role="tab" aria-selected={tab === 'memories'} onClick={() => setTab('memories')} className={`rounded-lg px-3 py-1.5 text-sm transition-colors ${tab === 'memories' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>原子记忆 {memories.length ? `(${memories.length})` : ''}</button>
-              </div>
-              <button type="button" onClick={() => void load()} disabled={loading} className="text-xs text-purple-600 hover:text-purple-700 disabled:opacity-40">{loading ? '刷新中…' : '刷新'}</button>
-            </div>
-
-            <div className="flex-1 overflow-y-auto px-6 py-4">
-              {loading && <div className="py-14 text-center text-sm text-gray-400">正在读取项目洞察…</div>}
-              {!loading && error && <div role="alert" className="rounded-lg border border-red-100 bg-red-50 px-3 py-2 text-sm text-red-600">{error}</div>}
-
-              {!loading && !error && tab === 'patterns' && (
-                <div className="space-y-3" role="tabpanel">
-                  {patterns.map(pattern => {
-                    const meta = statusMeta[pattern.status] ?? statusMeta.tentative;
-                    return (
-                      <article key={pattern.pattern_id} className="rounded-xl border border-gray-100 bg-gray-50 p-4">
-                        <div className="flex flex-wrap items-center gap-2 mb-2">
-                          <span className={`rounded-full px-2 py-0.5 text-[11px] ${meta.className}`}>{meta.label}</span>
-                          <span className="text-[11px] text-gray-500">{kindLabel[pattern.kind] ?? pattern.kind}</span>
-                          {pattern.subtype && <span className="text-[11px] text-gray-400">{pattern.subtype}</span>}
-                          <span className="ml-auto text-[11px] text-gray-400">置信度 {Math.round(pattern.confidence * 100)}%</span>
-                        </div>
-                        <p className="text-sm leading-6 text-gray-700">{pattern.canonical_claim}</p>
-                        <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-gray-400">
-                          <span>支持 {pattern.support_count} 条</span>
-                          <span>冲突 {pattern.contradiction_count} 条</span>
-                          <span>范围：{pattern.scope}</span>
-                          <span>更新于 {formatDate(pattern.updated_at)}</span>
-                        </div>
-                      </article>
-                    );
-                  })}
-                  {patterns.length === 0 && <EmptyState text="还没有从多次交互中归纳出规律。完成几轮带有反馈的对话后，系统会在这里显示待观察或已确认的偏好与问题。" />}
-                </div>
-              )}
-
-              {!loading && !error && tab === 'memories' && (
-                <div className="space-y-3" role="tabpanel">
-                  {memories.map(memory => (
-                    <article key={memory.memory_id} className="rounded-xl border border-gray-100 bg-white p-4 shadow-sm">
-                      <div className="flex flex-wrap items-center gap-2 mb-2 text-[11px]">
-                        <span className="rounded-full bg-violet-100 text-violet-700 px-2 py-0.5">{kindLabel[memory.kind] ?? memory.kind}</span>
-                        {memory.subtype && <span className="text-gray-500">{memory.subtype}</span>}
-                        <span className="ml-auto text-gray-400">置信度 {Math.round(memory.confidence * 100)}%</span>
-                      </div>
-                      <button type="button" onClick={() => void toggleMemory(memory)} className="w-full text-left text-sm leading-6 text-gray-700 hover:text-purple-700">
-                        {memory.claim}
-                      </button>
-                      <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-gray-400">
-                        <span>范围：{memory.scope}</span>
-                        <span title={memory.trace_id}>Trace：{memory.trace_id.slice(0, 14)}…</span>
-                        <span>事件 {memory.source_event_ids.length} 个</span>
-                        <span>{formatDate(memory.created_at)}</span>
-                      </div>
-                      {expandedMemoryId === memory.memory_id && (
-                        <div className="mt-3 border-t border-gray-100 pt-3">
-                          {contentLoadingId === memory.memory_id
-                            ? <div className="text-xs text-gray-400">正在读取记忆正文…</div>
-                            : <pre className="whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-3 text-xs leading-5 text-gray-600 font-sans">{memoryContents[memory.memory_id] ?? memory.claim}</pre>}
-                          {memory.file_path && <div className="mt-2 text-[11px] text-gray-400">{memory.file_path}</div>}
-                        </div>
-                      )}
-                    </article>
-                  ))}
-                  {memories.length === 0 && <EmptyState text="还没有提取到可长期复用的原子记忆。普通聊天与一次性指令不会被保存。" />}
-                </div>
-              )}
-            </div>
+  return <>
+    <button type="button" onClick={() => { if (projectId) setOpen(true); }} disabled={!projectId} className="rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-xs text-gray-600 shadow-sm transition-colors hover:border-purple-200 hover:text-purple-600 disabled:cursor-not-allowed disabled:opacity-40">项目洞察</button>
+    {open && createPortal(
+      <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="project-insights-title">
+        <div className="relative mx-4 flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
+          <div className="shrink-0 border-b border-gray-100 px-6 pb-4 pt-6 pr-14"><h2 id="project-insights-title" className="font-semibold text-gray-800">项目洞察</h2><p className="mt-1 text-xs text-gray-400">Trace 保存原始事实；Evidence 等待支持，Memory 可复用，Pattern 经审核后注入上下文。</p></div>
+          <button type="button" onClick={() => setOpen(false)} aria-label="关闭项目洞察" className="absolute right-4 top-4 z-10 flex h-8 w-8 items-center justify-center rounded-lg text-gray-400 hover:bg-gray-100 hover:text-gray-700">×</button>
+          <div className="flex shrink-0 items-center justify-between gap-3 px-6 pt-4"><div className="flex gap-1 rounded-xl bg-gray-100 p-1"><Tab active={tab === 'evidence'} onClick={() => setTab('evidence')}>证据 {evidence.length ? `(${evidence.length})` : ''}</Tab><Tab active={tab === 'memory'} onClick={() => setTab('memory')}>记忆 {memories.length ? `(${memories.length})` : ''}</Tab><Tab active={tab === 'pattern'} onClick={() => setTab('pattern')}>模式 {patterns.length ? `(${patterns.length})` : ''}</Tab></div><button type="button" onClick={() => void load()} disabled={loading} className="text-xs text-purple-600 hover:text-purple-700 disabled:opacity-40">{loading ? '刷新中…' : '刷新'}</button></div>
+          <div className="flex-1 overflow-y-auto px-6 py-4">
+            {loading && <Empty text="正在读取项目洞察…" />}{!loading && error && <div role="alert" className="rounded-lg border border-red-100 bg-red-50 px-3 py-2 text-sm text-red-600">{error}</div>}
+            {!loading && !error && tab === 'evidence' && <RecordList records={evidence} empty="没有待观察证据。只有尚不足以形成长期结论的 Trace 线索会保留在这里。" badge="待观察" />}
+            {!loading && !error && tab === 'memory' && <RecordList records={memories} empty="没有已提升 Memory。" badge="已提升" />}
+            {!loading && !error && tab === 'pattern' && <div className="space-y-3">{patterns.map(pattern => <article key={pattern.pattern_id} className="rounded-xl border border-gray-100 bg-white p-4 shadow-sm"><div className="mb-2 flex flex-wrap items-center gap-2 text-[11px]"><span className="rounded-full bg-purple-100 px-2 py-0.5 text-purple-700">{patternStatus[pattern.status] ?? pattern.status}</span><span className="text-gray-500">{kindLabel[pattern.kind] ?? pattern.kind}</span><span className="ml-auto text-gray-400">置信度 {Math.round(pattern.confidence * 100)}%</span></div><p className="text-sm leading-6 text-gray-700">{pattern.claim}</p><div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-gray-400"><span>支持 {pattern.support_count} 条</span><span>冲突 {pattern.contradiction_count} 条</span><span>Trace {pattern.trace_ids.length} 条</span></div>{pattern.status === 'ready_for_review' && <div className="mt-3 flex gap-2"><button type="button" onClick={() => void review(pattern, 'confirmed')} className="rounded bg-emerald-600 px-2 py-1 text-xs text-white hover:bg-emerald-700">确认</button><button type="button" onClick={() => void review(pattern, 'disputed')} className="rounded border border-rose-200 px-2 py-1 text-xs text-rose-600 hover:bg-rose-50">标记冲突</button></div>}</article>)}{patterns.length === 0 && <Empty text="尚未形成 Pattern。至少需要多条已提升 Memory，并经 Trace 回读校验。" />}</div>}
           </div>
-        </div>,
-        document.body,
-      )}
-    </>
-  );
+        </div>
+      </div>, document.body,
+    )}
+  </>;
 }
 
-function EmptyState({ text }: { text: string }) {
-  return <div className="rounded-xl border border-dashed border-gray-200 bg-gray-50 px-5 py-12 text-center text-sm leading-6 text-gray-400">{text}</div>;
-}
+function Tab({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) { return <button type="button" onClick={onClick} className={`rounded-lg px-3 py-1.5 text-sm transition-colors ${active ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>{children}</button>; }
+function RecordList({ records, empty, badge }: { records: Array<Evidence | TraceMemory>; empty: string; badge: string }) { return <div className="space-y-3">{records.map(record => <article key={'evidence_id' in record ? record.evidence_id : record.memory_id} className="rounded-xl border border-gray-100 bg-white p-4 shadow-sm"><div className="mb-2 flex flex-wrap items-center gap-2 text-[11px]"><span className="rounded-full bg-violet-100 px-2 py-0.5 text-violet-700">{badge}</span><span className="text-gray-500">{kindLabel[record.kind] ?? record.kind}</span><span className="ml-auto text-gray-400">置信度 {Math.round(record.confidence * 100)}%</span></div><p className="text-sm leading-6 text-gray-700">{record.claim}</p><div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-gray-400"><span>范围：{record.scope}</span><span title={record.trace_id}>Trace：{record.trace_id.slice(0, 14)}…</span><span>事件 {record.source_event_ids.length} 个</span><span>{formatDate(record.created_at)}</span></div></article>)}{records.length === 0 && <Empty text={empty} />}</div>; }
+function Empty({ text }: { text: string }) { return <div className="rounded-xl border border-dashed border-gray-200 bg-gray-50 px-5 py-12 text-center text-sm leading-6 text-gray-400">{text}</div>; }

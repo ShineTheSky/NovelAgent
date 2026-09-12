@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { fetchMemoryPatterns, fetchTraceMemories } from '../api/client';
-import type { MemoryPattern, TraceMemory } from '../types/insights';
+import { useCallback, useEffect, useState } from 'react';
+import { fetchEvidence, fetchMemories, fetchMemoryPatterns } from '../api/client';
+import type { Evidence, MemoryPattern, TraceMemory } from '../types/insights';
 import type { ProjectInfo, SessionInfo } from '../types/chat';
 
 interface ProjectOverviewProps {
@@ -11,32 +11,33 @@ interface ProjectOverviewProps {
 }
 
 function kindLabel(kind: string) {
-  return kind === 'preference' ? '用户偏好' : kind === 'issue' ? '问题规律' : '项目记忆';
+  return kind === 'preference' ? '用户偏好' : kind === 'issue' ? '问题记录' : '项目记忆';
 }
 
 export function ProjectOverview({ project, sessions, onNewSession, onSelectSession }: ProjectOverviewProps) {
-  const [patterns, setPatterns] = useState<MemoryPattern[]>([]);
+  const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [memories, setMemories] = useState<TraceMemory[]>([]);
+  const [patterns, setPatterns] = useState<MemoryPattern[]>([]);
 
   const loadInsights = useCallback(async () => {
     try {
-      const [nextPatterns, nextMemories] = await Promise.all([
-        fetchMemoryPatterns(project.project_id),
-        fetchTraceMemories(project.project_id),
+      const [nextEvidence, nextMemories, nextPatterns] = await Promise.all([
+        fetchEvidence(project.project_id), fetchMemories(project.project_id), fetchMemoryPatterns(project.project_id),
       ]);
-      setPatterns(nextPatterns);
+      setEvidence(nextEvidence);
       setMemories(nextMemories);
+      setPatterns(nextPatterns);
     } catch {
-      // The project remains usable when a background insight request fails.
-      setPatterns([]);
+      setEvidence([]);
       setMemories([]);
+      setPatterns([]);
     }
   }, [project.project_id]);
 
   useEffect(() => { void loadInsights(); }, [loadInsights]);
 
-  const confirmedPatterns = useMemo(() => patterns.filter(pattern => pattern.status === 'confirmed'), [patterns]);
-  const recentMemories = memories.slice(0, 4);
+  const confirmedPatterns = patterns.filter(pattern => pattern.status === 'confirmed').slice(0, 3);
+  const recentMemories = memories.slice(0, 3);
 
   return (
     <section className="flex-1 overflow-y-auto bg-white px-8 py-10">
@@ -50,36 +51,26 @@ export function ProjectOverview({ project, sessions, onNewSession, onSelectSessi
           <button type="button" onClick={onNewSession} className="rounded-lg bg-purple-600 px-3 py-2 text-sm font-medium text-white shadow-sm hover:bg-purple-700">新建会话</button>
         </div>
 
-        <div className="grid gap-3 sm:grid-cols-3 mb-8">
+        <div className="mb-8 grid gap-3 sm:grid-cols-4">
           <StatCard label="会话" value={sessions.length} detail="该项目下的任务" />
-          <StatCard label="已确认规律" value={confirmedPatterns.length} detail="会注入后续上下文" />
-          <StatCard label="原子记忆" value={memories.length} detail="均可回溯到 Trace" />
+          <StatCard label="待观察证据" value={evidence.length} detail="尚不足以形成结论" />
+          <StatCard label="原子记忆" value={memories.length} detail="已提升，可按需预取" />
+          <StatCard label="已确认模式" value={confirmedPatterns.length} detail="会注入后续上下文" />
         </div>
 
         <div className="grid gap-5 lg:grid-cols-2">
           <section className="rounded-xl border border-gray-100 bg-[#fafbfc] p-5">
-            <div className="mb-4 flex items-center justify-between"><h2 className="text-sm font-semibold text-gray-700">已学习的项目规律</h2><span className="text-xs text-gray-400">{patterns.length} 条</span></div>
+            <div className="mb-4 flex items-center justify-between"><h2 className="text-sm font-semibold text-gray-700">已确认模式</h2><span className="text-xs text-gray-400">多条 Memory 归纳</span></div>
             <div className="space-y-3">
-              {patterns.slice(0, 4).map(pattern => (
-                <div key={pattern.pattern_id} className="rounded-lg bg-white px-3 py-2.5 border border-gray-100">
-                  <div className="mb-1 flex items-center gap-2 text-[11px] text-gray-400"><span className={pattern.status === 'confirmed' ? 'text-emerald-600' : 'text-amber-600'}>{pattern.status === 'confirmed' ? '已确认' : '待观察'}</span><span>{kindLabel(pattern.kind)}</span></div>
-                  <p className="text-sm leading-5 text-gray-700">{pattern.canonical_claim}</p>
-                </div>
-              ))}
-              {patterns.length === 0 && <p className="py-4 text-sm leading-6 text-gray-400">完成几轮有反馈的对话后，系统会在这里归纳用户偏好和重复问题。</p>}
+              {confirmedPatterns.map(pattern => <div key={pattern.pattern_id} className="rounded-lg border border-gray-100 bg-white px-3 py-2.5"><div className="mb-1 text-[11px] text-emerald-600">已确认 · 支持 {pattern.support_count} 条</div><p className="text-sm leading-5 text-gray-700">{pattern.claim}</p></div>)}
+              {confirmedPatterns.length === 0 && <p className="py-4 text-sm leading-6 text-gray-400">模式需经多条 Memory 支持并审核确认后才会注入上下文。</p>}
             </div>
           </section>
-
           <section className="rounded-xl border border-gray-100 bg-[#fafbfc] p-5">
-            <div className="mb-4 flex items-center justify-between"><h2 className="text-sm font-semibold text-gray-700">最近记忆</h2><span className="text-xs text-gray-400">Trace 支持</span></div>
+            <div className="mb-4 flex items-center justify-between"><h2 className="text-sm font-semibold text-gray-700">最近记忆</h2><span className="text-xs text-gray-400">可回溯到 Trace</span></div>
             <div className="space-y-3">
-              {recentMemories.map(memory => (
-                <div key={memory.memory_id} className="rounded-lg bg-white px-3 py-2.5 border border-gray-100">
-                  <div className="mb-1 text-[11px] text-violet-600">{kindLabel(memory.kind)} · {memory.subtype || '通用'}</div>
-                  <p className="text-sm leading-5 text-gray-700">{memory.claim}</p>
-                </div>
-              ))}
-              {memories.length === 0 && <p className="py-4 text-sm leading-6 text-gray-400">暂无长期记忆。普通聊天和一次性指令不会被保存。</p>}
+              {recentMemories.map(memory => <div key={memory.memory_id} className="rounded-lg border border-gray-100 bg-white px-3 py-2.5"><div className="mb-1 text-[11px] text-violet-600">{kindLabel(memory.kind)} · {memory.subtype || '通用'}</div><p className="text-sm leading-5 text-gray-700">{memory.claim}</p></div>)}
+              {memories.length === 0 && <p className="py-4 text-sm leading-6 text-gray-400">暂无已提升 Memory；一次性或证据不足的结论会保留为待观察证据。</p>}
             </div>
           </section>
         </div>

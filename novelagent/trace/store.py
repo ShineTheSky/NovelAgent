@@ -135,6 +135,15 @@ class TraceStore:
         await conn.close()
         return dict(row) if row else None
 
+    async def get_project_trace(self, project_id: str, trace_id: str) -> dict | None:
+        conn = await get_connection()
+        cursor = await conn.execute(
+            "SELECT * FROM traces WHERE project_id = ? AND trace_id = ?", (project_id, trace_id)
+        )
+        row = await cursor.fetchone()
+        await conn.close()
+        return dict(row) if row else None
+
     async def list_session_traces(self, session_id: str, limit: int = 50) -> list[dict]:
         conn = await get_connection()
         cursor = await conn.execute(
@@ -153,10 +162,50 @@ class TraceStore:
         await conn.close()
         return int(row[0]) if row else 0
 
-    async def list_events(self, trace_id: str, limit: int = 80) -> list[dict]:
+    async def list_events(self, trace_id: str, limit: int = 1000, offset: int = 0) -> list[dict]:
         conn = await get_connection()
         cursor = await conn.execute(
-            "SELECT * FROM trace_events WHERE trace_id = ? ORDER BY sequence_no ASC LIMIT ?", (trace_id, limit)
+            "SELECT * FROM trace_events WHERE trace_id = ? ORDER BY sequence_no ASC LIMIT ? OFFSET ?", (trace_id, limit, offset)
+        )
+        rows = await cursor.fetchall()
+        await conn.close()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json") or "{}")
+            result.append(item)
+        return result
+
+    async def get_events_by_ids(self, trace_id: str, event_ids: list[str]) -> list[dict]:
+        wanted = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
+        if not wanted:
+            return []
+        placeholders = ",".join("?" for _ in wanted)
+        conn = await get_connection()
+        cursor = await conn.execute(
+            f"SELECT * FROM trace_events WHERE trace_id = ? AND event_id IN ({placeholders}) ORDER BY sequence_no ASC",
+            (trace_id, *wanted),
+        )
+        rows = await cursor.fetchall()
+        await conn.close()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json") or "{}")
+            result.append(item)
+        return result
+
+    async def get_trace_event_window(self, trace_id: str, event_ids: list[str], before: int = 2, after: int = 2) -> list[dict]:
+        anchors = await self.get_events_by_ids(trace_id, event_ids)
+        if not anchors:
+            return []
+        low = max(1, min(event["sequence_no"] for event in anchors) - max(0, before))
+        high = max(event["sequence_no"] for event in anchors) + max(0, after)
+        conn = await get_connection()
+        cursor = await conn.execute(
+            """SELECT * FROM trace_events WHERE trace_id = ? AND sequence_no BETWEEN ? AND ?
+               ORDER BY sequence_no ASC""",
+            (trace_id, low, high),
         )
         rows = await cursor.fetchall()
         await conn.close()
