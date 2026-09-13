@@ -12,6 +12,7 @@ from novelagent.context.message_manager import Message, MessageManager
 from novelagent.security.audit import audit_log
 from novelagent.core.llm_turn import build_assistant_message
 from novelagent.trace.recorder import TraceRecorder, sanitize_payload
+from novelagent.trace.agent_bad_cases import AgentBadCaseRecorder
 from novelagent.memory.memory_manager import MemoryManager
 from novelagent.core.review_workflow import ReviewPolishWorkflow
 
@@ -33,6 +34,7 @@ class AgentLoop:
         self.trace_interval = self._config.get("trace_interval", 5)
         self.working_dir = self._config.get("working_dir", "./workspace")
         self.trace = trace_recorder
+        self.bad_cases = AgentBadCaseRecorder(trace_recorder.store, self.working_dir) if trace_recorder else None
         self.post_turn_analyzer = post_turn_analyzer
         self.preference_context_provider = preference_context_provider
         self.rag_store = rag_store
@@ -97,6 +99,48 @@ class AgentLoop:
             history_messages=history_msgs + [current_user_msg],
             preference_context=preference_context,
         )
+
+        def capture_bad_case(failure_kind: str, actor: str, error: str, *, tool: str = "",
+                             params: dict | None = None, duration_ms: float | None = None) -> None:
+            if not self.bad_cases:
+                return
+            asyncio.create_task(self.bad_cases.capture(
+                source_trace_id=trace_id,
+                session_id=session.session_id,
+                project_id=session.project_id,
+                failure_kind=failure_kind,
+                actor=actor,
+                error=error,
+                tool=tool,
+                params=params,
+                messages=ctx.to_llm_messages(),
+                duration_ms=duration_ms,
+            ))
+
+        async def capture_trace_if_due(answer: str = "") -> dict | None:
+            """Seal a completed or interrupted turn without losing a requested checkpoint."""
+            if not self.trace:
+                return None
+            try:
+                token_count = self.context_builder.token_counter.count_messages(ctx.to_llm_messages())
+                await self.trace.store.append_session_turn(
+                    session.session_id, request.content, answer, deferred_trace_events,
+                )
+                pending_turns = await self.trace.store.pending_trace_turn_count(session.session_id)
+                if not trace_checkpoint_requested and (self.trace_interval <= 0 or pending_turns < self.trace_interval):
+                    return None
+                captured = await self.trace.store.capture_pending_trace(
+                    session.session_id, session.project_id, ctx.to_llm_messages(), token_count,
+                )
+                if captured and self.post_turn_analyzer:
+                    asyncio.create_task(self.post_turn_analyzer.analyze(
+                        captured["trace_id"], session.project_id, captured["messages"], main_tool_schemas,
+                    ))
+                return captured
+            except Exception as exc:
+                print(f"[trace] checkpoint capture failed: {exc}", flush=True)
+                return None
+
         await record("context_built", "system", {
             "history_message_count": len(history_msgs),
             "memory_index_present": bool(memory_md),
@@ -109,7 +153,7 @@ class AgentLoop:
             memories = await asyncio.wait_for(prefetch_task, timeout=1.5)
             if memories:
                 memory_injection = memories
-                injection_text = "[相关记忆]\n" + "\n---\n".join(memories)
+                injection_text = "[相关记忆附件]\n" + "\n---\n".join(memories)
                 ctx.messages.insert(-1, Message(role="system", content=injection_text))
         except asyncio.TimeoutError:
             pass
@@ -191,7 +235,9 @@ class AgentLoop:
             if session.stop_requested:
                 await record("interrupted", "user", {"reason": "stop_requested"})
                 await finish("interrupted")
-                yield ResponseChunk(type="done", data={"finish_reason": "interrupted", "message": "用户中断"})
+                captured_trace = await capture_trace_if_due(final_text)
+                yield ResponseChunk(type="done", data={"finish_reason": "interrupted", "message": "用户中断",
+                                                        "trace_id": captured_trace["trace_id"] if captured_trace else ""})
                 return
 
             llm_messages = ctx.to_llm_messages()
@@ -232,8 +278,11 @@ class AgentLoop:
                         for i, m in enumerate(llm_messages[-6:]):
                             print(f"  [{i}] {json.dumps(m, ensure_ascii=False)[:200]}", flush=True)
                         await record("error", "main_agent", {"message": chunk.error, "turn": turn})
+                        capture_bad_case("main_agent_failure", "main_agent", chunk.error)
                         await finish("failed")
-                        yield ResponseChunk(type="error", data={"message": chunk.error, "trace_id": trace_id})
+                        captured_trace = await capture_trace_if_due(full_response)
+                        yield ResponseChunk(type="error", data={"message": chunk.error,
+                                                                  "trace_id": captured_trace["trace_id"] if captured_trace else trace_id})
                         return
                     elif chunk.type == "done":
                         break
@@ -242,8 +291,11 @@ class AgentLoop:
                 print(f"[LLM] 调用异常: {e}", flush=True)
                 traceback.print_exc()
                 await record("error", "main_agent", {"message": str(e), "turn": turn})
+                capture_bad_case("main_agent_failure", "main_agent", str(e))
                 await finish("failed")
-                yield ResponseChunk(type="error", data={"message": f"LLM调用失败: {e}", "trace_id": trace_id})
+                captured_trace = await capture_trace_if_due(full_response)
+                yield ResponseChunk(type="error", data={"message": f"LLM调用失败: {e}",
+                                                          "trace_id": captured_trace["trace_id"] if captured_trace else trace_id})
                 return
 
             await record("assistant_turn", "main_agent", {
@@ -278,6 +330,7 @@ class AgentLoop:
                     error_msg = f"操作被安全策略禁止: {tool_name}"
                     await record("permission", "system", {"tool": tool_name, "decision": "block"}, tool_event_id)
                     await record("tool_result", "tool", {"tool": tool_name, "success": False, "error": error_msg}, tool_event_id)
+                    capture_bad_case("tool_failure", "main_agent", error_msg, tool=tool_name, params=params)
                     yield ResponseChunk(type="error", data={"message": error_msg})
                     ctx.messages.append(Message(role="tool_result", content=error_msg, tool_call_id=tool_name))
                     continue
@@ -299,6 +352,7 @@ class AgentLoop:
                         })
                         await record("permission_response", "user", {"tool": tool_name, "allowed": False}, tool_event_id)
                         await record("tool_result", "tool", {"tool": tool_name, "success": False, "error": error_msg}, tool_event_id)
+                        capture_bad_case("tool_failure", "main_agent", error_msg, tool=tool_name, params=params)
                         ctx.messages.append(Message(role="tool_result", content=error_msg, tool_call_id=tool_name))
                         continue
                     # 用户同意 → 记录到会话内批准列表
@@ -375,6 +429,7 @@ class AgentLoop:
                                 print(f"[workflow] build writer context failed: {exc}", flush=True)
                     t0 = time.time()
                     subagent_result_text = ""
+                    subagent_failed = False
                     writer_revision_events = []
                     subagent_run_id = uuid.uuid4().hex
                     async for sub_chunk in self.subagent_runner.spawn_and_run(
@@ -387,6 +442,18 @@ class AgentLoop:
                         run_id=subagent_run_id,
                     ):
                         await record(f"subagent_{sub_chunk.type}", f"subagent:{preset}", sub_chunk.data, tool_event_id)
+                        if sub_chunk.type == "tool_result" and not sub_chunk.data.get("success", False):
+                            capture_bad_case(
+                                "tool_failure", f"subagent:{preset}", sub_chunk.data.get("error", "子 Agent 工具调用失败"),
+                                tool=sub_chunk.data.get("tool", ""), params=sub_chunk.data.get("params", {}),
+                            )
+                        if sub_chunk.type == "error":
+                            subagent_failed = True
+                            subagent_result_text = f"Error: {sub_chunk.data.get('message', '子 Agent 执行失败')}"
+                            capture_bad_case(
+                                "subagent_failure", f"subagent:{preset}", sub_chunk.data.get("message", "子 Agent 执行失败"),
+                                tool="SubAgent", params={"preset": preset, "task": task},
+                            )
                         if sub_chunk.type == "subagent_done":
                             subagent_result_text = sub_chunk.data.get("result", "")
                             writer_revision_events = sub_chunk.data.get("revision_events", [])
@@ -420,6 +487,20 @@ class AgentLoop:
                                     f"workflow:{workflow_chunk.data.get('workflow', 'review_polish')}",
                                     workflow_chunk.data, tool_event_id,
                                 )
+                                if workflow_chunk.type == "error":
+                                    capture_bad_case(
+                                        "subagent_failure",
+                                        f"workflow:{workflow_chunk.data.get('workflow', 'review_polish')}",
+                                        workflow_chunk.data.get("message", "自动审阅或润色失败"),
+                                        tool="SubAgent", params={"workflow": workflow_chunk.data.get("workflow", "")},
+                                    )
+                                elif workflow_chunk.type == "tool_result" and not workflow_chunk.data.get("success", False):
+                                    capture_bad_case(
+                                        "tool_failure",
+                                        f"workflow:{workflow_chunk.data.get('workflow', 'review_polish')}",
+                                        workflow_chunk.data.get("error", "工作流工具调用失败"),
+                                        tool=workflow_chunk.data.get("tool", ""), params=workflow_chunk.data.get("params", {}),
+                                    )
                                 yield workflow_chunk
 
                     if workflow_summaries:
@@ -435,7 +516,10 @@ class AgentLoop:
                     duration = (time.time() - t0) * 1000
                 else:
                     t0 = time.time()
-                    result = await self.tools.execute(tool_name, params, tool_ctx)
+                    try:
+                        result = await self.tools.execute(tool_name, params, tool_ctx)
+                    except Exception as exc:
+                        result = ToolResult(success=False, error=str(exc))
                     duration = (time.time() - t0) * 1000
                 if tool_name == "CreateTraceCheckpoint" and result.success:
                     trace_checkpoint_requested = True
@@ -451,6 +535,11 @@ class AgentLoop:
                     "data": result.data if result.success else "",
                     "error": result.error if not result.success else "",
                 }, tool_event_id, duration)
+                if not result.success and not (tool_name == "SubAgent" and subagent_failed):
+                    capture_bad_case(
+                        "tool_failure", "main_agent", result.error or f"{tool_name} 执行失败",
+                        tool=tool_name, params=params, duration_ms=duration,
+                    )
 
                 # SubAgent的结果已通过subagent_done事件推送给前端，不再重复发送tool_result
                 if tool_name != "SubAgent":
@@ -484,7 +573,9 @@ class AgentLoop:
                 if loop_count >= self.loop_threshold:
                     await record("loop_detected", "system", {"turn": turn})
                     await finish("interrupted")
-                    yield ResponseChunk(type="done", data={"finish_reason": "loop_detected"})
+                    captured_trace = await capture_trace_if_due(final_text)
+                    yield ResponseChunk(type="done", data={"finish_reason": "loop_detected",
+                                                            "trace_id": captured_trace["trace_id"] if captured_trace else ""})
                     return
             else:
                 self._loop_count = 0
@@ -493,23 +584,7 @@ class AgentLoop:
         # 7. The analyzer derives trace-backed atomic memories after the immutable trace is complete.
         token_count = self.context_builder.token_counter.count_messages(ctx.to_llm_messages())
         session.messages = [m.to_dict() for m in ctx.messages]
-        captured_trace = None
-        if self.trace:
-            await self.trace.store.append_session_turn(
-                session.session_id, request.content, final_text, deferred_trace_events,
-            )
-            pending_turns = await self.trace.store.pending_trace_turn_count(session.session_id)
-            if trace_checkpoint_requested or (self.trace_interval > 0 and pending_turns >= self.trace_interval):
-                captured_trace = await self.trace.store.capture_pending_trace(
-                    session.session_id, session.project_id, ctx.to_llm_messages(), token_count,
-                )
-        if self.post_turn_analyzer and captured_trace:
-            asyncio.create_task(self.post_turn_analyzer.analyze(
-                captured_trace["trace_id"],
-                session.project_id,
-                captured_trace["messages"],
-                main_tool_schemas,
-            ))
+        captured_trace = await capture_trace_if_due(final_text)
 
         # 8. Done
         yield ResponseChunk(type="done", data={

@@ -94,6 +94,12 @@ class RagStore:
     def __init__(self, embedding_model=None):
         self.embedding_model = embedding_model
 
+    async def load_embedding_model(self) -> bool:
+        if self.embedding_model is None:
+            return False
+        await self.embedding_model.load()
+        return True
+
     async def add_document(self, title: str, content: str, source_name: str = "", encoding: str = "utf-8") -> dict:
         if "\ufffd" in content:
             raise ValueError("资料包含无法解码的字符，请选择正确的文本编码后重新导入")
@@ -116,8 +122,25 @@ class RagStore:
             )
         await conn.commit()
         await conn.close()
-        await self._store_embeddings(chunk_rows)
         return {"document_id": document_id, "title": title.strip() or "未命名文章", "source_name": source_name.strip(), "encoding": encoding.strip() or "utf-8", "chunk_count": len(chunks)}
+
+    async def embed_document(self, document_id: str, progress_callback=None) -> dict:
+        """Generate vectors for one already-imported document in the background."""
+        conn = await get_connection()
+        cursor = await conn.execute(
+            "SELECT chunk_id, content FROM rag_chunks WHERE document_id = ? ORDER BY chunk_index",
+            (document_id,),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+        await conn.close()
+        total = len(rows)
+        embedded = await self._store_embeddings(
+            rows,
+            raise_on_error=True,
+            progress_callback=progress_callback,
+            total_chunks=total,
+        )
+        return {"embedded_chunks": embedded, "total_chunks": total}
 
     async def list_documents(self) -> list[dict]:
         conn = await get_connection()

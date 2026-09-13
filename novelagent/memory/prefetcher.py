@@ -14,6 +14,15 @@ class Prefetcher:
         self.llm_client = llm_client
         self.timeout = timeout
 
+    @staticmethod
+    def _attachment_body(content: str) -> str:
+        """Return only the body of a Markdown memory record, without YAML metadata."""
+        if content.lstrip().startswith("---"):
+            parts = content.split("---", 2)
+            if len(parts) == 3:
+                return parts[2].strip()
+        return content.strip()
+
     async def fetch(self, user_message: str, memory_index: str | None = None,
                     external_sources: dict[str, str] | None = None) -> list[str] | None:
         """异步预取相关记忆文件原文。超时返回None。"""
@@ -84,6 +93,7 @@ class Prefetcher:
                 content = self.file_store.read(str(file_path).replace(".memory/", ""))
             if not content:
                 continue
+            content = self._attachment_body(content)
             # Rough token estimate (4 chars ≈ 1 token for Chinese)
             est_tokens = len(content) // 2
             if total_tokens + est_tokens > self.MAX_TOKENS:

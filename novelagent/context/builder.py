@@ -51,9 +51,10 @@ class ContextBuilder:
         # Build Messages
         messages = list(history_messages) if history_messages else []
 
-        # Inject prefetched memories before user message
+        # Inject only bodies of preselected memories before the user message.
+        # Their titles have already been included in the system prompt index.
         if memory_injection:
-            injection_text = "[相关记忆]\n" + "\n---\n".join(memory_injection)
+            injection_text = "[相关记忆附件]\n" + "\n---\n".join(memory_injection)
             messages.insert(-1 if messages else 0, Message(role="system", content=injection_text))
 
         return Context(system_prompt=system_prompt, messages=messages, tool_context=None)

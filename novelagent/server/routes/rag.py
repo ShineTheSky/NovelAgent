@@ -20,9 +20,40 @@ class ImportDocumentRequest(BaseModel):
 @router.post("/rag/documents")
 async def import_document(body: ImportDocumentRequest, request: Request):
     try:
-        return await request.app.state.rag_store.add_document(body.title, body.content, body.source_name, body.encoding)
+        document = await request.app.state.rag_store.add_document(body.title, body.content, body.source_name, body.encoding)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    jobs = getattr(request.app.state, "rag_embedding_jobs", {})
+    job_id = f"rag_emb_{uuid.uuid4().hex}"
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "running",
+        "completed_chunks": 0,
+        "total_chunks": document["chunk_count"],
+        "phase": "loading",
+        "error": "",
+    }
+    request.app.state.rag_embedding_jobs = jobs
+
+    async def run() -> None:
+        job = jobs[job_id]
+
+        def update(completed: int, total: int) -> None:
+            job.update({"completed_chunks": completed, "total_chunks": total, "phase": "embedding"})
+
+        try:
+            await request.app.state.rag_store.load_embedding_model()
+            job["phase"] = "embedding"
+            result = await request.app.state.rag_store.embed_document(document["document_id"], update)
+            job.update({"status": "completed", "completed_chunks": result["embedded_chunks"], "total_chunks": result["total_chunks"], "phase": "completed"})
+        except RuntimeError as exc:
+            job.update({"status": "failed", "error": str(exc)})
+        except Exception as exc:
+            job.update({"status": "failed", "error": f"向量构建失败：{exc}"})
+
+    asyncio.create_task(run())
+    return {**document, "embedding_job": jobs[job_id]}
 
 
 @router.get("/rag/documents")
@@ -35,16 +66,18 @@ async def rebuild_embeddings(request: Request):
     """Explicitly backfill vectors for documents imported before Emb was enabled."""
     jobs = getattr(request.app.state, "rag_embedding_jobs", {})
     job_id = f"rag_emb_{uuid.uuid4().hex}"
-    jobs[job_id] = {"job_id": job_id, "status": "running", "completed_chunks": 0, "total_chunks": 0, "error": ""}
+    jobs[job_id] = {"job_id": job_id, "status": "running", "completed_chunks": 0, "total_chunks": 0, "phase": "loading", "error": ""}
     request.app.state.rag_embedding_jobs = jobs
 
     async def run() -> None:
         job = jobs[job_id]
         def update(completed: int, total: int) -> None:
-            job.update({"completed_chunks": completed, "total_chunks": total})
+            job.update({"completed_chunks": completed, "total_chunks": total, "phase": "embedding"})
         try:
+            await request.app.state.rag_store.load_embedding_model()
+            job["phase"] = "embedding"
             result = await request.app.state.rag_store.rebuild_embeddings(update)
-            job.update({"status": "completed", "completed_chunks": result["embedded_chunks"], "total_chunks": result["missing_chunks"]})
+            job.update({"status": "completed", "completed_chunks": result["embedded_chunks"], "total_chunks": result["missing_chunks"], "phase": "completed"})
         except RuntimeError as exc:
             job.update({"status": "failed", "error": str(exc)})
 

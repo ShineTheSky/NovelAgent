@@ -105,6 +105,40 @@ async def save_messages(session_id: str, messages: list[dict], token_count: int 
     await conn.close()
 
 
+async def save_display_turn(session_id: str, events: list[dict]) -> None:
+    """Persist UI-only SSE events separately from the model conversation."""
+    conn = await get_connection()
+    cursor = await conn.execute(
+        "SELECT COALESCE(MAX(turn_no), 0) FROM session_display_turns WHERE session_id = ?", (session_id,)
+    )
+    row = await cursor.fetchone()
+    turn_no = int(row[0]) + 1
+    await conn.execute(
+        "INSERT INTO session_display_turns (session_id, turn_no, events_json) VALUES (?, ?, ?)",
+        (session_id, turn_no, json.dumps(events, ensure_ascii=False, default=str)),
+    )
+    await conn.commit()
+    await conn.close()
+
+
+async def load_display_events(session_id: str) -> list[dict]:
+    conn = await get_connection()
+    cursor = await conn.execute(
+        "SELECT events_json FROM session_display_turns WHERE session_id = ? ORDER BY turn_no", (session_id,)
+    )
+    rows = await cursor.fetchall()
+    await conn.close()
+    events: list[dict] = []
+    for row in rows:
+        try:
+            stored = json.loads(row[0] or "[]")
+        except json.JSONDecodeError:
+            continue
+        if isinstance(stored, list):
+            events.extend(item for item in stored if isinstance(item, dict))
+    return events
+
+
 async def _generate_title(llm_client, messages: list[dict]) -> str:
     """用轻量LLM根据用户消息生成10字以内的会话标题"""
     if llm_client is None:

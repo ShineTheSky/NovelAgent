@@ -6,6 +6,18 @@ export function ToolResultCard({ toolName, content }: { toolName: string; conten
   const [editExpanded, setEditExpanded] = useState(false);
   const cleanName = toolName.replace(/^🤖\s?/, '');
 
+  if (cleanName === 'CreateTraceCheckpoint') {
+    return (
+      <div className="-mt-1 mb-2 flex justify-center text-xs text-slate-400">
+        <span>已加入后台洞察队列</span>
+      </div>
+    );
+  }
+
+  if (!content?.trim()) {
+    return <div className="my-1 text-xs text-slate-400">{cleanName} 已完成</div>;
+  }
+
   if (cleanName === 'Edit') {
     const parts = (content || '').split('\n===EDIT_DIFF===\n');
     const diff = parts[1] || '';

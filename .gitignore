@@ -39,6 +39,7 @@ global_memory/
 data/*.db
 data/*.sqlite
 data/rag/
+data/agent_bad_cases/
 .rag/
 workspace/**/.rag/
 

@@ -14,6 +14,10 @@ class LocalEmbeddingModel:
     async def encode(self, texts: list[str]):
         return await asyncio.to_thread(self._encode_sync, texts)
 
+    async def load(self) -> None:
+        """Load the local model without starting vector generation."""
+        await asyncio.to_thread(self._get_model)
+
     def _encode_sync(self, texts: list[str]):
         return self._get_model().encode(texts, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
 

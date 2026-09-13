@@ -156,12 +156,14 @@ async def list_sessions(project_id: str, request: Request):
 async def get_session(session_id: str, request: Request):
     """获取会话详情"""
     session = await _get_or_load_session(session_id, request)
+    from novelagent.storage import models
     return {
         "session_id": session.session_id,
         "project_id": session.project_id,
         "messages": session.messages,
         "accept_edits_mode": session.accept_edits_mode,
         "token_count": getattr(session, 'token_count', 0),
+        "display_events": await models.load_display_events(session_id),
     }
 
 
@@ -202,14 +204,18 @@ async def send_message(session_id: str, body: SendMessageRequest, request: Reque
 
     async def event_generator():
         import traceback
+        display_events: list[dict] = [{"type": "user_message", "content": body.content}]
         try:
             async for chunk in agent_loop.run(internal_req, session, project_info):
                 if stop_event.is_set():
+                    display_events.append({"type": "done", "data": {"finish_reason": "interrupted"}})
                     yield f"event: done\ndata: {json.dumps({'finish_reason': 'interrupted'})}\n\n"
                     break
+                display_events.append({"type": chunk.type, "data": chunk.data})
                 yield chunk.to_sse()
         except Exception as e:
             traceback.print_exc()
+            display_events.append({"type": "error", "data": {"message": f"服务器内部错误: {e}"}})
             yield f"event: error\ndata: {json.dumps({'type': 'error', 'message': f'服务器内部错误: {e}', 'timestamp': ''})}\n\n"
         finally:
             active_trace_id = getattr(session, "active_trace_id", "")
@@ -221,6 +227,7 @@ async def send_message(session_id: str, body: SendMessageRequest, request: Reque
             if session.messages:
                 from novelagent.storage import models
                 try:
+                    await models.save_display_turn(session_id, display_events)
                     await models.save_messages(session_id, session.messages, session.token_count, llm_client=request.app.state.agent_loop.llm)
                     print(f"[API] 消息已保存: session={session_id}, messages={len(session.messages)}", flush=True)
                 except Exception as _e:

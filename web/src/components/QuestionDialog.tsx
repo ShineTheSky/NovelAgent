@@ -3,17 +3,27 @@ import type { PendingQuestion, QuestionAnswer } from '../types/chat';
 
 export function QuestionDialog({ qa }: { qa: PendingQuestion }) {
   const [answers, setAnswers] = useState<Record<number, QuestionAnswer>>({});
+  const [customAnswers, setCustomAnswers] = useState<Record<number, string>>({});
 
   const setAnswer = (index: number, value: QuestionAnswer) => {
     setAnswers(previous => ({ ...previous, [index]: value }));
   };
 
+  const answerFor = (index: number, multiSelect: boolean): QuestionAnswer => {
+    const custom = customAnswers[index]?.trim() ?? '';
+    const selected = answers[index];
+    if (!custom) return selected ?? '';
+    if (!multiSelect) return custom;
+    const choices = Array.isArray(selected) ? selected : selected ? [selected] : [];
+    return [...choices, custom];
+  };
+
   const handleSubmit = () => {
-    qa.onSubmit(qa.questions.map((_, index) => answers[index] ?? ''));
+    qa.onSubmit(qa.questions.map((question, index) => answerFor(index, question.multiSelect)));
   };
 
   const allAnswered = qa.questions.every((_, index) => {
-    const answer = answers[index];
+    const answer = answerFor(index, qa.questions[index].multiSelect);
     return answer !== undefined && answer !== '' && (!Array.isArray(answer) || answer.length > 0);
   });
 
@@ -51,6 +61,7 @@ export function QuestionDialog({ qa }: { qa: PendingQuestion }) {
                       onChange={() => {
                         if (!question.multiSelect) {
                           setAnswer(index, option.label);
+                          setCustomAnswers(previous => ({ ...previous, [index]: '' }));
                           return;
                         }
                         const selected = Array.isArray(current) ? [...current] : [];
@@ -65,6 +76,16 @@ export function QuestionDialog({ qa }: { qa: PendingQuestion }) {
                 );
               })}
             </div>
+            <label className="mt-2.5 block">
+              <span className="mb-1 block text-xs text-gray-500">补充意见或直接输入回答</span>
+              <textarea
+                value={customAnswers[index] ?? ''}
+                onChange={event => setCustomAnswers(previous => ({ ...previous, [index]: event.target.value }))}
+                rows={2}
+                placeholder="可不选以上选项，直接输入你的想法…"
+                className="w-full resize-y rounded-lg border border-gray-200 bg-white px-2.5 py-2 text-sm leading-5 text-gray-700 outline-none placeholder:text-gray-400 focus:border-purple-400"
+              />
+            </label>
           </fieldset>
         ))}
 

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { getLLMSettings, saveLLMSettings, saveProviderSettings } from '../api/client';
 import type { LLMPositionSetting, LLMSettings } from '../types/llm';
@@ -30,6 +30,8 @@ export function LLMSettingsPanel() {
   const [savingProvider, setSavingProvider] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [panelOffset, setPanelOffset] = useState({ x: 0, y: 0 });
+  const dragStart = useRef<{ pointerX: number; pointerY: number; offsetX: number; offsetY: number } | null>(null);
 
   const loadSettings = async () => {
     setLoading(true);
@@ -56,6 +58,17 @@ export function LLMSettingsPanel() {
     setMessage(null);
     void loadSettings();
   };
+
+  const startDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    if ((event.target as HTMLElement).closest('button')) return;
+    dragStart.current = { pointerX: event.clientX, pointerY: event.clientY, offsetX: panelOffset.x, offsetY: panelOffset.y };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const dragPanel = (event: ReactPointerEvent<HTMLElement>) => {
+    const start = dragStart.current;
+    if (start) setPanelOffset({ x: start.offsetX + event.clientX - start.pointerX, y: start.offsetY + event.clientY - start.pointerY });
+  };
+  const stopDrag = () => { dragStart.current = null; };
 
   const updatePosition = (key: string, update: Partial<LLMPositionSetting>) => {
     setSettings(current => current && {
@@ -120,8 +133,9 @@ export function LLMSettingsPanel() {
       <button type="button" onClick={showPanel} className="rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-xs text-gray-600 shadow-sm hover:border-purple-200 hover:text-purple-600 transition-colors" aria-label="打开模型设置">模型设置</button>
       {open && createPortal(
         <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="llm-settings-title">
-          <div className="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded-2xl bg-white p-6 pr-14 shadow-2xl mx-4">
-            <div className="mb-5">
+          <div style={{ transform: `translate(${panelOffset.x}px, ${panelOffset.y}px)` }} className="relative mx-4 flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
+            <div className="shrink-0 border-b border-gray-100 bg-white">
+            <div onPointerDown={startDrag} onPointerMove={dragPanel} onPointerUp={stopDrag} onPointerCancel={stopDrag} className="cursor-grab touch-none px-6 pb-4 pt-6 pr-14 active:cursor-grabbing">
               <div>
                 <h2 id="llm-settings-title" className="font-semibold text-gray-800">模型设置</h2>
                 <p className="mt-1 text-xs text-gray-400">先配置公司 API，再为不同 Agent 选择对应的 provider 和模型。</p>
@@ -129,11 +143,15 @@ export function LLMSettingsPanel() {
             </div>
             <button type="button" onClick={() => setOpen(false)} aria-label="关闭模型设置" className="absolute right-4 top-4 flex h-8 w-8 items-center justify-center rounded-lg text-gray-400 hover:bg-gray-100 hover:text-gray-700">✕</button>
 
-            <div className="mb-4 flex gap-1 rounded-xl bg-gray-100 p-1" role="tablist" aria-label="模型设置分类">
-              <button type="button" role="tab" aria-selected={activeTab === 'providers'} onClick={() => setActiveTab('providers')} className={`flex-1 rounded-lg px-3 py-2 text-sm transition-colors ${activeTab === 'providers' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>1. 公司 API</button>
-              <button type="button" role="tab" aria-selected={activeTab === 'agents'} onClick={() => setActiveTab('agents')} className={`flex-1 rounded-lg px-3 py-2 text-sm transition-colors ${activeTab === 'agents' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>2. Agent 模型路由</button>
+            <div className="px-6 pb-4">
+              <div className="flex gap-1 rounded-xl bg-gray-100 p-1" role="tablist" aria-label="模型设置分类">
+                <button type="button" role="tab" aria-selected={activeTab === 'providers'} onClick={() => setActiveTab('providers')} className={`flex-1 rounded-lg px-3 py-2 text-sm transition-colors ${activeTab === 'providers' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>1. 公司 API</button>
+                <button type="button" role="tab" aria-selected={activeTab === 'agents'} onClick={() => setActiveTab('agents')} className={`flex-1 rounded-lg px-3 py-2 text-sm transition-colors ${activeTab === 'agents' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>2. Agent 模型路由</button>
+              </div>
+            </div>
             </div>
 
+            <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
             {loading && <div className="py-12 text-center text-sm text-gray-400">正在加载设置…</div>}
             {!loading && error && <div role="alert" className="mb-3 rounded-lg border border-red-100 bg-red-50 px-3 py-2 text-sm text-red-600">{error}</div>}
             {!loading && message && <div role="status" className="mb-3 rounded-lg border border-green-100 bg-green-50 px-3 py-2 text-sm text-green-700">{message}</div>}
@@ -229,6 +247,7 @@ export function LLMSettingsPanel() {
                 </div>
               </div>
             )}
+            </div>
           </div>
         </div>,
         document.body,

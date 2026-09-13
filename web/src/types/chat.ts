@@ -83,6 +83,7 @@ export interface SessionDetail {
   messages: Message[];
   accept_edits_mode: boolean;
   token_count: number;
+  display_events?: unknown[];
 }
 
 export interface Question {

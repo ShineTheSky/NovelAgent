@@ -6,12 +6,20 @@ import type { MaterialDocument, MaterialTree, NovelDocument, NovelTree } from '.
 
 interface NovelWorkspaceProps {
   projectId: string;
+  refreshSignal: number;
 }
 
 type WorkspaceDocument = NovelDocument | MaterialDocument;
 
 function formatCount(count: number) {
   return `${count.toLocaleString()} 字`;
+}
+
+// 文件头信息用于后端版本校验和 Agent 协作，不应作为小说或资料正文展示。
+function contentForDisplay(content: string) {
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!match || !/^[A-Za-z_][\w-]*\s*:/m.test(match[1])) return content;
+  return content.slice(match[0].length);
 }
 
 function DocumentButton({ document, selectedId, onSelect, indent = false }: {
@@ -34,7 +42,7 @@ function DocumentButton({ document, selectedId, onSelect, indent = false }: {
   );
 }
 
-export function NovelWorkspace({ projectId }: NovelWorkspaceProps) {
+export function NovelWorkspace({ projectId, refreshSignal }: NovelWorkspaceProps) {
   const [tree, setTree] = useState<NovelTree | null>(null);
   const [materials, setMaterials] = useState<MaterialTree | null>(null);
   const [selected, setSelected] = useState<WorkspaceDocument | null>(null);
@@ -48,6 +56,7 @@ export function NovelWorkspace({ projectId }: NovelWorkspaceProps) {
   const [showMaterials, setShowMaterials] = useState(true);
   const [materialsWidth, setMaterialsWidth] = useState(264);
   const contentAbortRef = useRef<AbortController | null>(null);
+  const selectedRef = useRef<WorkspaceDocument | null>(null);
   const workspaceRef = useRef<HTMLDivElement>(null);
   const resizingNavigatorRef = useRef(false);
   const navigatorStartXRef = useRef(0);
@@ -111,10 +120,11 @@ export function NovelWorkspace({ projectId }: NovelWorkspaceProps) {
     return () => contentAbortRef.current?.abort();
   }, [loadMaterials, loadTree]);
 
-  const selectDocument = async (document: WorkspaceDocument) => {
+  const selectDocument = useCallback(async (document: WorkspaceDocument) => {
     contentAbortRef.current?.abort();
     const controller = new AbortController();
     contentAbortRef.current = controller;
+    selectedRef.current = document;
     setSelected(document);
     setContent(null);
     setLoadingContent(true);
@@ -123,13 +133,24 @@ export function NovelWorkspace({ projectId }: NovelWorkspaceProps) {
       const result = document.type === 'material'
         ? await fetchMaterialNode(projectId, document.id, controller.signal)
         : await fetchNovelNode(projectId, document.id, controller.signal);
-      if (!controller.signal.aborted) setContent(result.content);
+      if (!controller.signal.aborted) {
+        setSelected(result.node);
+        selectedRef.current = result.node;
+        setContent(contentForDisplay(result.content));
+      }
     } catch (requestError) {
       if (!controller.signal.aborted) setError(requestError instanceof Error ? requestError.message : '正文加载失败');
     } finally {
       if (!controller.signal.aborted) setLoadingContent(false);
     }
-  };
+  }, [projectId]);
+
+  useEffect(() => {
+    if (refreshSignal === 0) return;
+    void loadTree();
+    void loadMaterials();
+    if (selectedRef.current) void selectDocument(selectedRef.current);
+  }, [refreshSignal, loadMaterials, loadTree, selectDocument]);
 
   const startNavigatorResize = (event: React.MouseEvent) => {
     event.preventDefault();
@@ -221,12 +242,12 @@ export function NovelWorkspace({ projectId }: NovelWorkspaceProps) {
 
       {showMaterials ? <div style={{ width: materialsWidth }} className="relative shrink-0 max-md:hidden">
         <aside className="h-full overflow-y-auto border-l border-gray-200 bg-[#fafbfc] p-3">
-          <div className="mb-3 flex cursor-default items-center justify-between select-none">
-            <div>
+          <div className="mb-3 flex flex-wrap items-start gap-2 select-none">
+            <div className="min-w-0 flex-1">
               <h2 className="text-sm font-semibold text-gray-700">创作资料</h2>
               <p className="mt-0.5 text-[11px] text-gray-400">世界观、角色与参考设定</p>
             </div>
-            <div className="flex items-center gap-1">
+            <div className="ml-auto flex shrink-0 items-center gap-1">
               <button type="button" onClick={() => void loadMaterials()} className="rounded px-2 py-1 text-xs text-purple-600 hover:bg-purple-50">刷新</button>
               <button type="button" onClick={() => setShowMaterials(false)} className="rounded px-2 py-1 text-xs text-gray-500 hover:bg-gray-200" title="隐藏创作资料">隐藏</button>
             </div>
@@ -253,7 +274,7 @@ export function NovelWorkspace({ projectId }: NovelWorkspaceProps) {
             </section>
           ))}
         </aside>
-        <div onMouseDown={startMaterialsResize} role="separator" aria-orientation="vertical" aria-label="调整创作资料宽度" className="absolute left-0 top-0 z-10 h-full w-1.5 cursor-col-resize hover:bg-purple-300 active:bg-purple-400" />
+        <div onMouseDown={startMaterialsResize} role="separator" aria-orientation="vertical" aria-label="调整创作资料宽度" className="absolute -left-1 top-0 z-10 h-full w-3 cursor-col-resize border-l border-transparent hover:border-purple-400 active:border-purple-500" />
       </div> : <div className="flex w-8 shrink-0 items-start justify-center border-l border-gray-200 bg-[#fafbfc] pt-3 max-md:hidden">
         <button type="button" onClick={() => setShowMaterials(true)} className="rounded px-1.5 py-1 text-xs text-purple-600 hover:bg-purple-50" title="显示创作资料">‹</button>
       </div>}

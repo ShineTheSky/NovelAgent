@@ -9,7 +9,7 @@ import type {
   StreamEvent,
 } from '../types/chat';
 import type { LLMPositionUpdate, LLMSettings, ProviderSettingsUpdate } from '../types/llm';
-import type { MemoryPattern, TraceEvidence, TraceMemory } from '../types/insights';
+import type { LifecycleRecord, MemoryPattern, TraceEvidence, TraceMemory } from '../types/insights';
 import type { MaterialDocument, MaterialTree, NovelDocument, NovelTree } from '../types/novel';
 
 const BASE = '/api';
@@ -259,18 +259,6 @@ export function compressSession(sessionId: string) {
   return requestJson<{ token_count: number; message: string }>(`/sessions/${resourceId(sessionId)}/compress`, { method: 'POST' });
 }
 
-export interface HistoricalTraceImportResult {
-  status: 'imported' | 'already_imported';
-  trace_count: number;
-  candidate_turn_count: number;
-  skipped_incomplete_count: number;
-  trace_ids?: string[];
-}
-
-export function importHistoricalTraces(sessionId: string) {
-  return requestJson<HistoricalTraceImportResult>(`/sessions/${resourceId(sessionId)}/traces/import-history`, { method: 'POST' });
-}
-
 export function toggleAcceptEdits(sessionId: string, enabled: boolean) {
   return requestJson<{ session_id: string; accept_edits_mode: boolean }>(`/sessions/${resourceId(sessionId)}/accept-edits`, {
     method: 'POST',
@@ -323,9 +311,14 @@ export function rebuildRagEmbeddings() {
 export interface RagEmbeddingJob {
   job_id: string;
   status: 'running' | 'completed' | 'failed';
+  phase?: 'loading' | 'embedding' | 'completed';
   completed_chunks: number;
   total_chunks: number;
   error: string;
+}
+
+export interface RagImportResult extends RagDocument {
+  embedding_job: RagEmbeddingJob;
 }
 
 export function getRagEmbeddingJob(jobId: string) {
@@ -333,7 +326,7 @@ export function getRagEmbeddingJob(jobId: string) {
 }
 
 export function importRagDocument(title: string, content: string, sourceName = '', encoding = 'utf-8') {
-  return requestJson<RagDocument>('/rag/documents', {
+  return requestJson<RagImportResult>('/rag/documents', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ title, content, source_name: sourceName, encoding }),
@@ -374,6 +367,22 @@ export function saveProviderSettings(providers: Record<string, ProviderSettingsU
 
 export function fetchMemoryPatterns(projectId: string) {
   return requestJson<MemoryPattern[]>(`/projects/${resourceId(projectId)}/memory-patterns`);
+}
+
+export function fetchEvidence(projectId: string) {
+  return requestJson<LifecycleRecord[]>(`/projects/${resourceId(projectId)}/evidence`);
+}
+
+export function fetchMemories(projectId: string) {
+  return requestJson<LifecycleRecord[]>(`/projects/${resourceId(projectId)}/memories`);
+}
+
+export function fetchPatterns(projectId: string) {
+  return requestJson<LifecycleRecord[]>(`/projects/${resourceId(projectId)}/patterns`);
+}
+
+export function downgradeLifecycleRecord(projectId: string, layer: 'memory' | 'pattern', recordId: string) {
+  return requestJson<LifecycleRecord>(`/projects/${resourceId(projectId)}/${layer}/${resourceId(recordId)}/downgrade`, { method: 'POST' });
 }
 
 export function fetchTraceMemories(projectId: string) {

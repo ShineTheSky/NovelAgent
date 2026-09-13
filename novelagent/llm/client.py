@@ -112,6 +112,9 @@ class LLMClient:
                 m2 = dict(m)
                 if m2["role"] == "tool_result":
                     m2["role"] = "tool"
+                if m2["role"] == "tool" and not isinstance(m2.get("content"), str):
+                    content = m2.get("content", "")
+                    m2["content"] = json.dumps(content, ensure_ascii=False) if content is not None else ""
                 # 有 tool_calls 的消息必须删除 content（None 或空字符串都会被 MiniMax 拒绝）
                 if m2.get("tool_calls") and not m2.get("content"):
                     del m2["content"]
@@ -170,13 +173,15 @@ class LLMClient:
                     async with client.stream("POST", messages_url, json=body, headers=headers) as response:
                         import sys
                         print(f"[LLM{self._log_tag}] HTTP {response.status_code}", flush=True)
+                        error_detail = ""
                         if response.status_code != 200:
                             try:
                                 error_body = await response.aread()
-                                print(f"[LLM{self._log_tag}] 错误响应体: {error_body.decode()[:500]}", flush=True)
+                                error_detail = error_body.decode(errors="replace")[:500]
+                                print(f"[LLM{self._log_tag}] 错误响应体: {error_detail}", flush=True)
                             except Exception:
                                 pass
-                        self._check_status(response.status_code, messages_url, body, headers)
+                        self._check_status(response.status_code, messages_url, body, headers, error_detail)
                         async for line in response.aiter_lines():
                             if line.startswith("data: "):
                                 print(f"[SSE{self._log_tag}] {line}", flush=True)
@@ -196,18 +201,20 @@ class LLMClient:
                     response = await client.post(messages_url, json=body, headers=headers)
                     import sys
                     print(f"[LLM{self._log_tag}] HTTP {response.status_code}", flush=True)
+                    error_detail = ""
                     if response.status_code != 200:
                         try:
-                            print(f"[LLM{self._log_tag}] 错误响应体: {response.text[:500]}", flush=True)
+                            error_detail = response.text[:500]
+                            print(f"[LLM{self._log_tag}] 错误响应体: {error_detail}", flush=True)
                         except Exception:
                             pass
-                    self._check_status(response.status_code, messages_url, body, headers)
+                    self._check_status(response.status_code, messages_url, body, headers, error_detail)
                     data = response.json()
                     for chunk in self._parse_non_stream_response(config, data): yield chunk
             except httpx.TimeoutException:
                 raise TimeoutError(f"请求超时 ({config.timeout}s)")
 
-    def _check_status(self, status_code: int, messages_url: str, body: dict, headers: dict):
+    def _check_status(self, status_code: int, messages_url: str, body: dict, headers: dict, error_detail: str = ""):
         if status_code == 401:
             raise AuthenticationError(f"API key无效")
         if status_code == 403:
@@ -217,7 +224,11 @@ class LLMClient:
         if status_code >= 500:
             raise APIError(f"API服务器错误: {status_code}")
         if status_code != 200:
-            raise APIError(f"HTTP {status_code}: 请检查API key和网络连接")
+            try:
+                detail = json.loads(error_detail).get("error", {}).get("message", "")
+            except (json.JSONDecodeError, AttributeError):
+                detail = error_detail
+            raise APIError(f"HTTP {status_code}: {detail[:300] or '请求被服务端拒绝'}")
 
     def _parse_anthropic_event(self, data: dict) -> list[LLMResponse]:
         results = []

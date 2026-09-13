@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { ChatController } from '../hooks/useChat';
 
 interface SidebarProps {
+  width?: number;
   chat: Pick<ChatController,
     | 'projects'
     | 'activeProject'
@@ -36,7 +37,7 @@ function Chevron({ open }: { open: boolean }) {
   return <span aria-hidden="true" className={`w-3 text-[10px] text-gray-400 transition-transform ${open ? 'rotate-90' : ''}`}>›</span>;
 }
 
-export function Sidebar({ chat }: SidebarProps) {
+export function Sidebar({ chat, width = 264 }: SidebarProps) {
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(new Set());
   const activeProject = chat.projects.find(project => project.project_id === chat.activeProject) ?? null;
 
@@ -59,7 +60,7 @@ export function Sidebar({ chat }: SidebarProps) {
   };
 
   return (
-    <aside className="w-[264px] max-md:hidden bg-[#f7f9fb] border-r border-gray-200 text-gray-700 flex flex-col shrink-0 select-none">
+    <aside style={{ width }} className="max-md:hidden bg-[#f7f9fb] border-r border-gray-200 text-gray-700 flex flex-col shrink-0 select-none">
       <div className="h-12 px-3 flex items-center justify-between shrink-0">
         <span className="text-[13px] font-medium text-gray-600">项目</span>
         <div className="flex items-center gap-1">

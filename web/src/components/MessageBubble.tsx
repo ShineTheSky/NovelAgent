@@ -48,7 +48,7 @@ export function MessageBubble({ role, content, ts }: { role: string; content: st
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} my-1`}>
       {!isUser && <div className="w-7 h-7 rounded-full bg-purple-100 flex items-center justify-center text-xs mr-2 mt-0.5 shrink-0 select-none" aria-hidden="true">N</div>}
-      <div className="max-w-[80%]">
+      <div className={hasThink ? 'w-[80%] min-w-0' : 'max-w-[80%]'}>
         {hasThink ? parts.map((p, i) =>
           p.type === 'think' ? <ThinkBlock key={i} text={p.content} /> :
           p.content.trim() ? renderBubble(p.content, i) : null

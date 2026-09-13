@@ -47,6 +47,7 @@ export function RagPanel({ onClose }: RagPanelProps) {
   const dragStart = useRef<{ pointerX: number; pointerY: number; offsetX: number; offsetY: number } | null>(null);
   const embeddedChunks = documents.reduce((total, document) => total + document.embedding_chunk_count, 0);
   const totalChunks = documents.reduce((total, document) => total + document.chunk_count, 0);
+  const embeddingInProgress = embeddingJob?.phase === 'embedding' || (embeddingJob?.phase === undefined && (embeddingJob?.completed_chunks || 0) > 0);
 
   const refresh = async () => {
     try {
@@ -62,7 +63,7 @@ export function RagPanel({ onClose }: RagPanelProps) {
 
   useEffect(() => {
     if (!embeddingJob || embeddingJob.status !== 'running') return;
-    const timer = window.setInterval(() => {
+    const poll = () => {
       void getRagEmbeddingJob(embeddingJob.job_id).then(next => {
         setEmbeddingJob(next);
         if (next.status === 'completed') {
@@ -71,7 +72,9 @@ export function RagPanel({ onClose }: RagPanelProps) {
         }
         if (next.status === 'failed') setError(next.error || '构建向量失败');
       }).catch(error => { setError(error instanceof Error ? error.message : '读取构建进度失败'); setEmbeddingJob(null); });
-    }, 500);
+    };
+    poll();
+    const timer = window.setInterval(poll, 500);
     return () => window.clearInterval(timer);
   }, [embeddingJob?.job_id, embeddingJob?.status]);
 
@@ -93,7 +96,9 @@ export function RagPanel({ onClose }: RagPanelProps) {
     setBusy(true); setError('');
     try {
       const { content, encoding } = await decodeTextFile(file);
-      await importRagDocument(file.name.replace(/\.[^.]+$/, '') || '未命名文章', content, file.name, encoding);
+      const imported = await importRagDocument(file.name.replace(/\.[^.]+$/, '') || '未命名文章', content, file.name, encoding);
+      setEmbeddingJob(imported.embedding_job);
+      setEmbeddingMessage('资料已导入，正在后台生成向量。');
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : '导入失败');
@@ -152,7 +157,7 @@ export function RagPanel({ onClose }: RagPanelProps) {
     <div className="fixed inset-0 z-30 flex items-start justify-end bg-black/15" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
       <section style={{ transform: `translate(${panelOffset.x}px, ${panelOffset.y}px)` }} className="mr-[264px] mt-14 w-[780px] max-w-[calc(100vw-24px)] rounded-xl border border-gray-200 bg-white p-4 shadow-xl">
         <div onPointerDown={startDrag} onPointerMove={dragPanel} onPointerUp={stopDrag} onPointerCancel={stopDrag} className="flex cursor-grab touch-none items-center justify-between active:cursor-grabbing">
-          <div><h2 className="text-sm font-semibold text-gray-800">全局参考资料库</h2><p className="mt-0.5 text-[11px] text-gray-400">BM25 与本地 Emb 混合检索，资料由所有项目共享 · Emb {embeddedChunks}/{totalChunks}</p></div>
+          <div><h2 className="text-sm font-semibold text-gray-800">全局参考资料库</h2><p className="mt-0.5 text-[11px] text-gray-400">BM25 与本地 Emb 混合检索，资料由所有项目共享 · Emb {embeddedChunks + (embeddingJob?.status === 'running' ? embeddingJob.completed_chunks : 0)}/{totalChunks}</p></div>
           <button type="button" onClick={onClose} className="rounded px-2 text-lg text-gray-400 hover:bg-gray-100">×</button>
         </div>
         <label className="mt-4 flex cursor-pointer items-center justify-center rounded-lg border border-dashed border-purple-300 bg-purple-50 px-3 py-3 text-xs text-purple-700 hover:bg-purple-100">
@@ -163,7 +168,7 @@ export function RagPanel({ onClose }: RagPanelProps) {
           <span className="text-gray-400">旧资料可手动补齐 Emb；新导入资料会自动生成。</span>
           <button type="button" onClick={() => void handleRebuildEmbeddings()} disabled={busy || embeddingJob?.status === 'running'} className="shrink-0 rounded border border-gray-200 px-2 py-1 text-gray-600 hover:border-purple-300 hover:text-purple-600 disabled:opacity-40">{embeddingJob?.status === 'running' ? '构建中…' : '构建/补齐 Emb'}</button>
         </div>
-        {embeddingJob?.status === 'running' && <div className="mt-2"><div className="mb-1 flex justify-between text-[11px] text-gray-500"><span>正在生成向量…</span><span>{embeddingJob.total_chunks ? `${embeddingJob.completed_chunks}/${embeddingJob.total_chunks}` : '准备中…'}</span></div><div className="h-1.5 overflow-hidden rounded-full bg-gray-100"><div className="h-full rounded-full bg-purple-500 transition-all" style={{ width: `${embeddingJob.total_chunks ? Math.round(embeddingJob.completed_chunks / embeddingJob.total_chunks * 100) : 5}%` }} /></div></div>}
+        {embeddingJob?.status === 'running' && <div className="mt-2"><div className="mb-1 flex justify-between text-[11px] text-gray-500"><span>{embeddingInProgress ? '正在生成向量…' : '正在加载本地 Emb 模型…'}</span><span>{embeddingInProgress && embeddingJob.total_chunks ? `${embeddingJob.completed_chunks}/${embeddingJob.total_chunks}` : '准备中…'}</span></div><div className="h-1.5 overflow-hidden rounded-full bg-gray-100"><div className={`h-full rounded-full bg-purple-500 transition-all ${embeddingInProgress ? '' : 'animate-pulse'}`} style={{ width: `${embeddingInProgress && embeddingJob.total_chunks ? Math.max(2, Math.round(embeddingJob.completed_chunks / embeddingJob.total_chunks * 100)) : 12}%` }} /></div></div>}
         <div className="mt-3 flex gap-2">
           <input ref={inputRef} value={query} onChange={event => setQuery(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void handleSearch(); }} placeholder="搜索资料库中的相似内容" className="min-w-0 flex-1 rounded-md border border-gray-200 px-2.5 py-2 text-xs outline-none focus:border-purple-400" />
           <button type="button" onClick={() => void handleSearch()} disabled={busy || !query.trim()} className="rounded-md bg-gray-800 px-3 text-xs text-white disabled:opacity-40">检索</button>

@@ -22,6 +22,13 @@ export function AgentRunCard({ run, children = [] }: { run: AgentRun; children?:
   const c = presetColors[run.preset] || defaultPresetColor;
   const result = run.result || run.draft;
   const longResult = result.length > 900;
+  const displayEvents = run.events.reduce<AgentRun['events']>((events, event) => {
+    const lastEvent = events.at(-1);
+    if (event.type === 'thinking' && lastEvent?.type === 'thinking') {
+      return [...events.slice(0, -1), { ...lastEvent, content: `${lastEvent.content ?? ''}${event.content ?? ''}` }];
+    }
+    return [...events, event];
+  }, []);
 
   return (
     <section className={`my-3 overflow-hidden rounded-xl border ${c.border} bg-white shadow-sm`}>
@@ -41,11 +48,11 @@ export function AgentRunCard({ run, children = [] }: { run: AgentRun; children?:
             {longResult && <button type="button" onClick={() => setShowResult(value => !value)} className="mt-1 text-xs text-purple-600 hover:text-purple-700">{showResult ? '收起结果' : '展开完整结果'}</button>}
           </div>
         )}
-        {run.events.length > 0 && (
+        {displayEvents.length > 0 && (
           <div>
-            <button type="button" onClick={() => setShowDetails(value => !value)} className="text-xs text-gray-500 hover:text-gray-700">{showDetails ? '隐藏执行详情' : `查看执行详情（${run.events.length}）`}</button>
+            <button type="button" onClick={() => setShowDetails(value => !value)} className="text-xs text-gray-500 hover:text-gray-700">{showDetails ? '隐藏执行详情' : `查看执行详情（${displayEvents.length}）`}</button>
             {showDetails && <div className="mt-2 space-y-1 border-l border-gray-200 pl-3 text-xs text-gray-500">
-              {run.events.map(event => <p key={event.id}>{event.type === 'thinking' ? '分析中' : event.type === 'tool_call' ? `调用 ${event.tool}` : `${event.tool} ${event.success ? '完成' : '失败'}`}{event.content ? `：${event.content}` : ''}</p>)}
+              {displayEvents.map(event => <p key={event.id} className={event.type === 'thinking' ? 'whitespace-pre-wrap break-words leading-5' : ''}>{event.type === 'thinking' ? (event.content || '分析中') : <>{event.type === 'tool_call' ? `调用 ${event.tool}` : `${event.tool} ${event.success ? '完成' : '失败'}`}{event.content ? `：${event.content}` : ''}</>}</p>)}
             </div>}
           </div>
         )}

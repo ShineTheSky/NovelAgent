@@ -1,5 +1,21 @@
 export type PatternStatus = 'tentative' | 'confirmed' | 'disputed' | 'ready_for_review';
 
+export interface LifecycleRecord {
+  id: string;
+  layer: 'evidence' | 'memory' | 'pattern';
+  title?: string;
+  claim: string;
+  category: 'user' | 'project' | 'reference' | 'agent';
+  domain: 'writing' | 'outline' | 'overall';
+  trace_id?: string;
+  source_event_ids?: string[];
+  weight: number;
+  support_count?: number;
+  updated: string;
+  file_path: string;
+  content?: string;
+}
+
 export interface MemoryPattern {
   pattern_id: string;
   project_id: string;

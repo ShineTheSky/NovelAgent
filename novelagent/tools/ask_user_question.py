@@ -10,7 +10,7 @@ class AskUserQuestionTool(ToolProtocol):
         "This allows you to: 1. Gather user preferences or requirements. "
         "2. Clarify ambiguous instructions. 3. Get decisions on implementation choices. "
         "4. Offer choices to the user about what direction to take. "
-        "Usage notes: Users will always be able to select 'Other' to provide custom text input. "
+        "Usage notes: Every question always includes a free-text input field in addition to the options. "
         "Use multiSelect: true to allow multiple answers to be selected. "
         "当需要询问用户问题时."
         "If you recommend a specific option, make that the first option and add '(Recommended)' at the end."

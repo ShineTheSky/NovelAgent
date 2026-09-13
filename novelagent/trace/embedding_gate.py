@@ -44,9 +44,6 @@ class EmbeddingGate:
     async def _evaluate_sync(self, user_inputs: list[str]) -> GateResult:
         vectors = await self.embedding_model.encode(
             [*user_inputs, *_ROUTINE_PROTOTYPES, *_FEEDBACK_PROTOTYPES],
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
         )
         user_vectors = vectors[:len(user_inputs)]
         routine_vectors = vectors[len(user_inputs):len(user_inputs) + len(_ROUTINE_PROTOTYPES)]

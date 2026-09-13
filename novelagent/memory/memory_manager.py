@@ -11,7 +11,7 @@ from novelagent.memory.auto_memory import AutoMemory
 
 class MemoryManager:
     PROJECT_INDEX_EXCLUDES = (
-        "archive/", "user/", "feedback/", "project/", "workflow/", "review/", "user_prefs.md",
+        "archive/", "feedback/", "workflow/", "review/", "agent/", "user_prefs.md",
     )
 
     def __init__(self, working_dir: str, llm_client=None, global_memory_dir: str | None = None):
@@ -69,7 +69,7 @@ class MemoryManager:
         """新建项目时初始化项目规则与参考绑定目录。"""
         memory_dir = Path(self.working_dir) / ".memory"
         memory_dir.mkdir(parents=True, exist_ok=True)
-        for sub in ["references", "archive/legacy"]:
+        for sub in ["user", "project", "reference", "agent", "references", "archive/legacy"]:
             (memory_dir / sub).mkdir(parents=True, exist_ok=True)
         rules_path = memory_dir / "project_rules.md"
         if not rules_path.exists():

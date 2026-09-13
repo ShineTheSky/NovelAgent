@@ -4,7 +4,7 @@ import { ChatTimeline } from './components/ChatTimeline';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { LLMSettingsPanel } from './components/LLMSettingsPanel';
 import { NovelWorkspace } from './components/NovelWorkspace';
-import { ProjectInsightsPanel } from './components/ProjectInsightsPanel';
+import { FileInsightsPanel } from './components/FileInsightsPanel';
 import { ProjectOverview } from './components/ProjectOverview';
 import { RagPanel } from './components/RagPanel';
 import { Sidebar } from './components/Sidebar';
@@ -16,8 +16,12 @@ export default function App() {
   const [showRag, setShowRag] = useState(false);
   const [showChatPane, setShowChatPane] = useState(true);
   const [showNovelPane, setShowNovelPane] = useState(true);
+  const [sidebarWidth, setSidebarWidth] = useState(264);
   const [chatPaneWidth, setChatPaneWidth] = useState(560);
   const splitRef = useRef<HTMLDivElement>(null);
+  const sidebarResizingRef = useRef(false);
+  const sidebarResizeStartXRef = useRef(0);
+  const sidebarResizeStartWidthRef = useRef(264);
   const resizingRef = useRef(false);
   const resizeStartXRef = useRef(0);
   const resizeStartWidthRef = useRef(560);
@@ -25,11 +29,14 @@ export default function App() {
 
   useEffect(() => {
     const onMouseMove = (event: MouseEvent) => {
+      if (sidebarResizingRef.current) {
+        setSidebarWidth(Math.max(200, Math.min(480, sidebarResizeStartWidthRef.current + event.clientX - sidebarResizeStartXRef.current)));
+      }
       if (!resizingRef.current || !splitRef.current) return;
       const maxWidth = Math.max(360, splitRef.current.clientWidth - 440);
       setChatPaneWidth(Math.max(360, Math.min(maxWidth, resizeStartWidthRef.current + event.clientX - resizeStartXRef.current)));
     };
-    const onMouseUp = () => { resizingRef.current = false; };
+    const onMouseUp = () => { resizingRef.current = false; sidebarResizingRef.current = false; };
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup', onMouseUp);
     return () => {
@@ -45,6 +52,13 @@ export default function App() {
     resizeStartWidthRef.current = chatPaneWidth;
   };
 
+  const startSidebarResize = (event: React.MouseEvent) => {
+    event.preventDefault();
+    sidebarResizingRef.current = true;
+    sidebarResizeStartXRef.current = event.clientX;
+    sidebarResizeStartWidthRef.current = sidebarWidth;
+  };
+
   const toggleChatPane = () => {
     if (showChatPane && !showNovelPane) return;
     setShowChatPane(current => !current);
@@ -57,7 +71,8 @@ export default function App() {
 
   return (
     <div className="flex h-screen bg-[#f8f9fb] font-sans">
-      <Sidebar chat={chat} />
+      <Sidebar chat={chat} width={sidebarWidth} />
+      <div role="separator" aria-orientation="vertical" aria-label="调整项目与对话区域宽度" onMouseDown={startSidebarResize} className="w-1.5 shrink-0 cursor-col-resize bg-gray-100 hover:bg-purple-300 active:bg-purple-400" />
 
       <main className="flex-1 flex flex-col min-w-0">
         <header className="h-14 border-b border-gray-200 flex items-center gap-3 px-4 bg-white/80 backdrop-blur shrink-0">
@@ -73,8 +88,7 @@ export default function App() {
           )}
           <div className="flex shrink-0 items-center gap-2">
             {chat.activeSession && <TokenBar tokenCount={chat.tokenCount} limit={150000} onCompress={chat.handleCompress} disabled={chat.loading} />}
-            {chat.activeSession && <button type="button" onClick={() => void chat.handleImportHistoricalTraces()} disabled={chat.loading || chat.importingHistoricalTraces} className="rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-xs text-gray-600 shadow-sm hover:border-purple-200 hover:text-purple-600 disabled:cursor-not-allowed disabled:opacity-40">{chat.importingHistoricalTraces ? '导入中…' : '生成历史 Trace'}</button>}
-            <ProjectInsightsPanel projectId={chat.activeProject} />
+            <FileInsightsPanel projectId={chat.activeProject} />
             <button type="button" onClick={() => setShowRag(true)} className="rounded-md border border-gray-200 px-2.5 py-1.5 text-xs text-gray-600 hover:border-purple-300 hover:text-purple-600">资料库</button>
             <LLMSettingsPanel />
             <button
@@ -130,7 +144,7 @@ export default function App() {
               </section>}
               {showChatPane && showNovelPane && <div role="separator" aria-orientation="vertical" aria-label="调整对话与小说区域宽度" onMouseDown={startResize} className="w-1.5 shrink-0 cursor-col-resize bg-gray-100 hover:bg-purple-300 active:bg-purple-400" />}
               {showNovelPane && <section className="flex min-w-[27.5rem] flex-1 overflow-hidden bg-white">
-                <NovelWorkspace key={activeProject.project_id} projectId={activeProject.project_id} />
+                <NovelWorkspace key={activeProject.project_id} projectId={activeProject.project_id} refreshSignal={chat.workspaceRevision} />
               </section>}
             </div>
           ) : (

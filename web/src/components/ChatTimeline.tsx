@@ -51,10 +51,16 @@ export function ChatTimeline({
   onRetry,
 }: ChatTimelineProps) {
   const endRef = useRef<HTMLDivElement>(null);
+  const followLatestRef = useRef(true);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (followLatestRef.current) endRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  const handleScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    const element = event.currentTarget;
+    followLatestRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+  };
 
   const runs = messages.flatMap(message => message.run ? [message.run] : []);
   const childRuns = new Map<string, typeof runs>();
@@ -71,7 +77,7 @@ export function ChatTimeline({
   });
 
   return (
-    <div className="flex-1 overflow-y-auto" role="log" aria-live="polite" aria-label="对话消息">
+    <div className="flex-1 overflow-y-auto" role="log" aria-live="polite" aria-label="对话消息" onScroll={handleScroll}>
       {messages.length === 0 ? (
         <div className="flex flex-col items-center justify-center h-full text-gray-300 select-none">
           <div className="text-6xl mb-4">✎</div>

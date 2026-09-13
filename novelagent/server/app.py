@@ -26,8 +26,7 @@ from novelagent.core.agent_loop import AgentLoop
 from novelagent.core.subagent import SubAgentRunner
 from novelagent.trace.store import TraceStore
 from novelagent.trace.recorder import TraceRecorder
-from novelagent.trace.analyzer import PostTurnAnalyzer, PreferenceContextProvider
-from novelagent.trace.materializer import TraceMemoryMaterializer
+from novelagent.trace.file_analyzer import FileTraceAnalyzer, FilePatternContextProvider
 from novelagent.trace.embedding_gate import EmbeddingGate
 from novelagent.embeddings.local_model import LocalEmbeddingModel
 from novelagent.server.routes import projects, sessions, files, novel, settings, traces
@@ -91,9 +90,8 @@ def create_app() -> FastAPI:
         routine_min_margin=float(embedding_cfg.get("routine_min_margin", 0.12)),
     )
     embedding_gate.embedding_model = embedding_model
-    trace_memory_materializer = TraceMemoryMaterializer(working_dir)
-    post_turn_analyzer = PostTurnAnalyzer(llm_client, working_dir, trace_store, embedding_gate, trace_memory_materializer)
-    preference_context_provider = PreferenceContextProvider(trace_store)
+    post_turn_analyzer = FileTraceAnalyzer(llm_client, working_dir, trace_store, embedding_gate)
+    preference_context_provider = FilePatternContextProvider(working_dir)
 
     agent_config = {
         **session_cfg,
@@ -120,7 +118,6 @@ def create_app() -> FastAPI:
     app.state.registry = registry
     app.state.memory_manager = memory_manager
     app.state.trace_store = trace_store
-    app.state.trace_memory_materializer = trace_memory_materializer
     app.state.config = cfg
     app.state.llm_config_path = llm_config_path
     app.state.rag_store = rag_store

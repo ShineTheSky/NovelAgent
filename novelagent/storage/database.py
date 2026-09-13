@@ -38,6 +38,28 @@ async def init():
                 FOREIGN KEY (project_id) REFERENCES projects(project_id)
             )
         """)
+        # 仅用于恢复前端展示；不能混入 sessions.messages_json 的模型上下文。
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS session_display_turns (
+                session_id TEXT NOT NULL,
+                turn_no INTEGER NOT NULL,
+                events_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (session_id, turn_no),
+                FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+            )
+        """)
+        # 仅用于恢复前端展示；不能混入 sessions.messages_json 的模型上下文。
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS session_display_turns (
+                session_id TEXT NOT NULL,
+                turn_no INTEGER NOT NULL,
+                events_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (session_id, turn_no),
+                FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+            )
+        """)
         # Trace 是每次 Agent 执行的不可变事实记录；sessions.messages_json
         # 仍然仅用于恢复会话，不承担分析与审计职责。
         await db.execute("""

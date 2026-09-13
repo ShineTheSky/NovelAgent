@@ -38,19 +38,23 @@ Web UI (React) ← SSE → FastAPI Server → Agent Loop (ReAct)
 
 ```bash
 # 1. 安装 Python 依赖
-pip install fastapi uvicorn tiktoken python-dotenv pydantic pydantic-settings sqlalchemy aiosqlite httpx jinja2 pyyaml
+pip install -r requirements.txt
 
-# 2. 配置 API key
+# 2. 下载本地 Embedding 模型（首次使用 RAG/Trace 分类前执行）
+# 模型权重保存在 models/，已被 .gitignore 排除，不会提交到仓库。
+huggingface-cli download BAAI/bge-base-zh-v1.5 --local-dir models/bge-base-zh-v1.5
+
+# 3. 配置 API key
 cp .env.example .env
 # 编辑 .env，填入你的 LLM API key
 
-# 3. 启动后端
+# 4. 启动后端
 uvicorn novelagent.server.app:app --reload --port 8000
 
-# 4. 安装前端依赖（仅首次）
+# 5. 安装前端依赖（仅首次）
 cd web && npm install && cd ..
 
-# 5. 启动前端
+# 6. 启动前端
 cd web && npm run dev
 ```
 
@@ -158,7 +162,9 @@ Write/Edit 默认弹窗确认。以下情况自动放行：
 
 在项目页点击“资料库”，可导入 TXT 或 Markdown 文章。系统会按段落切分为约 900 字的小块，并保留约 120 字重叠内容。发送写作、续写或润色请求时，系统会在当前项目的资料库中自动检索最多 5 个相关片段，作为只读参考注入主 Agent 和子 Agent 上下文。
 
-当前检索器使用本地 BM25，不需要额外的向量数据库或 embedding API，适合离线使用；后续可以在 `novelagent/rag/store.py` 中替换为向量检索实现。
+资料库采用本地 **BM25 + Embedding** 混合检索：BM25 负责关键词命中，`BAAI/bge-base-zh-v1.5` 负责语义相似度。两项分数都会显示在前端检索结果中；不需要第三方 embedding API，也不需要向量数据库。
+
+Embedding 模型路径由 `config/config.yaml` 的 `embedding.model_path` 指定，默认是 `models/bge-base-zh-v1.5`。服务仅加载本地模型（不会在运行时下载）；首次部署请先执行快速开始中的 `huggingface-cli download` 命令。模型权重、RAG 索引和本地数据库均在 `.gitignore` 中排除。
 
 ### SSE 事件类型
 

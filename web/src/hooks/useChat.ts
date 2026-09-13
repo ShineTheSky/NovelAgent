@@ -9,13 +9,13 @@ import {
   listImportableProjects,
   listSessions,
   importExistingProject,
-  importHistoricalTraces,
   permissionResponse,
   questionResponse,
   sendMessage,
   stopGeneration,
   toggleAcceptEdits,
 } from '../api/client';
+import { replayDisplayEvents } from '../displayReplay';
 import type {
   Message,
   AgentRun,
@@ -57,9 +57,9 @@ export function useChat() {
   const [pendingAsk, setPendingAsk] = useState<PendingAsk | null>(null);
   const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
   const [currentAction, setCurrentAction] = useState('');
+  const [workspaceRevision, setWorkspaceRevision] = useState(0);
   const [tokenCount, setTokenCount] = useState(0);
   const [appError, setAppError] = useState<string | null>(null);
-  const [importingHistoricalTraces, setImportingHistoricalTraces] = useState(false);
 
   const controllerRef = useRef<AbortController | null>(null);
   const activeSessionRef = useRef<string | null>(null);
@@ -123,7 +123,7 @@ export function useChat() {
         if (disposed) return;
         activeSessionRef.current = savedSession;
         setActiveSession(savedSession);
-        setMessages(normalizeMessages(session.messages));
+        setMessages(session.display_events?.length ? replayDisplayEvents(session.display_events) : normalizeMessages(session.messages));
         setAcceptEdits(session.accept_edits_mode);
         setTokenCount(session.token_count);
       } catch (error) {
@@ -166,7 +166,7 @@ export function useChat() {
     try {
       const session = await getSession(sessionId);
       if (navigationId !== navigationIdRef.current) return;
-      setMessages(normalizeMessages(session.messages));
+      setMessages(session.display_events?.length ? replayDisplayEvents(session.display_events) : normalizeMessages(session.messages));
       setAcceptEdits(session.accept_edits_mode);
       setTokenCount(session.token_count);
     } catch (error) {
@@ -232,22 +232,6 @@ export function useChat() {
     }
   }, [activeProject, loadSession]);
 
-  const handleImportHistoricalTraces = useCallback(async () => {
-    if (!activeSession || importingHistoricalTraces) return;
-    setImportingHistoricalTraces(true);
-    setAppError(null);
-    try {
-      const result = await importHistoricalTraces(activeSession);
-      appendSystemMessage(result.status === 'already_imported'
-        ? `该会话已导入 ${result.trace_count} 条历史 Trace。`
-        : `已导入 ${result.candidate_turn_count} 轮历史对话，生成 ${result.trace_count} 条 Trace；跳过 ${result.skipped_incomplete_count} 条未完成请求。`);
-    } catch (error) {
-      setAppError(`导入历史 Trace 失败：${errorText(error)}`);
-    } finally {
-      setImportingHistoricalTraces(false);
-    }
-  }, [activeSession, appendSystemMessage, importingHistoricalTraces]);
-
   const handleStreamEvent = useCallback((event: StreamEvent, sessionId: string, streamId: number, optimisticMessageId: number) => {
     const isCurrentStream = () => activeSessionRef.current === sessionId && streamIdRef.current === streamId;
     if (!isCurrentStream()) return;
@@ -283,10 +267,13 @@ export function useChat() {
         const source = event.source ?? 'main';
         if (source === 'subagent' && event.run_id) {
           const eventId = nextMessageId();
-          updateRun(event.run_id, run => ({
-            ...run,
-            events: [...run.events, { id: eventId, type: 'thinking', content: event.content }],
-          }));
+          updateRun(event.run_id, run => {
+            const lastEvent = run.events.at(-1);
+            const events: AgentRun['events'] = lastEvent?.type === 'thinking'
+              ? [...run.events.slice(0, -1), { ...lastEvent, content: `${lastEvent.content ?? ''}${event.content}` }]
+              : [...run.events, { id: eventId, type: 'thinking' as const, content: event.content }];
+            return { ...run, events };
+          });
           setCurrentAction('子 Agent 工作中…');
           break;
         }
@@ -315,6 +302,9 @@ export function useChat() {
         }]);
         break;
       case 'tool_result':
+        if (event.success && (event.tool === 'Write' || event.tool === 'Edit')) {
+          setWorkspaceRevision(current => current + 1);
+        }
         if (event.source === 'subagent' && event.run_id) {
           const eventId = nextMessageId();
           updateRun(event.run_id, run => ({
@@ -527,6 +517,7 @@ export function useChat() {
     pendingAsk,
     pendingQuestion,
     currentAction,
+    workspaceRevision,
     tokenCount,
     appError,
     loadSessions,
@@ -535,8 +526,6 @@ export function useChat() {
     loadImportableProjects,
     handleImportProject,
     handleNewSession,
-    handleImportHistoricalTraces,
-    importingHistoricalTraces,
     handleSend,
     handleRetry,
     handleStop,

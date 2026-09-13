@@ -1,10 +1,12 @@
 """Trace replay APIs and explicit historical-import action."""
 
+import asyncio
 import json
 from fastapi import APIRouter, HTTPException, Request
 from pathlib import Path
 
 from novelagent.memory.file_store import FileStore
+from novelagent.trace.file_lifecycle import FileLifecycleStore
 from novelagent.trace.store import TraceStore
 
 
@@ -13,6 +15,46 @@ router = APIRouter(prefix="/api")
 
 def _store(request: Request) -> TraceStore:
     return request.app.state.trace_store
+
+
+def _files(request: Request, project_id: str) -> FileLifecycleStore:
+    return FileLifecycleStore(request.app.state.agent_loop.working_dir, project_id)
+
+
+@router.post("/projects/{project_id}/traces/analyze-pending")
+async def analyze_pending_traces(project_id: str, request: Request):
+    """Schedule historical/pending Trace extraction without blocking the UI."""
+    traces = await _store(request).list_project_traces(project_id, limit=500)
+    pending = [trace for trace in traces if trace.get("analysis_status") == "pending"]
+    analyzer = request.app.state.agent_loop.post_turn_analyzer
+    for trace in pending:
+        asyncio.create_task(analyzer.analyze(trace["trace_id"], project_id))
+    return {"scheduled": len(pending)}
+
+
+@router.get("/projects/{project_id}/evidence")
+async def list_evidence(project_id: str, request: Request):
+    return _files(request, project_id).list("evidence")
+
+
+@router.get("/projects/{project_id}/memories")
+async def list_file_memories(project_id: str, request: Request):
+    return _files(request, project_id).list("memory")
+
+
+@router.get("/projects/{project_id}/patterns")
+async def list_patterns(project_id: str, request: Request):
+    return _files(request, project_id).list("pattern")
+
+
+@router.post("/projects/{project_id}/{layer}/{record_id}/downgrade")
+async def downgrade_file_record(project_id: str, layer: str, record_id: str, request: Request):
+    if layer not in {"memory", "pattern"}:
+        raise HTTPException(status_code=422, detail="只能降低 Memory 或 Pattern")
+    result = _files(request, project_id).downgrade(layer, record_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    return result
 
 
 @router.post("/sessions/{session_id}/traces/import-history")
