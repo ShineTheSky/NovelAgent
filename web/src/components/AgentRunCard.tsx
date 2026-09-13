@@ -18,9 +18,11 @@ function statusText(status: AgentRun['status']) {
 
 export function AgentRunCard({ run, children = [] }: { run: AgentRun; children?: AgentRun[] }) {
   const [showDetails, setShowDetails] = useState(false);
+  const [showTaskPrompt, setShowTaskPrompt] = useState(false);
   const [showResult, setShowResult] = useState(false);
   const c = presetColors[run.preset] || defaultPresetColor;
   const result = run.result || run.draft;
+  const taskPrompt = run.taskPrompt || run.taskSummary;
   const longResult = result.length > 900;
   const displayEvents = run.events.reduce<AgentRun['events']>((events, event) => {
     const lastEvent = events.at(-1);
@@ -37,7 +39,18 @@ export function AgentRunCard({ run, children = [] }: { run: AgentRun; children?:
         <span className="rounded-full bg-white/20 px-2 py-0.5 text-[11px]">{statusText(run.status)}</span>
       </header>
       <div className="space-y-2 px-4 py-3">
-        {run.taskSummary && <p className="text-xs leading-5 text-gray-500">{run.taskSummary}</p>}
+        {taskPrompt && (
+          <div className="rounded-lg bg-gray-50 px-3 py-2">
+            <div className={`whitespace-pre-wrap break-words text-xs leading-5 text-gray-600 ${showTaskPrompt ? '' : 'line-clamp-2'}`}>
+              {taskPrompt}
+            </div>
+            {taskPrompt.length > 120 && (
+              <button type="button" onClick={() => setShowTaskPrompt(value => !value)} className="mt-1 text-[11px] text-purple-600 hover:text-purple-700">
+                {showTaskPrompt ? '收起任务提示' : '展开任务提示'}
+              </button>
+            )}
+          </div>
+        )}
         {run.status === 'running' && !result && <p className="text-xs text-gray-400">正在处理任务…</p>}
         {run.error && <p className="rounded-md bg-red-50 px-2 py-1.5 text-xs text-red-600">{run.error}</p>}
         {result && (

@@ -14,9 +14,10 @@ GLOBAL_PROJECT_ID = "__agent_bad_cases__"
 class AgentBadCaseRecorder:
     """Capture failures without affecting project memories or the user-facing turn."""
 
-    def __init__(self, store: TraceStore, workspace_dir: str):
+    def __init__(self, store: TraceStore, workspace_dir: str, analyzer=None):
         self.store = store
         self.directory = Path(workspace_dir).resolve().parent / "data" / "agent_bad_cases"
+        self.analyzer = analyzer
 
     @staticmethod
     def _snapshot(messages: list[dict] | None) -> list[dict]:
@@ -60,6 +61,7 @@ class AgentBadCaseRecorder:
                 "params": params or {},
                 "error": error,
             })
+            metadata["classification"] = self.analyzer.classify(metadata) if self.analyzer else "unclassified"
             await self.store.append_event(trace_id, 1, "bad_case_context", "system", metadata)
             await self.store.append_event(trace_id, 2, "error", actor, {
                 "message": str(error)[:16_000],
@@ -71,6 +73,8 @@ class AgentBadCaseRecorder:
             })
             await self.store.finish_trace(trace_id, "failed", str(error)[:16_000])
             await asyncio.to_thread(self._write_file, trace_id, metadata, self._snapshot(messages))
+            if self.analyzer:
+                self.analyzer.schedule(trace_id, metadata)
             return trace_id
         except Exception as exc:
             print(f"[agent_bad_case] capture failed: {exc}", flush=True)
@@ -85,6 +89,7 @@ class AgentBadCaseRecorder:
             "type: agent_bad_case",
             f"created: {created}",
             f"failure_kind: {metadata.get('failure_kind', '')}",
+            f"classification: {metadata.get('classification', 'unclassified')}",
             f"actor: {metadata.get('actor', '')}",
             f"tool: {metadata.get('tool', '')}",
             f"source_trace_id: {metadata.get('source_trace_id', '')}",

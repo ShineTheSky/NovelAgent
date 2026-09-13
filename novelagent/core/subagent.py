@@ -76,6 +76,7 @@ class SubAgentRunner:
         yield ResponseChunk(type="subagent_start", data={
             **src,
             "task_summary": task.strip().replace("\n", " ")[:160],
+            "task_prompt": task.strip(),
         })
 
         system_prompt = self._build_system_prompt(preset, extra_context, attachments, artifact_context)
@@ -117,6 +118,8 @@ class SubAgentRunner:
                     actor=actor or preset_name,
                     operation_id=operation_id,
                     revision_events=revision_events,
+                    permission_decision="not_checked",
+                    source_trace_id=operation_id,
                 )
                 result = await tool.execute(params, sub_ctx)
                 data = result.data if isinstance(result.data, str) else json.dumps(result.data, ensure_ascii=False)

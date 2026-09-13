@@ -20,7 +20,8 @@ from novelagent.core.review_workflow import ReviewPolishWorkflow
 class AgentLoop:
     def __init__(self, llm_client, tool_registry, permission_checker, context_builder, memory_manager,
                  config: dict | None = None, subagent_runner=None, trace_recorder: TraceRecorder | None = None,
-                 post_turn_analyzer=None, preference_context_provider=None, rag_store=None):
+                 post_turn_analyzer=None, preference_context_provider=None, rag_store=None, bash_case_recorder=None,
+                 bad_case_analyzer=None):
         self.llm = llm_client
         self.tools = tool_registry
         self.security = permission_checker
@@ -34,7 +35,8 @@ class AgentLoop:
         self.trace_interval = self._config.get("trace_interval", 5)
         self.working_dir = self._config.get("working_dir", "./workspace")
         self.trace = trace_recorder
-        self.bad_cases = AgentBadCaseRecorder(trace_recorder.store, self.working_dir) if trace_recorder else None
+        self.bad_cases = AgentBadCaseRecorder(trace_recorder.store, self.working_dir, bad_case_analyzer) if trace_recorder else None
+        self.bash_cases = bash_case_recorder
         self.post_turn_analyzer = post_turn_analyzer
         self.preference_context_provider = preference_context_provider
         self.rag_store = rag_store
@@ -117,6 +119,26 @@ class AgentLoop:
                 duration_ms=duration_ms,
             ))
 
+        def capture_bash_case(*, permission: str, status: str, success: bool | None = None,
+                              result: object = "", error: object = "", params: dict | None = None,
+                              actor: str = "main_agent", duration_ms: float | None = None) -> None:
+            if not self.bash_cases:
+                return
+            asyncio.create_task(self.bash_cases.capture(
+                session_id=session.session_id,
+                project_id=session.project_id,
+                source_trace_id=trace_id,
+                actor=actor,
+                operation_id=f"op_{session.session_id}_{trace_id}",
+                params=params,
+                permission=permission,
+                status=status,
+                success=success,
+                result=result,
+                error=error,
+                duration_ms=duration_ms,
+            ))
+
         async def capture_trace_if_due(answer: str = "") -> dict | None:
             """Seal a completed or interrupted turn without losing a requested checkpoint."""
             if not self.trace:
@@ -169,6 +191,7 @@ class AgentLoop:
             previously_allowed=session.previously_allowed,
             operation_id=f"op_{session.session_id}_{trace_id}",
             actor="main_agent",
+            source_trace_id=trace_id,
         )
         ctx.tool_context = tool_ctx
 
@@ -330,7 +353,10 @@ class AgentLoop:
                     error_msg = f"操作被安全策略禁止: {tool_name}"
                     await record("permission", "system", {"tool": tool_name, "decision": "block"}, tool_event_id)
                     await record("tool_result", "tool", {"tool": tool_name, "success": False, "error": error_msg}, tool_event_id)
-                    capture_bad_case("tool_failure", "main_agent", error_msg, tool=tool_name, params=params)
+                    if tool_name == "Bash":
+                        capture_bash_case(permission="blocked", status="blocked", success=False, error=error_msg, params=params)
+                    else:
+                        capture_bad_case("tool_failure", "main_agent", error_msg, tool=tool_name, params=params)
                     yield ResponseChunk(type="error", data={"message": error_msg})
                     ctx.messages.append(Message(role="tool_result", content=error_msg, tool_call_id=tool_name))
                     continue
@@ -352,12 +378,18 @@ class AgentLoop:
                         })
                         await record("permission_response", "user", {"tool": tool_name, "allowed": False}, tool_event_id)
                         await record("tool_result", "tool", {"tool": tool_name, "success": False, "error": error_msg}, tool_event_id)
-                        capture_bad_case("tool_failure", "main_agent", error_msg, tool=tool_name, params=params)
+                        if tool_name == "Bash":
+                            capture_bash_case(permission="user_denied", status="not_executed", success=False, error=error_msg, params=params)
+                        else:
+                            capture_bad_case("tool_failure", "main_agent", error_msg, tool=tool_name, params=params)
                         ctx.messages.append(Message(role="tool_result", content=error_msg, tool_call_id=tool_name))
                         continue
                     # 用户同意 → 记录到会话内批准列表
                     await record("permission_response", "user", {"tool": tool_name, "allowed": True}, tool_event_id)
                     tool_ctx.mark_allowed(f"{tool_name}:{hashlib.md5(str(params).encode()).hexdigest()[:8]}")
+
+                if tool_name == "Bash":
+                    tool_ctx.permission_decision = "ask_user_approved" if perm == PermissionResult.ASK else "allowed"
 
                 # Execute tool — AskUserQuestion pauses and waits for user
                 if tool_name == "AskUserQuestion":

@@ -36,10 +36,22 @@ agent:
 
 # 仅编码 Trace 中的用户输入；高置信度常规执行会跳过 LLM 记忆分析。
 embedding:
+    enabled: true
+    model_path: "models/bge-base-zh-v1.5"
+    routine_min_similarity: 0.70
+    routine_min_margin: 0.12
+
+# 全局 Agent Bad Case：先按类别积累，再异步生成仅供人工审核的根因与建议。
+bad_case_analysis:
   enabled: true
-  model_path: "models/bge-base-zh-v1.5"
-  routine_min_similarity: 0.70
-  routine_min_margin: 0.12
+  batch_size: 3
+  max_cases: 12
+
+# 所有 Bash 行为样本（含成功）按命令族聚合，用于提出受监控工具候选。
+bash_case_analysis:
+  enabled: true
+  batch_size: 3
+  max_cases: 20
 
 # 日志配置
 logging:

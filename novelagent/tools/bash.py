@@ -5,6 +5,7 @@ import sys
 import shutil
 import subprocess
 import hashlib
+import time
 from novelagent.tools.base import ToolProtocol, ToolResult, ToolContext, PermissionResult
 
 
@@ -32,9 +33,13 @@ class BashTool(ToolProtocol):
         "nmap", "telnet", "su", "runas", "doas", "pkexec", "systemctl", "service",
     ]
 
+    def __init__(self, case_recorder=None):
+        self.case_recorder = case_recorder
+
     async def execute(self, params: dict, context: ToolContext) -> ToolResult:
         command = params["command"]
         cwd = os.path.abspath(params.get("working_dir", context.working_dir))
+        started_at = time.time()
 
         try:
             # Windows: use Git Bash if available, otherwise fall back to cmd
@@ -61,9 +66,28 @@ class BashTool(ToolProtocol):
             max_size = 10240
             if len(output) > max_size:
                 output = output[:max_size] + f"\n[输出截断，超过{max_size}字节]"
-            return ToolResult(success=(result.returncode == 0), data=output.strip() or "(无输出)")
+            tool_result = ToolResult(success=(result.returncode == 0), data=output.strip() or "(无输出)")
         except subprocess.TimeoutExpired:
-            return ToolResult(success=False, error="Bash命令超时（30s）")
+            tool_result = ToolResult(success=False, error="Bash命令超时（30s）")
+        except Exception as exc:
+            tool_result = ToolResult(success=False, error=str(exc))
+
+        if self.case_recorder:
+            await self.case_recorder.capture(
+                session_id=context.session_id,
+                project_id=context.project_id,
+                source_trace_id=context.source_trace_id or context.operation_id,
+                actor=context.actor,
+                operation_id=context.operation_id,
+                params={**params, "working_dir": cwd},
+                permission=context.permission_decision or "executed",
+                status="executed",
+                success=tool_result.success,
+                result=tool_result.data,
+                error=tool_result.error if not tool_result.success else "",
+                duration_ms=(time.time() - started_at) * 1000,
+            )
+        return tool_result
 
     def checkPermissions(self, params: dict, context: ToolContext) -> PermissionResult:
         command = params.get("command", "").strip()

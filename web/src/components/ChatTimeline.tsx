@@ -88,9 +88,9 @@ export function ChatTimeline({
         <div className="max-w-3xl mx-auto px-4 py-6 space-y-4">
           {elements}
           {loading && (
-            <div className="flex items-center gap-2 px-1 py-2">
-              <div className="flex gap-1"><div className="w-2 h-2 bg-purple-400 rounded-full animate-bounce motion-reduce:animate-none" /><div className="w-2 h-2 bg-purple-400 rounded-full animate-bounce motion-reduce:animate-none" style={{ animationDelay: '150ms' }} /><div className="w-2 h-2 bg-purple-400 rounded-full animate-bounce motion-reduce:animate-none" style={{ animationDelay: '300ms' }} /></div>
-              <span className="text-xs text-gray-400 ml-2">{currentAction || 'AI 思考中…'}</span>
+            <div className="flex w-full min-w-0 items-center gap-2 px-1 py-2">
+              <div className="flex shrink-0 gap-1"><div className="w-2 h-2 bg-purple-400 rounded-full animate-bounce motion-reduce:animate-none" /><div className="w-2 h-2 bg-purple-400 rounded-full animate-bounce motion-reduce:animate-none" style={{ animationDelay: '150ms' }} /><div className="w-2 h-2 bg-purple-400 rounded-full animate-bounce motion-reduce:animate-none" style={{ animationDelay: '300ms' }} /></div>
+              <span className="ml-2 min-w-0 flex-1 truncate whitespace-nowrap text-xs text-gray-400">{currentAction || 'AI 正在思考…'}</span>
             </div>
           )}
           {canRetry && <div className="flex justify-center my-2"><button type="button" onClick={onRetry} className="text-xs text-purple-600 hover:text-purple-700 border border-purple-200 rounded-full px-3 py-1">重试</button></div>}

@@ -78,6 +78,7 @@ export function replayDisplayEvents(rawEvents: unknown[]): Message[] {
           parentRunId: typeof data.parent_run_id === 'string' ? data.parent_run_id : undefined,
           workflow: typeof data.workflow === 'string' ? data.workflow : undefined,
           taskSummary: asText(data.task_summary), status: 'running', draft: '', result: '', events: [],
+          taskPrompt: asText(data.task_prompt) || asText(data.task_summary),
         },
       });
       continue;

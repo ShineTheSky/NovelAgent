@@ -108,3 +108,17 @@ positions:
     max_tokens: 2048
     temperature: 0.3
     timeout: 30
+
+  bad_case_analysis:
+    provider: minimax
+    model: MiniMax-M2.7
+    max_tokens: 2048
+    temperature: 0.2
+    timeout: 60
+
+  bash_case_analysis:
+    provider: minimax
+    model: MiniMax-M2.7
+    max_tokens: 2048
+    temperature: 0.2
+    timeout: 60

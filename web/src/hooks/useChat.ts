@@ -277,7 +277,9 @@ export function useChat() {
           setCurrentAction('子 Agent 工作中…');
           break;
         }
-        setCurrentAction(event.content || 'AI 思考中…');
+        // Reasoning arrives as very small streaming fragments. Keep them in
+        // one status line instead of replacing the line with the latest char.
+        setCurrentAction(previous => `${previous}${event.content || ''}`);
         break;
       }
       case 'tool_call':
@@ -337,6 +339,7 @@ export function useChat() {
             parentRunId: event.parent_run_id ?? undefined,
             workflow: event.workflow ?? undefined,
             taskSummary: event.task_summary ?? '',
+            taskPrompt: event.task_prompt ?? event.task_summary ?? '',
             status: 'running',
             draft: '',
             result: '',

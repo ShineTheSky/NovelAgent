@@ -34,6 +34,8 @@ class ToolContext:
     operation_id: str = ""
     actor: str = "main_agent"
     revision_events: list[dict] = field(default_factory=list)
+    permission_decision: str = ""
+    source_trace_id: str = ""
 
     def is_previously_allowed(self, key: str) -> bool:
         return key in self.previously_allowed

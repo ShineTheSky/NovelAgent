@@ -49,6 +49,7 @@ export interface AgentRun {
   parentRunId?: string;
   workflow?: string;
   taskSummary: string;
+  taskPrompt?: string;
   status: 'running' | 'completed' | 'failed';
   draft: string;
   result: string;
@@ -111,7 +112,7 @@ export type StreamEvent =
   | { type: 'thinking'; content: string; source?: 'main' | 'subagent'; run_id?: string }
   | { type: 'tool_call'; tool: string; params: JsonRecord; source?: 'main' | 'subagent'; run_id?: string }
   | { type: 'tool_result'; tool: string; success: boolean; data?: unknown; error?: string; source?: 'main' | 'subagent'; run_id?: string }
-  | { type: 'subagent_start'; source: 'subagent'; run_id: string; parent_run_id?: string | null; preset: string; workflow?: string | null; task_summary?: string }
+  | { type: 'subagent_start'; source: 'subagent'; run_id: string; parent_run_id?: string | null; preset: string; workflow?: string | null; task_summary?: string; task_prompt?: string }
   | { type: 'subagent_result'; run_id: string; preset: string; content: string }
   | { type: 'subagent_done'; run_id: string; preset: string; result?: string }
   | { type: 'permission_ask'; tool: string; params_summary?: string }
