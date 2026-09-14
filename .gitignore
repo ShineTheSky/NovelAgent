@@ -51,6 +51,3 @@ embedding_models/
 *.hnsw
 *.safetensors
 pytorch_model.bin
-
-#测试
-tests/

@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 from novelagent.core.session import ResponseChunk
+from novelagent.trace.file_lifecycle import FileLifecycleStore
 
 
 _CHAPTER_PATH = re.compile(r"^chapters/content_(\d+)\.(\d+)\.(\d+)\.md$", re.IGNORECASE)
@@ -38,6 +39,16 @@ class ReviewPolishWorkflow:
         path = project_dir / relative_path
         return path.read_text(encoding="utf-8") if path.is_file() else "（该文件尚不存在）"
 
+    def _reference_feedback_context(self, project_id: str, chapter_path: str, body: str) -> str:
+        records = FileLifecycleStore(str(self.working_dir), project_id).text_feedback_for_artifact(chapter_path, body)
+        if not records:
+            return ""
+        lines = ["## 当前正文的用户修改反馈（按需遵守）"]
+        for record in records:
+            lines.append(f"### {record.get('title', record.get('claim', '文本反馈'))}\n{record.get('content', '')}")
+        lines.append("若反馈互相矛盾、引用已无法定位，或修改方向仍不明确，先用 AskUserQuestion 澄清；否则据此直接审阅或润色。")
+        return "\n\n".join(lines)
+
     def _artifact_context(self, project_id: str, chapter_path: str) -> tuple[str, str]:
         normalized = chapter_path.replace("\\", "/")
         match = _CHAPTER_PATH.match(normalized)
@@ -55,7 +66,9 @@ class ReviewPolishWorkflow:
             f"### 对应章纲：{chapter_outline}\n{self._read_if_exists(project_dir, chapter_outline)}",
         ])
         memory = self._read_if_exists(project_dir, ".memory/memory.md")
-        return context, f"## 项目记忆（按需遵守）\n{memory}"
+        feedback = self._reference_feedback_context(project_id, normalized, body)
+        extra = f"## 项目记忆（按需遵守）\n{memory}"
+        return context, f"{extra}\n\n{feedback}" if feedback else extra
 
     def build_context(self, project_id: str, chapter_path: str) -> tuple[str, str]:
         """Expose the same deterministic context order to manual review/polish calls."""
@@ -94,7 +107,8 @@ class ReviewPolishWorkflow:
         artifact_context, memory_context = self._artifact_context(parent_session.project_id, chapter_path)
         reviewer_task = (
             f"审阅 `{chapter_path}`。这是写作 Agent 刚提交的版本；只输出可执行的结构化审阅报告，"
-            "不要写文件。请按“问题、证据、严重度、建议”列出；没有问题也明确说明。"
+            "不要写文件。请按“问题、证据、严重度、建议”列出；没有问题也明确说明。\n\n"
+            f"## 本轮写作需求（用于判断是否满足用户目标）\n{writer_task}"
         )
         reviewer_result = ""
         reviewer_completed = False
@@ -103,6 +117,7 @@ class ReviewPolishWorkflow:
             extra_context=memory_context, artifact_context=artifact_context,
             actor="reviewer", operation_id=f"{operation_id}:review",
             parent_run_id=parent_run_id, workflow="auto_review",
+            context_as_user_message=True,
         ):
             if chunk.type == "subagent_done":
                 reviewer_result = chunk.data.get("result", "")

@@ -21,6 +21,20 @@ class SubAgentRunner:
         from novelagent.context.prompt_manager import PromptManager
         self.prompt_manager = PromptManager("prompts")
 
+    @staticmethod
+    def _artifact_context(artifact_context: str, attachments: list[dict] | None) -> str:
+        if artifact_context:
+            return artifact_context
+        if not attachments:
+            return ""
+        att_lines = ["## 参考文件内容（由主Agent提供，请直接使用，无需再读文件）"]
+        for att in attachments:
+            if isinstance(att, str):
+                att_lines.append(f"\n{att}")
+            elif isinstance(att, dict):
+                att_lines.append(f"\n### {att.get('path', '')}\n{att.get('content', '')}")
+        return "\n".join(att_lines)
+
     def _build_system_prompt(
         self, preset: dict, extra_context: str = "", attachments: list[dict] | None = None,
         artifact_context: str = "",
@@ -28,16 +42,6 @@ class SubAgentRunner:
         from datetime import datetime
         tool_names = preset.get("tools", [])
         tools_desc = self.tools.get_tools_prompt(tool_names) if tool_names else ""
-        att_text = ""
-        if attachments:
-            att_lines = ["## 参考文件内容（由主Agent提供，请直接使用，无需再读文件）"]
-            for att in attachments:
-                if isinstance(att, str):
-                    att_lines.append(f"\n{att}")
-                elif isinstance(att, dict):
-                    att_lines.append(f"\n### {att.get('path', '')}\n{att.get('content', '')}")
-            att_text = "\n".join(att_lines)
-        artifact = artifact_context or att_text
         return self.prompt_manager.render("base_subagent.j2", {
             "role_definition": preset.get("system_prompt", ""),
             "current_date": datetime.now().strftime("%Y-%m-%d"),
@@ -45,7 +49,7 @@ class SubAgentRunner:
             "memory_md_content": "",
             "memory_enabled": preset.get("memory_enabled", False),
             "tools_description": tools_desc,
-            "artifact_context": artifact,
+            "artifact_context": self._artifact_context(artifact_context, attachments),
             "extra_context": extra_context,
         })
 
@@ -55,6 +59,7 @@ class SubAgentRunner:
         attachments: list[dict] | None = None, artifact_context: str = "",
         actor: str | None = None, operation_id: str = "",
         run_id: str = "", parent_run_id: str = "", workflow: str = "",
+        context_as_user_message: bool = False,
     ):
         preset = self.presets_tool.get_preset(preset_name)
         if preset is None:
@@ -79,11 +84,21 @@ class SubAgentRunner:
             "task_prompt": task.strip(),
         })
 
-        system_prompt = self._build_system_prompt(preset, extra_context, attachments, artifact_context)
+        fixed_context = self._artifact_context(artifact_context, attachments)
+        system_prompt = self._build_system_prompt(
+            preset,
+            "" if context_as_user_message else extra_context,
+            None if context_as_user_message else attachments,
+            "" if context_as_user_message else artifact_context,
+        )
         initial_messages = []
         if inherit:
             parent_msgs = parent_session.messages[-20:] if len(parent_session.messages) > 20 else parent_session.messages
             initial_messages.extend(parent_msgs)
+        if context_as_user_message:
+            runtime_context = "\n\n".join(part for part in (fixed_context, extra_context) if part)
+            if runtime_context:
+                initial_messages.append({"role": "user", "content": runtime_context})
         initial_messages.append({"role": "user", "content": task})
 
         # Debug

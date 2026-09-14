@@ -220,8 +220,8 @@ async def send_message(session_id: str, body: SendMessageRequest, request: Reque
         finally:
             active_trace_id = getattr(session, "active_trace_id", "")
             if active_trace_id and agent_loop.trace:
-                await agent_loop.trace.finish(active_trace_id, "interrupted")
                 session.active_trace_id = ""
+                asyncio.create_task(agent_loop.trace.finish(active_trace_id, "interrupted"))
             # 先释放会话锁，防止save_messages（含LLM标题生成）阻塞后续请求
             _active_locks[session_id] = 0
             if session.messages:

@@ -1,5 +1,6 @@
 """Write工具"""
 
+import hashlib
 import re
 from pathlib import Path
 from novelagent.tools.base import ToolProtocol, ToolResult, ToolContext, PermissionResult
@@ -7,6 +8,18 @@ from novelagent.versioning import RevisionConflict, revision_manager
 
 PROTECTED_DIRS = [".git", ".claude/settings", ".env", ".memory/memory.md"]
 INTERNAL_EDITABLES = [".claude/plans/", ".claude/scratchpad.md"]
+
+
+def _changed_excerpt(before: str, after: str, limit: int = 1200) -> tuple[str, str]:
+    """Return bounded text around the first changed position for Trace anchoring."""
+    shared = 0
+    max_shared = min(len(before), len(after))
+    while shared < max_shared and before[shared] == after[shared]:
+        shared += 1
+    start = max(0, shared - 180)
+    before_excerpt = before[start:start + limit].strip()
+    after_excerpt = after[start:start + limit].strip()
+    return before_excerpt, after_excerpt
 
 
 def layout_error(path: str) -> str | None:
@@ -49,13 +62,20 @@ class WriteTool(ToolProtocol):
         file_path = Path(context.working_dir) / params["path"]
         try:
             if revision_manager.is_managed(file_path, context.working_dir):
+                existing = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
+                current = revision_manager.parse(existing) if existing else None
                 info = await revision_manager.commit(
                     file_path, params["content"], params.get("expected_revision_id"),
                     actor=context.actor, operation_id=context.operation_id,
                 )
+                before_excerpt, after_excerpt = _changed_excerpt(current.body if current else "", info.body)
                 context.revision_events.append({
                     "path": params["path"], "revision_id": info.revision_id,
                     "parent_revision_id": info.metadata.get("parent_revision_id"),
+                    "source_revision_id": current.revision_id if current else "new",
+                    "anchor_excerpt": before_excerpt,
+                    "anchor_sha256": hashlib.sha256(before_excerpt.encode("utf-8")).hexdigest() if before_excerpt else "",
+                    "replacement_excerpt": after_excerpt,
                     "updated_by": context.actor,
                     "operation_id": context.operation_id,
                 })

@@ -1,9 +1,16 @@
 """Edit工具"""
 
+import hashlib
 from pathlib import Path
 from novelagent.tools.base import ToolProtocol, ToolResult, ToolContext, PermissionResult
 from novelagent.tools.write import WriteTool, layout_error
 from novelagent.versioning import RevisionConflict, revision_manager
+
+
+def _excerpt(value: str, limit: int = 1200) -> str:
+    """Keep Trace anchors useful without copying an entire chapter into an event."""
+    value = value.strip()
+    return value if len(value) <= limit else value[:limit] + "\n[片段已截断]"
 
 
 class EditTool(ToolProtocol):
@@ -65,6 +72,10 @@ class EditTool(ToolProtocol):
                 context.revision_events.append({
                     "path": params["path"], "revision_id": info.revision_id,
                     "parent_revision_id": info.metadata.get("parent_revision_id"),
+                    "source_revision_id": current.revision_id,
+                    "anchor_excerpt": _excerpt(old),
+                    "anchor_sha256": hashlib.sha256(old.encode("utf-8")).hexdigest(),
+                    "replacement_excerpt": _excerpt(new),
                     "updated_by": context.actor,
                     "operation_id": context.operation_id,
                 })

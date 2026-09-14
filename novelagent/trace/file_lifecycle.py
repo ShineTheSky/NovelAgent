@@ -109,6 +109,108 @@ class FileLifecycleStore:
     def get(self, layer: str, record_id: str) -> dict | None:
         return next((item for item in self.list(layer) if item["id"] == record_id), None)
 
+    @staticmethod
+    def is_text_feedback(item: dict) -> bool:
+        return item.get("category") == "reference" and item.get("kind") == "text_feedback"
+
+    def merge_text_feedback(self, existing: dict, incoming: dict, trace_id: str,
+                            source_event_ids: list[str], user_inputs: list[dict]) -> dict:
+        """Refresh one reference-memory interpretation without treating repeats as votes."""
+        merged = dict(existing)
+        history = list(merged.get("feedback_history") or [])
+        if not history and (merged.get("source_event_ids") or merged.get("trace_id")):
+            history.append({
+                "trace_id": str(merged.get("trace_id") or ""),
+                "source_event_ids": list(merged.get("source_event_ids") or []),
+                "feedback_direction": str(merged.get("feedback_direction") or ""),
+                "relation": "new",
+            })
+        entry = {
+            "trace_id": trace_id,
+            "source_event_ids": list(dict.fromkeys(source_event_ids)),
+            "feedback_direction": str(incoming.get("feedback_direction") or "").strip(),
+            "relation": str(incoming.get("feedback_relation") or "").strip(),
+        }
+        if not any(
+            row.get("trace_id") == entry["trace_id"] and row.get("source_event_ids") == entry["source_event_ids"]
+            for row in history if isinstance(row, dict)
+        ):
+            history.append(entry)
+        merged["feedback_history"] = history
+        merged["feedback_count"] = len(history)
+        inputs = list(merged.get("user_inputs") or [])
+        known_input_ids = {str(row.get("event_id") or "") for row in inputs if isinstance(row, dict)}
+        inputs.extend(row for row in user_inputs if str(row.get("event_id") or "") not in known_input_ids)
+        merged["user_inputs"] = inputs
+        merged["trace_id"] = trace_id
+        merged["trace_ids"] = list(dict.fromkeys([*merged.get("trace_ids", []), trace_id]))
+        merged["source_event_ids"] = list(dict.fromkeys([*merged.get("source_event_ids", []), *source_event_ids]))
+        anchors = list(merged.get("anchor_examples") or [])
+        if not anchors and merged.get("anchor_excerpt"):
+            anchors.append({
+                "artifact_path": str(merged.get("artifact_path") or "").replace("\\", "/").lstrip("./"),
+                "artifact_revision_id": str(merged.get("artifact_revision_id") or ""),
+                "anchor_excerpt": str(merged.get("anchor_excerpt") or "")[:700],
+                "anchor_sha256": str(merged.get("anchor_sha256") or ""),
+            })
+        anchor = {
+            "artifact_path": str(incoming.get("artifact_path") or "").replace("\\", "/").lstrip("./"),
+            "artifact_revision_id": str(incoming.get("artifact_revision_id") or ""),
+            "anchor_excerpt": str(incoming.get("anchor_excerpt") or "")[:700],
+            "anchor_sha256": str(incoming.get("anchor_sha256") or ""),
+        }
+        if anchor["anchor_excerpt"] and not any(
+            row.get("anchor_sha256") == anchor["anchor_sha256"] and row.get("artifact_path") == anchor["artifact_path"]
+            for row in anchors if isinstance(row, dict)
+        ):
+            anchors.append(anchor)
+        merged["anchor_examples"] = anchors
+        for key in ("feedback_direction", "artifact_path", "artifact_revision_id", "anchor_excerpt", "anchor_sha256"):
+            value = incoming.get(key)
+            if value:
+                merged[key] = value
+        # Trace remains the immutable full evidence source.  The normal Memory
+        # keeps the original user inputs beside the current Agent interpretation,
+        # so a repeat analysis normally needs no Trace lookup.
+        analysis = str(incoming.get("feedback_analysis") or incoming.get("content") or merged.get("feedback_analysis") or merged.get("content") or "").strip()
+        merged["feedback_analysis"] = analysis
+        merged["content"] = self.render_text_feedback_content(analysis, inputs)
+        if incoming.get("title"):
+            merged["title"] = str(incoming["title"])
+            merged["claim"] = str(incoming.get("claim") or incoming["title"])
+        return merged
+
+    @staticmethod
+    def render_text_feedback_content(analysis: str, user_inputs: list[dict]) -> str:
+        lines = ["## 当前 Agent 分析", analysis or "（尚待进一步判断）", "", "## 用户原始反馈"]
+        if not user_inputs:
+            lines.append("（未能定位原始用户输入；可按 trace_id 回查。）")
+        for row in user_inputs:
+            if not isinstance(row, dict):
+                continue
+            trace_id = row.get("trace_id", "")
+            event_id = row.get("event_id", "")
+            lines.extend([f"### Trace {trace_id} / Event {event_id}", str(row.get("content") or "")])
+        return "\n".join(lines).strip()
+
+    def text_feedback_for_artifact(self, relative_path: str, body: str, limit: int = 5) -> list[dict]:
+        """Find normal reference memories whose quoted text belongs to this artifact."""
+        normalized = relative_path.replace("\\", "/").lstrip("./")
+        matches = []
+        for item in self.list("memory"):
+            if not self.is_text_feedback(item):
+                continue
+            anchors = [item, *[row for row in item.get("anchor_examples", []) if isinstance(row, dict)]]
+            quoted = [str(anchor.get("anchor_excerpt") or "").strip() for anchor in anchors]
+            same_path = str(item.get("artifact_path") or "").replace("\\", "/").lstrip("./") == normalized
+            same_path = same_path or any(
+                str(anchor.get("artifact_path") or "").replace("\\", "/").lstrip("./") == normalized
+                for anchor in anchors
+            )
+            if same_path or any(quote and quote in body for quote in quoted):
+                matches.append(item)
+        return sorted(matches, key=self._rank, reverse=True)[:limit]
+
     def write(self, layer: str, item: dict) -> dict:
         self.ensure(); category = str(item.get("category", "project"))
         item["category"] = category if category in CATEGORIES else "project"

@@ -96,7 +96,7 @@ def create_app() -> FastAPI:
         routine_min_margin=float(embedding_cfg.get("routine_min_margin", 0.12)),
     )
     embedding_gate.embedding_model = embedding_model
-    post_turn_analyzer = FileTraceAnalyzer(llm_client, working_dir, trace_store, embedding_gate)
+    post_turn_analyzer = FileTraceAnalyzer(llm_client, working_dir, trace_store, embedding_gate, rag_store)
     preference_context_provider = FilePatternContextProvider(working_dir)
 
     agent_config = {

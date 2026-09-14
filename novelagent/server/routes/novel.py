@@ -12,6 +12,7 @@ VOLUME_OUTLINE_PATTERN = re.compile(r"^outlines/outline_(\d+)\.0\.0\.md$")
 CHAPTER_OUTLINE_PATTERN = re.compile(r"^outlines/outline_(\d+)\.(\d+)\.0\.md$")
 SECTION_PATTERN = re.compile(r"^chapters/content_(\d+)\.(\d+)\.(\d+)\.md$")
 HEADING_PATTERN = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
+SECTION_HEADING_PATTERN = re.compile(r"^\s*#{2,6}\s+(.+?)\s*$", re.MULTILINE)
 METADATA_TITLE_PATTERN = re.compile(r"^\|\s*\*{0,2}(卷标题|章标题)\*{0,2}\s*\|\s*(.+?)\s*\|\s*$", re.MULTILINE)
 MATERIAL_DIRECTORIES = (
     ("world", "世界观"),
@@ -42,6 +43,10 @@ def _display_title(content: str, kind: str, fallback: str) -> str:
         for label, value in METADATA_TITLE_PATTERN.findall(content):
             if label == expected_label:
                 return re.sub(r"\*{1,2}|`", "", value).strip()
+    if kind == "section":
+        section_heading = SECTION_HEADING_PATTERN.search(content)
+        if section_heading:
+            return section_heading.group(1).strip()
     heading = HEADING_PATTERN.search(content)
     if heading:
         return re.sub(r"^(?:卷纲|章纲)\s*[：:]\s*", "", heading.group(1)).strip()
