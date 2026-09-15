@@ -45,7 +45,10 @@ class AgentLoop:
         self._trace_capture_locks: dict[str, asyncio.Lock] = {}
 
     async def run(self, request: InternalRequest, session: Session, project_info: dict | None = None) -> ResponseChunk:
-        trace_id = hashlib.md5(f"{session.session_id}{time.time()}".encode()).hexdigest()[:8]
+        trace_id = await self.trace.start(session.session_id, session.project_id, request.content) if self.trace else f"op_{uuid.uuid4().hex}"
+        # The HTTP route can finish this trace if a client disconnects while the
+        # generator is awaiting a tool or model response.
+        session.active_trace_id = trace_id
         deferred_trace_events: list[dict] = []
         trace_event_sequence = 0
 
@@ -53,7 +56,7 @@ class AgentLoop:
                          parent_event_id: str | None = None, duration_ms: float | None = None):
             nonlocal trace_event_sequence
             trace_event_sequence += 1
-            event_id = f"deferred_{trace_event_sequence}"
+            event_id = await self.trace.record(trace_id, event_type, actor, payload, parent_event_id, duration_ms) if self.trace else f"deferred_{trace_event_sequence}"
             deferred_trace_events.append({
                 "event_id": event_id,
                 "event_type": event_type,
@@ -64,7 +67,10 @@ class AgentLoop:
             return event_id
 
         async def finish(status: str, answer: str = "", token_count: int = 0):
-            return None
+            if self.trace:
+                await self.trace.finish(trace_id, status, answer, token_count)
+            if getattr(session, "active_trace_id", "") == trace_id:
+                session.active_trace_id = ""
 
         pi = project_info or {}
         trace_checkpoint_requested = False
@@ -147,6 +153,7 @@ class AgentLoop:
             events_snapshot: list[dict],
             token_count: int,
             should_capture: bool,
+            reason: str,
             append_turn: bool = True,
         ) -> None:
             """Persist an immutable Trace snapshot outside the interactive response."""
@@ -157,24 +164,24 @@ class AgentLoop:
                 async with capture_lock:
                     if append_turn:
                         await self.trace.store.append_session_turn(
-                            session.session_id, request.content, answer, events_snapshot,
+                            session.session_id, request.content, answer, events_snapshot, trace_id,
                         )
                         pending_turns = await self.trace.store.pending_trace_turn_count(session.session_id)
                         if not should_capture and (self.trace_interval <= 0 or pending_turns < self.trace_interval):
                             return
-                    captured = await self.trace.store.capture_pending_trace(
-                        session.session_id, session.project_id, messages_snapshot, token_count,
+                    captured = await self.trace.store.capture_pending_trace_window(
+                        session.session_id, session.project_id, messages_snapshot, token_count, reason,
                     )
                     if captured and self.post_turn_analyzer:
-                        asyncio.create_task(self.post_turn_analyzer.analyze(
-                            captured["trace_id"], session.project_id, captured["messages"], main_tool_schemas,
+                        asyncio.create_task(self.post_turn_analyzer.analyze_window(
+                            captured["window_id"], session.project_id, captured["messages"], main_tool_schemas,
                         ))
             except Exception as exc:
                 print(f"[trace] checkpoint capture failed: {exc}", flush=True)
 
         def schedule_trace_capture(answer: str = "", *, force_capture: bool = False,
                                    append_turn: bool = True, messages_snapshot: list[dict] | None = None,
-                                   token_count: int | None = None) -> None:
+                                   token_count: int | None = None, reason: str = "interval") -> None:
             if not self.trace:
                 return
             snapshot = copy.deepcopy(messages_snapshot if messages_snapshot is not None else ctx.to_llm_messages())
@@ -185,6 +192,7 @@ class AgentLoop:
                 event_snapshot,
                 token_count if token_count is not None else self.context_builder.token_counter.count_messages(snapshot),
                 trace_checkpoint_requested or force_capture,
+                "agent_request" if trace_checkpoint_requested else reason,
                 append_turn,
             ))
 
@@ -234,6 +242,7 @@ class AgentLoop:
                 append_turn=False,
                 messages_snapshot=ctx.to_llm_messages(),
                 token_count=pre_check_tokens,
+                reason="compression",
             )
             # 发送完整消息历史给 LLM 生成摘要
             try:
@@ -514,9 +523,16 @@ class AgentLoop:
                         if sub_chunk.type == "subagent_done":
                             subagent_result_text = sub_chunk.data.get("result", "")
                             writer_revision_events = sub_chunk.data.get("revision_events", [])
+                            if sub_chunk.data.get("empty_result"):
+                                subagent_failed = True
+                                subagent_result_text = "Error: 子 Agent 未返回有效内容"
+                                capture_bad_case(
+                                    "empty_response", f"subagent:{preset}", "子 Agent 未返回有效内容",
+                                    tool="SubAgent", params={"preset": preset, "task": task, "run_id": subagent_run_id},
+                                )
                             # 转发subagent_done让前端显示完成消息+结果预览
                             yield sub_chunk
-                            if show_result and subagent_result_text and not subagent_result_text.startswith("Error:"):
+                            if show_result and not sub_chunk.data.get("empty_result") and subagent_result_text and not subagent_result_text.startswith("Error:"):
                                 yield ResponseChunk(type="subagent_result", data={
                                     "source": "subagent", "run_id": subagent_run_id,
                                     "preset": preset, "content": subagent_result_text,
@@ -537,6 +553,7 @@ class AgentLoop:
                                 if (
                                     workflow_chunk.type == "subagent_done"
                                     and workflow_chunk.data.get("workflow") == "auto_polish"
+                                    and not workflow_chunk.data.get("empty_result")
                                 ):
                                     workflow_summaries.append(workflow_chunk.data.get("result", ""))
                                 await record(
@@ -546,7 +563,7 @@ class AgentLoop:
                                 )
                                 if workflow_chunk.type == "error":
                                     capture_bad_case(
-                                        "subagent_failure",
+                                        workflow_chunk.data.get("failure_kind", "subagent_failure"),
                                         f"workflow:{workflow_chunk.data.get('workflow', 'review_polish')}",
                                         workflow_chunk.data.get("message", "自动审阅或润色失败"),
                                         tool="SubAgent", params={"workflow": workflow_chunk.data.get("workflow", "")},
@@ -641,9 +658,19 @@ class AgentLoop:
             last_tool_calls = current_tool_calls
 
         # 7. The analyzer derives trace-backed atomic memories after the immutable trace is complete.
+        if not final_text.strip():
+            capture_bad_case(
+                "empty_response", "main_agent", "主 Agent 未返回有效内容",
+                params={"turns": turn, "last_tool_call_count": len(last_tool_calls)},
+            )
         token_count = self.context_builder.token_counter.count_messages(ctx.to_llm_messages())
         session.messages = [m.to_dict() for m in ctx.messages]
         session.token_count = token_count
+        await finish("completed", final_text, token_count)
+
+        # Queue capture before yielding the terminal SSE event.  It remains
+        # asynchronous, but is not lost if the client closes immediately.
+        schedule_trace_capture(final_text)
 
         # 8. Done
         yield ResponseChunk(type="done", data={
@@ -653,7 +680,3 @@ class AgentLoop:
             # Trace capture runs after the UI receives the terminal event.
             "trace_id": "",
         })
-        # Trace persistence and the optional extraction LLM must not delay the
-        # end of the interactive response.  The captured trace is still built
-        # from the completed immutable event list above.
-        schedule_trace_capture(final_text)

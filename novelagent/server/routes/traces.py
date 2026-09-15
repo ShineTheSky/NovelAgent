@@ -91,6 +91,17 @@ async def get_trace(trace_id: str, request: Request):
     return trace
 
 
+@router.get("/traces/{trace_id}/context")
+async def get_trace_context(trace_id: str, request: Request, before: int = 2, after: int = 2):
+    """Return the bounded request chain needed to reconstruct a Trace."""
+    context = await _store(request).get_trace_context(
+        trace_id, before=max(0, min(before, 10)), after=max(0, min(after, 10)),
+    )
+    if context is None:
+        raise HTTPException(status_code=404, detail="Trace 不存在")
+    return context
+
+
 @router.get("/projects/{project_id}/memory-patterns")
 async def list_memory_patterns(project_id: str, request: Request):
     """Expose reviewed and pending cross-memory patterns for future profile UI."""

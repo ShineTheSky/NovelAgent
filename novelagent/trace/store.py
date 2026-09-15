@@ -124,16 +124,21 @@ class TraceStore:
                 }
 
             imported_trace_ids: list[str] = []
+            previous_trace_id: str | None = None
             for offset in range(0, len(turns), 5):
                 batch = turns[offset:offset + 5]
                 trace_id = f"tr_{uuid.uuid4().hex}"
                 imported_trace_ids.append(trace_id)
                 await conn.execute(
                     """INSERT INTO traces
-                       (trace_id, session_id, project_id, user_message, status, final_answer, source, started_at, finished_at)
-                       VALUES (?, ?, ?, ?, 'completed', ?, 'historical', ?, ?)""",
-                    (trace_id, session_id, project_id, batch[-1]["user_content"], batch[-1]["assistant_content"], _now(), _now()),
+                       (trace_id, session_id, project_id, user_message, status, final_answer, source, turn_no,
+                        previous_trace_id, started_at, finished_at)
+                       VALUES (?, ?, ?, ?, 'completed', ?, 'historical', ?, ?, ?, ?)""",
+                    (trace_id, session_id, project_id, batch[-1]["user_content"], batch[-1]["assistant_content"],
+                     batch[-1]["turn_no"], previous_trace_id, _now(), _now()),
                 )
+                if previous_trace_id:
+                    await conn.execute("UPDATE traces SET next_trace_id = ? WHERE trace_id = ?", (trace_id, previous_trace_id))
                 sequence = 0
                 for turn in batch:
                     sequence += 1
@@ -156,6 +161,7 @@ class TraceStore:
                     "INSERT INTO trace_snapshots (trace_id, start_turn_no, end_turn_no, messages_json) VALUES (?, ?, ?, ?)",
                     (trace_id, batch[0]["turn_no"], batch[-1]["turn_no"], json.dumps(snapshot_messages, ensure_ascii=False)),
                 )
+                previous_trace_id = trace_id
 
             await conn.execute(
                 """INSERT INTO historical_trace_import_state
@@ -176,7 +182,7 @@ class TraceStore:
             await conn.close()
 
     async def append_session_turn(self, session_id: str, user_content: str, assistant_content: str,
-                                  events: list[dict] | None = None) -> int:
+                                  events: list[dict] | None = None, source_trace_id: str = "") -> int:
         conn = await get_connection()
         cursor = await conn.execute(
             "SELECT COALESCE(MAX(turn_no), 0) FROM session_trace_turns WHERE session_id = ?", (session_id,)
@@ -184,78 +190,73 @@ class TraceStore:
         row = await cursor.fetchone()
         turn_no = int(row[0]) + 1
         await conn.execute(
-            """INSERT INTO session_trace_turns (session_id, turn_no, user_content, assistant_content, events_json)
-               VALUES (?, ?, ?, ?, ?)""",
-            (session_id, turn_no, user_content, assistant_content, json.dumps(events or [], ensure_ascii=False)),
+            """INSERT INTO session_trace_turns
+               (session_id, turn_no, user_content, assistant_content, events_json, source_trace_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (session_id, turn_no, user_content, assistant_content, json.dumps(events or [], ensure_ascii=False), source_trace_id or None),
         )
+        if source_trace_id:
+            previous = await conn.execute(
+                """SELECT source_trace_id FROM session_trace_turns
+                   WHERE session_id = ? AND turn_no < ? AND source_trace_id IS NOT NULL
+                   ORDER BY turn_no DESC LIMIT 1""",
+                (session_id, turn_no),
+            )
+            previous_row = await previous.fetchone()
+            previous_trace_id = str(previous_row[0]) if previous_row and previous_row[0] else None
+            await conn.execute(
+                "UPDATE traces SET turn_no = ?, previous_trace_id = ? WHERE trace_id = ?",
+                (turn_no, previous_trace_id, source_trace_id),
+            )
+            if previous_trace_id:
+                await conn.execute("UPDATE traces SET next_trace_id = ? WHERE trace_id = ?", (source_trace_id, previous_trace_id))
         await conn.commit()
         await conn.close()
         return turn_no
 
-    async def capture_pending_trace(
-        self, session_id: str, project_id: str, messages: list[dict], token_count: int = 0
+    async def capture_pending_trace_window(
+        self, session_id: str, project_id: str, messages: list[dict], token_count: int = 0, reason: str = "interval",
     ) -> dict | None:
+        """Create an analysis window that references raw request traces without copying their events."""
         conn = await get_connection()
-        await conn.execute(
-            "INSERT OR IGNORE INTO session_trace_state (session_id) VALUES (?)", (session_id,)
-        )
-        cursor = await conn.execute(
-            "SELECT last_captured_turn FROM session_trace_state WHERE session_id = ?", (session_id,)
-        )
+        await conn.execute("INSERT OR IGNORE INTO session_trace_state (session_id) VALUES (?)", (session_id,))
+        cursor = await conn.execute("SELECT last_captured_turn FROM session_trace_state WHERE session_id = ?", (session_id,))
         state = await cursor.fetchone()
         start_turn_no = int(state[0]) + 1
         cursor = await conn.execute(
-            "SELECT turn_no, user_content, assistant_content, events_json FROM session_trace_turns WHERE session_id = ? AND turn_no >= ? ORDER BY turn_no",
+            """SELECT turn_no, source_trace_id FROM session_trace_turns
+               WHERE session_id = ? AND turn_no >= ? ORDER BY turn_no""",
             (session_id, start_turn_no),
         )
         turns = [dict(row) for row in await cursor.fetchall()]
-        await conn.close()
-        if not turns:
+        source_trace_ids = [str(turn["source_trace_id"]) for turn in turns if turn.get("source_trace_id")]
+        if not turns or not source_trace_ids:
+            await conn.close()
             return None
-
-        end_turn_no = turns[-1]["turn_no"]
-        trace_id = await self.create_trace(session_id, project_id, turns[-1]["user_content"])
-        sequence_no = 0
-        for turn in turns:
-            sequence_no += 1
-            await self.append_event(trace_id, sequence_no, "user_message", "user", {
-                "turn_no": turn["turn_no"], "content": turn["user_content"],
-            })
-            try:
-                deferred_events = json.loads(turn.get("events_json") or "[]")
-            except json.JSONDecodeError:
-                deferred_events = []
-            has_assistant_turn = False
-            for event in deferred_events if isinstance(deferred_events, list) else []:
-                if not isinstance(event, dict) or not event.get("event_type") or not event.get("actor"):
-                    continue
-                sequence_no += 1
-                has_assistant_turn |= event["event_type"] == "assistant_turn"
-                payload = dict(event.get("payload") or {})
-                payload["turn_no"] = turn["turn_no"]
-                await self.append_event(trace_id, sequence_no, str(event["event_type"]), str(event["actor"]), payload,
-                                        duration_ms=event.get("duration_ms"))
-            if not has_assistant_turn:
-                sequence_no += 1
-                await self.append_event(trace_id, sequence_no, "assistant_turn", "main_agent", {
-                    "turn_no": turn["turn_no"], "content": turn["assistant_content"],
-                })
-
-        conn = await get_connection()
+        end_turn_no = int(turns[-1]["turn_no"])
+        window_id = f"tw_{uuid.uuid4().hex}"
         await conn.execute(
-            "INSERT INTO trace_snapshots (trace_id, start_turn_no, end_turn_no, messages_json) VALUES (?, ?, ?, ?)",
-            (trace_id, start_turn_no, end_turn_no, json.dumps(messages, ensure_ascii=False)),
+            """INSERT INTO trace_analysis_windows
+               (window_id, session_id, project_id, start_turn_no, end_turn_no, reason, token_count, messages_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (window_id, session_id, project_id, start_turn_no, end_turn_no, reason, token_count,
+             json.dumps(messages, ensure_ascii=False)),
         )
+        for member_no, trace_id in enumerate(dict.fromkeys(source_trace_ids), start=1):
+            await conn.execute(
+                "INSERT INTO trace_window_members (window_id, trace_id, member_no) VALUES (?, ?, ?)",
+                (window_id, trace_id, member_no),
+            )
         await conn.execute(
             "UPDATE session_trace_state SET last_captured_turn = ? WHERE session_id = ?",
             (end_turn_no, session_id),
         )
         await conn.commit()
         await conn.close()
-        await self.finish_trace(trace_id, "completed", turns[-1]["assistant_content"], token_count)
-        operation_kind = await self.infer_operation_kind(trace_id)
-        return {"trace_id": trace_id, "start_turn_no": start_turn_no, "end_turn_no": end_turn_no,
-                "operation_kind": operation_kind, "messages": messages}
+        return {
+            "window_id": window_id, "start_turn_no": start_turn_no, "end_turn_no": end_turn_no,
+            "source_trace_ids": list(dict.fromkeys(source_trace_ids)), "messages": messages,
+        }
 
     async def pending_trace_turn_count(self, session_id: str) -> int:
         conn = await get_connection()
@@ -354,6 +355,85 @@ class TraceStore:
         row = await cursor.fetchone()
         await conn.close()
         return dict(row) if row else None
+
+    async def get_trace_context(self, trace_id: str, before: int = 2, after: int = 2) -> dict | None:
+        """Return one raw trace plus adjacent request traces from the same session."""
+        trace = await self.get_trace(trace_id)
+        if not trace:
+            return None
+        conn = await get_connection()
+        turn_no = trace.get("turn_no")
+        if turn_no is None:
+            cursor = await conn.execute(
+                "SELECT * FROM traces WHERE session_id = ? ORDER BY started_at DESC LIMIT ?",
+                (trace["session_id"], max(1, before + after + 1)),
+            )
+            rows = [dict(row) for row in await cursor.fetchall()]
+            await conn.close()
+            result = {"trace": trace, "previous": [], "next": [], "related": rows}
+            for item in rows:
+                item["events"] = await self.list_events(item["trace_id"], limit=500)
+            return result
+        cursor = await conn.execute(
+            """SELECT * FROM traces WHERE session_id = ? AND turn_no IS NOT NULL AND turn_no < ?
+               ORDER BY turn_no DESC LIMIT ?""",
+            (trace["session_id"], turn_no, max(0, before)),
+        )
+        previous = list(reversed([dict(row) for row in await cursor.fetchall()]))
+        cursor = await conn.execute(
+            """SELECT * FROM traces WHERE session_id = ? AND turn_no IS NOT NULL AND turn_no > ?
+               ORDER BY turn_no ASC LIMIT ?""",
+            (trace["session_id"], turn_no, max(0, after)),
+        )
+        following = [dict(row) for row in await cursor.fetchall()]
+        await conn.close()
+        result = {"trace": trace, "previous": previous, "next": following}
+        for item in [trace, *previous, *following]:
+            item["events"] = await self.list_events(item["trace_id"], limit=500)
+        return result
+
+    async def get_trace_window(self, window_id: str) -> dict | None:
+        conn = await get_connection()
+        cursor = await conn.execute("SELECT * FROM trace_analysis_windows WHERE window_id = ?", (window_id,))
+        row = await cursor.fetchone()
+        if row is None:
+            await conn.close()
+            return None
+        result = dict(row)
+        result["messages"] = json.loads(result.pop("messages_json") or "[]")
+        cursor = await conn.execute(
+            "SELECT trace_id FROM trace_window_members WHERE window_id = ? ORDER BY member_no ASC", (window_id,)
+        )
+        result["source_trace_ids"] = [str(member[0]) for member in await cursor.fetchall()]
+        await conn.close()
+        return result
+
+    async def list_trace_window_events(self, window_id: str, limit: int = 2_000) -> list[dict]:
+        conn = await get_connection()
+        cursor = await conn.execute(
+            """SELECT e.*, m.member_no FROM trace_window_members m
+               JOIN trace_events e ON e.trace_id = m.trace_id
+               WHERE m.window_id = ?
+               ORDER BY m.member_no ASC, e.sequence_no ASC LIMIT ?""",
+            (window_id, limit),
+        )
+        rows = await cursor.fetchall()
+        await conn.close()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json") or "{}")
+            result.append(item)
+        return result
+
+    async def set_trace_window_status(self, window_id: str, status: str) -> None:
+        conn = await get_connection()
+        await conn.execute(
+            "UPDATE trace_analysis_windows SET status = ?, finished_at = ? WHERE window_id = ?",
+            (status, _now(), window_id),
+        )
+        await conn.commit()
+        await conn.close()
 
     async def list_session_traces(self, session_id: str, limit: int = 50) -> list[dict]:
         conn = await get_connection()

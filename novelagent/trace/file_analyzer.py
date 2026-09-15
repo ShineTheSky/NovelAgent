@@ -14,14 +14,20 @@ class FileTraceAnalyzer:
         self.llm, self.workspace_dir, self.trace_store, self.embedding_gate = llm_client, workspace_dir, trace_store, embedding_gate
         self.rag_tool = SearchRagTool(rag_store) if rag_store else None
 
-    async def analyze(self, trace_id: str, project_id: str, branch_messages=None, _tools=None) -> None:
+    async def analyze(self, trace_id: str, project_id: str, branch_messages=None, _tools=None, *,
+                      events_override: list[dict] | None = None,
+                      source_trace_ids: list[str] | None = None) -> None:
         trace = await self.trace_store.get_trace(trace_id)
         if not trace or trace.get("analysis_status") == "skipped": return
-        events = await self.trace_store.list_events(trace_id, limit=500)
+        events = events_override if events_override is not None else await self.trace_store.list_events(trace_id, limit=500)
+        source_trace_ids = list(dict.fromkeys(source_trace_ids or [trace_id]))
+        event_trace_ids = {str(event.get("event_id")): str(event.get("trace_id") or trace_id) for event in events}
         if self.embedding_gate:
             inputs = [str(e.get("payload", {}).get("content", "")) for e in events if e["event_type"] == "user_message"]
             if (await self.embedding_gate.evaluate(inputs)).skip:
-                await self.trace_store.set_trace_operation(trace_id, "routine", "skipped"); return
+                for source_trace_id in source_trace_ids:
+                    await self.trace_store.set_trace_operation(source_trace_id, "routine", "skipped")
+                return
         files = FileLifecycleStore(self.workspace_dir, project_id)
         valid = {e["event_id"] for e in events}
         all_records = [(layer, record) for layer in ("evidence", "memory", "pattern") for record in files.list(layer)]
@@ -34,7 +40,7 @@ class FileTraceAnalyzer:
             "weight": x.get("weight", 0), "support_count": x.get("support_count", 1),
         } for layer, x in all_records if FileLifecycleStore.is_text_feedback(x)][:80]
         event_view = [self._event_summary(event) for event in events if self._keep_event(event)]
-        prompt = f'''[后台 Trace 分支命令]\n你从当前主对话的末尾分叉。不要回复用户、不要续写、不要调用工具，只分析 Trace `{trace_id}`。\n只输出 JSON：{{"needs_trace_context":false,"trace_context_ids":[],"items":[{{"event_id":"","type":"error|correction|confirmation|feedback","summary":"","confidence":0.5}}],"records":[{{"layer":"evidence|memory","category":"user|project|reference","domain":"writing|outline|overall","title":"不超过40字的简要标题","content":"具体事实、约束、适用条件和必要背景；text_feedback 时仅写 Agent 分析","claim":"与 title 一致","source_event_ids":[""],"signal":"weak|strong","relation":"new|support|append","related_id":"","confidence":0.5,"kind":"text_feedback 时填写","artifact_path":"可从工具事件推断时填写","artifact_revision_id":"","anchor_excerpt":"用户引用或评价的原文，最多700字","anchor_sha256":"工具事件提供时填写","feedback_analysis":"当前修改方向、观察、推测与待确认点","feedback_direction":"当前建议的修改方向","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict"}}]}}。\n不记录：普通闲聊、纯工具调用、一次性命令，例如“继续写作”“读取文件”。\nEvidence 是尚不足以长期生效的弱证据，例如用户单次说“这章对话节奏有点慢”；它保留来源，等待后续相似反馈支持。\nMemory 是明确、可复用的长期偏好、修正或约束，例如“以后打斗必须突出空间关系”，或“把林深的初始性格改为恐惧回避型”；这类记录 layer=memory、signal=strong。\n凡是由用户 correction 事件得出的记录，source_event_ids 必须包含该 user_message 的 event_id，且 layer=memory、signal=strong；不要用后续 assistant_turn 替代该证据。support 必须引用 Existing 的 memory id。\n\n文本修改反馈的特殊规则：当用户粘贴、引用或明确评价某段小说/大纲原文时，写 category=reference、kind=text_feedback，并从工具事件补足 artifact_path、修订和锚点。程序会根据 source_event_ids 保存用户完整原始输入；不要复述或截断用户原话。feedback_analysis 必须是结合旧记录后的当前修改方向、观察、推测与待确认点。与同一锚点/同一段原文的重复意见使用 relation=append、feedback_relation=same_anchor：只更新理解，绝不加分。仅当是不同但相似的文本，且用户修改方向能相互验证时，relation=support、feedback_relation=cross_text_support，才允许为 Existing text_feedback 加分。相同/相似文本但方向相反时用 append、feedback_relation=cross_text_conflict：记录反例与不确定性，不加分。是否同锚点、是否跨文本可迁移由你根据原文、用户引用和 Existing 自行判断。\nTrace events:{json.dumps(event_view, ensure_ascii=False)}\nExisting:{json.dumps(context, ensure_ascii=False)}\nExisting text feedback (full):{json.dumps(feedback_context, ensure_ascii=False)}'''
+        prompt = f'''[后台 Trace 分支命令]\n你从当前主对话的末尾分叉。不要回复用户、不要续写、不要调用工具，只分析原始 Trace：{json.dumps(source_trace_ids, ensure_ascii=False)}。每个 Trace event 都携带 trace_id；记录必须通过 source_event_ids 保留真实来源。\n只输出 JSON：{{"needs_trace_context":false,"trace_context_ids":[],"items":[{{"event_id":"","type":"error|correction|confirmation|feedback","summary":"","confidence":0.5}}],"records":[{{"layer":"evidence|memory","category":"user|project|reference","domain":"writing|outline|overall","title":"不超过40字的简要标题","content":"具体事实、约束、适用条件和必要背景；text_feedback 时仅写 Agent 分析","claim":"与 title 一致","source_event_ids":[""],"signal":"weak|strong","relation":"new|support|append","related_id":"","confidence":0.5,"kind":"text_feedback 时填写","artifact_path":"可从工具事件推断时填写","artifact_revision_id":"","anchor_excerpt":"用户引用或评价的原文，最多700字","anchor_sha256":"工具事件提供时填写","feedback_analysis":"当前修改方向、观察、推测与待确认点","feedback_direction":"当前建议的修改方向","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict"}}]}}。\n不记录：普通闲聊、纯工具调用、一次性命令，例如“继续写作”“读取文件”。\nEvidence 是尚不足以长期生效的弱证据，例如用户单次说“这章对话节奏有点慢”；它保留来源，等待后续相似反馈支持。\nMemory 是明确、可复用的长期偏好、修正或约束，例如“以后打斗必须突出空间关系”，或“把林深的初始性格改为恐惧回避型”；这类记录 layer=memory、signal=strong。\n凡是由用户 correction 事件得出的记录，source_event_ids 必须包含该 user_message 的 event_id，且 layer=memory、signal=strong；不要用后续 assistant_turn 替代该证据。support 必须引用 Existing 的 memory id。\n\n文本修改反馈的特殊规则：当用户粘贴、引用或明确评价某段小说/大纲原文时，写 category=reference、kind=text_feedback，并从工具事件补足 artifact_path、修订和锚点。程序会根据 source_event_ids 保存用户完整原始输入；不要复述或截断用户原话。feedback_analysis 必须是结合旧记录后的当前修改方向、观察、推测与待确认点。与同一锚点/同一段原文的重复意见使用 relation=append、feedback_relation=same_anchor：只更新理解，绝不加分。仅当是不同但相似的文本，且用户修改方向能相互验证时，relation=support、feedback_relation=cross_text_support，才允许为 Existing text_feedback 加分。相同/相似文本但方向相反时用 append、feedback_relation=cross_text_conflict：记录反例与不确定性，不加分。是否同锚点、是否跨文本可迁移由你根据原文、用户引用和 Existing 自行判断。\nTrace events:{json.dumps(event_view, ensure_ascii=False)}\nExisting:{json.dumps(context, ensure_ascii=False)}\nExisting text feedback (full):{json.dumps(feedback_context, ensure_ascii=False)}'''
         prompt = prompt.replace("user|project|reference", "user|project|reference|agent")
         prompt += "\n单次质疑异常工具或 Agent 行为（例如‘为什么调用 AskUserQuestion 工具’）属于 Evidence，category=agent；只有明确要求长期遵循的工具流程才属于 Memory。agent 分类只用于后续 Agent 优化，不能作为项目写作或大纲记忆。"
         prompt += "\n决定写入前必须先根据 Existing 选择候选：Evidence 只能与 Evidence 合并，低幅加分；Memory 可以与 Memory 或 Evidence 合并，高幅加分。Memory 候选还必须查看 Existing 中的 Pattern：若语义相同，relation=support、related_layer=pattern，直接为该 Pattern 加分，不重复新建 Pattern。records 可额外返回 related_layer=evidence|memory|pattern。被容量挤出的旧 Memory 在 Evidence 中保留 origin_memory_id，新的 Memory 可以将其重新提升。"
@@ -60,7 +66,14 @@ class FileTraceAnalyzer:
             "event_id": event["event_id"], "type": "feedback",
             "summary": "用户质疑 Agent 的工具调用或调度行为。", "confidence": 0.9,
         } for event in agent_feedback_events if event["event_id"] not in classified_ids)
-        await self.trace_store.save_trace_classification(trace_id, classifications)
+        classifications_by_trace: dict[str, list[dict]] = {}
+        for item in classifications:
+            source_trace_id = event_trace_ids.get(str(item.get("event_id")), trace_id)
+            classifications_by_trace.setdefault(source_trace_id, []).append(item)
+        for source_trace_id in source_trace_ids:
+            await self.trace_store.save_trace_classification(
+                source_trace_id, classifications_by_trace.get(source_trace_id, []),
+            )
         correction_ids = {item["event_id"] for item in classifications if item["type"] == "correction"}
         recorded_event_ids: set[str] = set()
         for item in data.get("records", []):
@@ -69,6 +82,8 @@ class FileTraceAnalyzer:
             claim = str(item.get("claim", "")).strip()
             layer = item.get("layer")
             if layer not in {"evidence", "memory"} or not ids or not claim: continue
+            record_trace_ids = list(dict.fromkeys(event_trace_ids.get(event_id, trace_id) for event_id in ids))
+            record_trace_id = record_trace_ids[-1]
             recorded_event_ids.update(ids)
             if any(event["event_id"] in ids for event in agent_feedback_events):
                 item["category"] = "agent"
@@ -81,7 +96,7 @@ class FileTraceAnalyzer:
             kind = str(item.get("kind") or "").strip()
             if kind == "text_feedback":
                 item["category"] = "reference"
-                user_inputs = self._user_inputs(events, ids, trace_id)
+                user_inputs = self._user_inputs(events, ids, record_trace_id)
                 if not user_inputs:
                     continue
                 feedback_relation = str(item.get("feedback_relation") or "same_anchor")
@@ -90,14 +105,15 @@ class FileTraceAnalyzer:
                 if related and not files.is_text_feedback(related):
                     related = None
                 if related:
-                    merged = files.merge_text_feedback(related, item, trace_id, ids, user_inputs)
+                    merged = files.merge_text_feedback(related, item, record_trace_id, ids, user_inputs)
+                    merged["trace_ids"] = list(dict.fromkeys([*merged.get("trace_ids", []), *record_trace_ids]))
                     if feedback_relation == "cross_text_support":
                         bonus = 35 if item.get("signal") == "strong" else 15
                         merged["weight"] = min(MAX_RECORD_WEIGHT, float(merged.get("weight", 0)) + bonus)
                         merged["support_count"] = int(merged.get("support_count", 1)) + 1
                     saved = files._move(merged, "memory") if layer == "memory" and related_layer == "evidence" else files.write(related_layer, merged)
                     if feedback_relation == "cross_text_support" and saved["layer"] == "memory" and saved["weight"] >= PATTERN_PROMOTION_WEIGHT and saved["support_count"] >= 3:
-                        files.write("pattern", {"title": saved.get("title", saved["claim"]), "claim": saved["claim"], "content": saved.get("content", saved["claim"]), "category": saved["category"], "domain": saved["domain"], "memory_ids": [saved["id"]], "trace_ids": [trace_id], "weight": saved["weight"], "support_count": saved["support_count"]})
+                        files.write("pattern", {"title": saved.get("title", saved["claim"]), "claim": saved["claim"], "content": saved.get("content", saved["claim"]), "category": saved["category"], "domain": saved["domain"], "memory_ids": [saved["id"]], "trace_ids": record_trace_ids, "weight": saved["weight"], "support_count": saved["support_count"]})
                 else:
                     analysis = str(item.get("feedback_analysis") or item.get("content") or claim).strip()
                     files.write(layer, {
@@ -110,8 +126,8 @@ class FileTraceAnalyzer:
                         "anchor_sha256": str(item.get("anchor_sha256") or ""),
                         "anchor_examples": [{"artifact_path": str(item.get("artifact_path") or "").replace("\\", "/").lstrip("./"), "artifact_revision_id": str(item.get("artifact_revision_id") or ""), "anchor_excerpt": str(item.get("anchor_excerpt") or "")[:700], "anchor_sha256": str(item.get("anchor_sha256") or "")}],
                         "feedback_direction": str(item.get("feedback_direction") or claim),
-                        "feedback_count": 1, "feedback_history": [{"trace_id": trace_id, "source_event_ids": ids, "feedback_direction": str(item.get("feedback_direction") or ""), "relation": feedback_relation}], "user_inputs": user_inputs,
-                        "trace_id": trace_id, "trace_ids": [trace_id], "source_event_ids": ids,
+                        "feedback_count": 1, "feedback_history": [{"trace_id": record_trace_id, "source_event_ids": ids, "feedback_direction": str(item.get("feedback_direction") or ""), "relation": feedback_relation}], "user_inputs": user_inputs,
+                        "trace_id": record_trace_id, "trace_ids": record_trace_ids, "source_event_ids": ids,
                         "confidence": item.get("confidence", .5), "weight": 65 if item.get("signal") == "strong" else 15, "support_count": 1,
                     })
                 continue
@@ -121,19 +137,19 @@ class FileTraceAnalyzer:
                 bonus = 35 if item.get("signal") == "strong" else 15
                 related["weight"] = min(MAX_RECORD_WEIGHT, float(related.get("weight", 0)) + bonus)
                 related["support_count"] = int(related.get("support_count", 1)) + 1
-                related["trace_id"] = trace_id
+                related["trace_id"] = record_trace_id
                 related["source_event_ids"] = list(dict.fromkeys([*related.get("source_event_ids", []), *ids]))
-                related["trace_ids"] = list(dict.fromkeys([*related.get("trace_ids", []), trace_id]))
+                related["trace_ids"] = list(dict.fromkeys([*related.get("trace_ids", []), *record_trace_ids]))
                 saved = files._move(related, "memory") if layer == "memory" and related_layer == "evidence" else files.write(related_layer, related)
                 if layer == "evidence" and saved["weight"] >= 60 and saved["support_count"] >= 3:
                     saved = files._move(saved, "memory")
                 if saved["layer"] == "memory" and saved["weight"] >= PATTERN_PROMOTION_WEIGHT and saved["support_count"] >= 3:
-                    files.write("pattern", {"title": saved.get("title", saved["claim"]), "claim": saved["claim"], "content": saved.get("content", saved["claim"]), "category": saved["category"], "domain": saved["domain"], "memory_ids": [saved["id"]], "trace_ids": [trace_id], "weight": saved["weight"], "support_count": saved["support_count"]})
+                    files.write("pattern", {"title": saved.get("title", saved["claim"]), "claim": saved["claim"], "content": saved.get("content", saved["claim"]), "category": saved["category"], "domain": saved["domain"], "memory_ids": [saved["id"]], "trace_ids": record_trace_ids, "weight": saved["weight"], "support_count": saved["support_count"]})
             else:
-                files.write(layer, {"title": item.get("title", claim), "claim": claim, "content": item.get("content", claim), "category": item.get("category", "project"), "domain": item.get("domain", "overall"), "trace_id": trace_id, "source_event_ids": ids, "confidence": item.get("confidence", .5), "weight": 65 if item.get("signal") == "strong" else 15, "support_count": 1})
+                files.write(layer, {"title": item.get("title", claim), "claim": claim, "content": item.get("content", claim), "category": item.get("category", "project"), "domain": item.get("domain", "overall"), "trace_id": record_trace_id, "trace_ids": record_trace_ids, "source_event_ids": ids, "confidence": item.get("confidence", .5), "weight": 65 if item.get("signal") == "strong" else 15, "support_count": 1})
         for event in agent_feedback_events:
             already_recorded = any(
-                item.get("trace_id") == trace_id and event["event_id"] in item.get("source_event_ids", [])
+                item.get("trace_id") == event_trace_ids.get(event["event_id"], trace_id) and event["event_id"] in item.get("source_event_ids", [])
                 for item in files.list("evidence")
             )
             if event["event_id"] not in recorded_event_ids and not already_recorded:
@@ -141,12 +157,42 @@ class FileTraceAnalyzer:
                     "title": "核查 AskUserQuestion 调用时机",
                     "claim": "用户质疑 Agent 对 AskUserQuestion 工具的调用时机，需要在后续调度优化中核查。",
                     "content": "用户质疑 Agent 对 AskUserQuestion 工具的调用时机，需要在后续调度优化中核查。",
-                    "category": "agent", "domain": "overall", "trace_id": trace_id,
+                    "category": "agent", "domain": "overall", "trace_id": event_trace_ids.get(event["event_id"], trace_id),
+                    "trace_ids": [event_trace_ids.get(event["event_id"], trace_id)],
                     "source_event_ids": [event["event_id"]], "confidence": 0.9,
                     "weight": 15, "support_count": 1,
                 })
         files.rebuild_indexes()
-        await self.trace_store.set_trace_analysis_status(trace_id, "complete")
+        for source_trace_id in source_trace_ids:
+            await self.trace_store.set_trace_analysis_status(source_trace_id, "complete")
+
+    async def analyze_window(self, window_id: str, project_id: str, branch_messages=None, _tools=None) -> None:
+        """Analyze a five-turn window without inventing a second aggregate Trace.
+
+        A window is only an ordered set of raw request traces.  Each raw trace
+        remains the provenance anchor for classifications and file-backed
+        records; the shared snapshot gives every extraction call the same
+        surrounding conversation context.
+        """
+        window = await self.trace_store.get_trace_window(window_id)
+        if not window:
+            return
+        await self.trace_store.set_trace_window_status(window_id, "running")
+        try:
+            source_trace_ids = window.get("source_trace_ids", [])
+            if not source_trace_ids:
+                await self.trace_store.set_trace_window_status(window_id, "complete")
+                return
+            events = await self.trace_store.list_trace_window_events(window_id)
+            messages = branch_messages if branch_messages is not None else window.get("messages", [])
+            await self.analyze(
+                source_trace_ids[-1], project_id, messages, _tools,
+                events_override=events, source_trace_ids=source_trace_ids,
+            )
+            await self.trace_store.set_trace_window_status(window_id, "complete")
+        except Exception:
+            await self.trace_store.set_trace_window_status(window_id, "failed")
+            raise
 
     async def _extract(self, prompt: str, branch_messages) -> str:
         text = ""
@@ -258,7 +304,11 @@ class FileTraceAnalyzer:
                 continue
             content = str((event.get("payload") or {}).get("content") or "").strip()
             if content:
-                selected.append({"trace_id": trace_id, "event_id": event["event_id"], "content": content})
+                selected.append({
+                    "trace_id": str(event.get("trace_id") or trace_id),
+                    "event_id": event["event_id"],
+                    "content": content,
+                })
         return selected
 
     @staticmethod
@@ -269,7 +319,7 @@ class FileTraceAnalyzer:
     @staticmethod
     def _event_summary(event: dict) -> dict:
         payload = event.get("payload", {}) or {}
-        result = {"event_id": event["event_id"], "type": event.get("event_type", "")}
+        result = {"event_id": event["event_id"], "trace_id": event.get("trace_id", ""), "type": event.get("event_type", "")}
         content = payload.get("content") or payload.get("message")
         if content:
             result["content"] = str(content)[:1200]

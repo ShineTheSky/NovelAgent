@@ -142,6 +142,8 @@ class SubAgentRunner:
             except Exception as e:
                 return False, "", str(e)
 
+        result_text = ""
+        empty_result = True
         try:
             async for ev in query(
                 self.llm, position="sub_agent", messages=initial_messages,
@@ -163,10 +165,14 @@ class SubAgentRunner:
                     yield ResponseChunk(type="error", data={**src, "message": f"子Agent执行失败: {ev['error']}"})
                     return
                 elif ev["type"] == "result":
+                    empty_result = not ev["final_text"].strip()
                     result_text = ev["final_text"].strip() or "(子Agent未返回内容)"
         except Exception as e:
             yield ResponseChunk(type="error", data={**src, "message": f"子Agent执行失败: {e}"})
             return
 
         print(f"[sub/{preset_name}] 完成: result_len={len(result_text)} preview={result_text[:100]}...", flush=True)
-        yield ResponseChunk(type="subagent_done", data={**src, "result": result_text, "revision_events": revision_events})
+        yield ResponseChunk(type="subagent_done", data={
+            **src, "result": result_text, "empty_result": empty_result,
+            "revision_events": revision_events,
+        })

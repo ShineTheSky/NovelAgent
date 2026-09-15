@@ -112,6 +112,7 @@ class ReviewPolishWorkflow:
         )
         reviewer_result = ""
         reviewer_completed = False
+        reviewer_empty = False
         async for chunk in self.runner.spawn_and_run(
             "reviewer", reviewer_task, parent_session, False,
             extra_context=memory_context, artifact_context=artifact_context,
@@ -121,13 +122,15 @@ class ReviewPolishWorkflow:
         ):
             if chunk.type == "subagent_done":
                 reviewer_result = chunk.data.get("result", "")
-                reviewer_completed = not reviewer_result.startswith("Error:")
+                reviewer_empty = bool(chunk.data.get("empty_result")) or not reviewer_result.strip()
+                reviewer_completed = not reviewer_empty and not reviewer_result.startswith("Error:")
             yield ResponseChunk(type=chunk.type, data={**chunk.data, "workflow": "auto_review"})
 
         if not reviewer_completed:
             yield ResponseChunk(type="error", data={
                 "message": "自动审阅未完成，已停止自动润色；原章节保持在写作版本。",
                 "workflow": "auto_review",
+                "failure_kind": "empty_response" if reviewer_empty else "subagent_failure",
             })
             return
 
@@ -138,10 +141,24 @@ class ReviewPolishWorkflow:
             "expected_revision_id。完成写入后简述修改内容。\n\n"
             f"## 审阅报告\n{reviewer_result}\n\n## 原写作任务（仅作意图参考）\n{writer_task}"
         )
+        polisher_result = ""
+        polisher_completed = False
+        polisher_empty = False
         async for chunk in self.runner.spawn_and_run(
             "chapter_polisher", polisher_task, parent_session, False,
             extra_context=memory_context, artifact_context=artifact_context,
             actor="polisher", operation_id=f"{operation_id}:polish",
             parent_run_id=parent_run_id, workflow="auto_polish",
         ):
+            if chunk.type == "subagent_done":
+                polisher_result = chunk.data.get("result", "")
+                polisher_empty = bool(chunk.data.get("empty_result")) or not polisher_result.strip()
+                polisher_completed = not polisher_empty and not polisher_result.startswith("Error:")
             yield ResponseChunk(type=chunk.type, data={**chunk.data, "workflow": "auto_polish"})
+
+        if not polisher_completed:
+            yield ResponseChunk(type="error", data={
+                "message": "自动润色未返回结果；章节保留在润色前版本或已写入版本，需人工核查。",
+                "workflow": "auto_polish",
+                "failure_kind": "empty_response" if polisher_empty else "subagent_failure",
+            })

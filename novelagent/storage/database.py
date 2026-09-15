@@ -78,6 +78,9 @@ async def init():
         await _ensure_column(db, "traces", "source", "TEXT NOT NULL DEFAULT 'live'")
         await _ensure_column(db, "traces", "operation_kind", "TEXT NOT NULL DEFAULT 'conversation'")
         await _ensure_column(db, "traces", "analysis_status", "TEXT NOT NULL DEFAULT 'pending'")
+        await _ensure_column(db, "traces", "turn_no", "INTEGER")
+        await _ensure_column(db, "traces", "previous_trace_id", "TEXT")
+        await _ensure_column(db, "traces", "next_trace_id", "TEXT")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS session_trace_turns (
                 session_id TEXT NOT NULL,
@@ -90,6 +93,7 @@ async def init():
             )
         """)
         await _ensure_column(db, "session_trace_turns", "events_json", "TEXT NOT NULL DEFAULT '[]'")
+        await _ensure_column(db, "session_trace_turns", "source_trace_id", "TEXT")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS session_trace_state (
                 session_id TEXT PRIMARY KEY,
@@ -104,6 +108,49 @@ async def init():
                 end_turn_no INTEGER NOT NULL,
                 messages_json TEXT NOT NULL DEFAULT '[]',
                 FOREIGN KEY (trace_id) REFERENCES traces(trace_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS trace_analysis_windows (
+                window_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                start_turn_no INTEGER NOT NULL,
+                end_turn_no INTEGER NOT NULL,
+                reason TEXT NOT NULL DEFAULT 'interval',
+                status TEXT NOT NULL DEFAULT 'pending',
+                token_count INTEGER NOT NULL DEFAULT 0,
+                messages_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                finished_at TEXT,
+                FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS trace_window_members (
+                window_id TEXT NOT NULL,
+                trace_id TEXT NOT NULL,
+                member_no INTEGER NOT NULL,
+                PRIMARY KEY (window_id, trace_id),
+                FOREIGN KEY (window_id) REFERENCES trace_analysis_windows(window_id),
+                FOREIGN KEY (trace_id) REFERENCES traces(trace_id)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_traces_session_turn ON traces(session_id, turn_no)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_trace_window_members_trace ON trace_window_members(trace_id)")
+        # Legacy Bad Case records retain their original payloads.  This table
+        # stores only a separately verified link to a real request Trace.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bad_case_trace_links (
+                bad_case_trace_id TEXT PRIMARY KEY,
+                legacy_source_trace_id TEXT NOT NULL DEFAULT '',
+                resolved_trace_id TEXT,
+                status TEXT NOT NULL DEFAULT 'unmapped_legacy',
+                match_method TEXT NOT NULL DEFAULT '',
+                candidate_trace_ids_json TEXT NOT NULL DEFAULT '[]',
+                linked_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (bad_case_trace_id) REFERENCES traces(trace_id),
+                FOREIGN KEY (resolved_trace_id) REFERENCES traces(trace_id)
             )
         """)
         await db.execute("""
