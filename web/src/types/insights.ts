@@ -11,12 +11,17 @@ export interface LifecycleRecord {
   source_event_ids?: string[];
   weight: number;
   support_count?: number;
+  promotion_status?: 'auto' | 'manual_review';
+  downgrade_reason?: string;
+  manual_downgraded_at?: string;
+  manual_review_cancelled_at?: string;
   updated: string;
   file_path: string;
   content?: string;
 }
 
 export interface MemoryPattern {
+
   pattern_id: string;
   project_id: string;
   kind: 'preference' | 'issue';

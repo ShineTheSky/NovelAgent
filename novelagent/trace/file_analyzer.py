@@ -31,21 +31,27 @@ class FileTraceAnalyzer:
         files = FileLifecycleStore(self.workspace_dir, project_id)
         valid = {e["event_id"] for e in events}
         all_records = [(layer, record) for layer in ("evidence", "memory", "pattern") for record in files.list(layer)]
-        context = [{"id": x["id"], "title": x.get("title", x.get("claim", "")), "layer": layer, "domain": x.get("domain", "overall"), "weight": x.get("weight", 0), "support_count": x.get("support_count", 1), "downgraded_from": x.get("downgraded_from", "")} for layer, x in all_records[:240]]
+        context = [{"id": x["id"], "title": x.get("title", x.get("claim", "")), "layer": layer, "domain": x.get("domain", "overall"), "weight": x.get("weight", 0), "support_count": x.get("support_count", 1), "promotion_status": x.get("promotion_status", "auto"), "downgraded_from": x.get("downgraded_from", "")} for layer, x in all_records[:240]]
         feedback_context = [{
             "id": x["id"], "layer": layer, "title": x.get("title", ""),
             "artifact_path": x.get("artifact_path", ""), "anchor_excerpt": str(x.get("anchor_excerpt", ""))[:700],
-            "feedback_direction": x.get("feedback_direction", ""), "content": str(x.get("content", ""))[:1600],
+            "user_requirements": x.get("user_requirements", ""),
+            "revision_direction": x.get("revision_direction", x.get("feedback_direction", "")),
+            "content": str(x.get("content", ""))[:1600],
             "trace_ids": x.get("trace_ids", []), "source_event_ids": x.get("source_event_ids", []),
             "weight": x.get("weight", 0), "support_count": x.get("support_count", 1),
+            "promotion_status": x.get("promotion_status", "auto"),
         } for layer, x in all_records if FileLifecycleStore.is_text_feedback(x)][:80]
+
         event_view = [self._event_summary(event) for event in events if self._keep_event(event)]
-        prompt = f'''[后台 Trace 分支命令]\n你从当前主对话的末尾分叉。不要回复用户、不要续写、不要调用工具，只分析原始 Trace：{json.dumps(source_trace_ids, ensure_ascii=False)}。每个 Trace event 都携带 trace_id；记录必须通过 source_event_ids 保留真实来源。\n只输出 JSON：{{"needs_trace_context":false,"trace_context_ids":[],"items":[{{"event_id":"","type":"error|correction|confirmation|feedback","summary":"","confidence":0.5}}],"records":[{{"layer":"evidence|memory","category":"user|project|reference","domain":"writing|outline|overall","title":"不超过40字的简要标题","content":"具体事实、约束、适用条件和必要背景；text_feedback 时仅写 Agent 分析","claim":"与 title 一致","source_event_ids":[""],"signal":"weak|strong","relation":"new|support|append","related_id":"","confidence":0.5,"kind":"text_feedback 时填写","artifact_path":"可从工具事件推断时填写","artifact_revision_id":"","anchor_excerpt":"用户引用或评价的原文，最多700字","anchor_sha256":"工具事件提供时填写","feedback_analysis":"当前修改方向、观察、推测与待确认点","feedback_direction":"当前建议的修改方向","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict"}}]}}。\n不记录：普通闲聊、纯工具调用、一次性命令，例如“继续写作”“读取文件”。\nEvidence 是尚不足以长期生效的弱证据，例如用户单次说“这章对话节奏有点慢”；它保留来源，等待后续相似反馈支持。\nMemory 是明确、可复用的长期偏好、修正或约束，例如“以后打斗必须突出空间关系”，或“把林深的初始性格改为恐惧回避型”；这类记录 layer=memory、signal=strong。\n凡是由用户 correction 事件得出的记录，source_event_ids 必须包含该 user_message 的 event_id，且 layer=memory、signal=strong；不要用后续 assistant_turn 替代该证据。support 必须引用 Existing 的 memory id。\n\n文本修改反馈的特殊规则：当用户粘贴、引用或明确评价某段小说/大纲原文时，写 category=reference、kind=text_feedback，并从工具事件补足 artifact_path、修订和锚点。程序会根据 source_event_ids 保存用户完整原始输入；不要复述或截断用户原话。feedback_analysis 必须是结合旧记录后的当前修改方向、观察、推测与待确认点。与同一锚点/同一段原文的重复意见使用 relation=append、feedback_relation=same_anchor：只更新理解，绝不加分。仅当是不同但相似的文本，且用户修改方向能相互验证时，relation=support、feedback_relation=cross_text_support，才允许为 Existing text_feedback 加分。相同/相似文本但方向相反时用 append、feedback_relation=cross_text_conflict：记录反例与不确定性，不加分。是否同锚点、是否跨文本可迁移由你根据原文、用户引用和 Existing 自行判断。\nTrace events:{json.dumps(event_view, ensure_ascii=False)}\nExisting:{json.dumps(context, ensure_ascii=False)}\nExisting text feedback (full):{json.dumps(feedback_context, ensure_ascii=False)}'''
+        prompt = f'''[后台 Trace 分支命令]\n你从当前主对话的末尾分叉。不要回复用户、不要续写、不要调用工具，只分析原始 Trace：{json.dumps(source_trace_ids, ensure_ascii=False)}。每个 Trace event 都携带 trace_id；记录必须通过 source_event_ids 保留真实来源。\n只输出 JSON：{{"needs_trace_context":false,"trace_context_ids":[],"items":[{{"event_id":"","type":"error|correction|confirmation|feedback","summary":"","confidence":0.5}}],"records":[{{"layer":"evidence|memory","category":"user|project|reference","domain":"writing|outline|overall","title":"不超过40字的简要标题","content":"具体事实、约束、适用条件和必要背景","claim":"与 title 一致","source_event_ids":[""],"signal":"weak|strong","relation":"new|support|append","related_id":"","confidence":0.5,"kind":"text_feedback 时填写","artifact_path":"可从工具事件推断时填写","artifact_revision_id":"","anchor_excerpt":"用户引用或评价的原文，最多700字","anchor_sha256":"工具事件提供时填写","user_requirements":"综合历次反馈后，用户希望该段达到什么效果以及明确禁止什么","revision_direction":"后续应如何修改，包括措辞、情节、人物表现和节奏等方向","feedback_direction":"兼容字段，填写当前建议的修改方向","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict","explicit_reconfirmation":false}}]}}。\n不记录：普通闲聊、纯工具调用、一次性命令，例如“继续写作”“读取文件”。\nEvidence 是尚不足以长期生效的弱证据，例如用户单次说“这章对话节奏有点慢”；它保留来源，等待后续相似反馈支持。\nMemory 是明确、可复用的长期偏好、修正或约束，例如“以后打斗必须突出空间关系”，或“把林深的初始性格改为恐惧回避型”；这类记录 layer=memory、signal=strong。\n凡是由用户 correction 事件得出的记录，source_event_ids 必须包含该 user_message 的 event_id，且 layer=memory、signal=strong；不要用后续 assistant_turn 替代该证据。support 必须引用 Existing 的 memory id。\n\n文本修改反馈的特殊规则：当用户粘贴、引用或明确评价某段小说/大纲原文时，写 category=reference、kind=text_feedback，并从工具事件补足 artifact_path、修订和锚点。程序会根据 source_event_ids 保存用户完整原始输入；不要复述或截断用户原话。user_requirements 必须综合历次反馈，提炼用户希望该段达到的效果和明确禁止项；revision_direction 必须总结后续具体修改方向，而不是生成原文摘要。与同一锚点/同一段原文的重复意见使用 relation=append、feedback_relation=same_anchor：只追加历史并更新这两个字段，绝不加分。仅当是不同但相似的文本，且用户修改方向能相互验证时，relation=support、feedback_relation=cross_text_support，才允许为 Existing text_feedback 加分。相同/相似文本但方向相反时用 append、feedback_relation=cross_text_conflict：记录反例与不确定性，不加分。是否同锚点、是否跨文本可迁移由你根据原文、用户引用和 Existing 自行判断。\nTrace events:{json.dumps(event_view, ensure_ascii=False)}\nExisting:{json.dumps(context, ensure_ascii=False)}\nExisting text feedback (full):{json.dumps(feedback_context, ensure_ascii=False)}'''
+
         prompt = prompt.replace("user|project|reference", "user|project|reference|agent")
         prompt += "\n单次质疑异常工具或 Agent 行为（例如‘为什么调用 AskUserQuestion 工具’）属于 Evidence，category=agent；只有明确要求长期遵循的工具流程才属于 Memory。agent 分类只用于后续 Agent 优化，不能作为项目写作或大纲记忆。"
         prompt += "\n决定写入前必须先根据 Existing 选择候选：Evidence 只能与 Evidence 合并，低幅加分；Memory 可以与 Memory 或 Evidence 合并，高幅加分。Memory 候选还必须查看 Existing 中的 Pattern：若语义相同，relation=support、related_layer=pattern，直接为该 Pattern 加分，不重复新建 Pattern。records 可额外返回 related_layer=evidence|memory|pattern。被容量挤出的旧 Memory 在 Evidence 中保留 origin_memory_id，新的 Memory 可以将其重新提升。"
-        prompt += "\nExisting 的 downgraded_from 表示用户曾手动降级：该条可能不符合当前偏好或需要重新验证。除非用户本轮明确重新确认，只能用 signal=weak 的低幅证据支持它，不能直接恢复高优先级。"
-        prompt += "\n每条 records 还必须提供 title 和 content：title 是不超过 40 字、可用于索引和列表的简要标题；content 是可独立理解的具体事实、约束、适用条件和必要背景。claim 保持与 title 一致，用于兼容旧记录。text_feedback 的 content 只写当前 Agent 分析；程序会保存 source_event_ids 对应的完整用户原始输入并与分析一起落盘。若仅凭这些原始输入、当前 Trace 和已有分析无法判断，顶层额外返回 needs_trace_context:true 及 trace_context_ids（只能选 Existing text feedback 已列出的 trace_id）；程序才会回查这些 Trace 的局部上下文并让你重新输出完整 JSON。"
+        prompt += "\npromotion_status=manual_review 表示用户曾手动降级并持有不同意见。后续证据仍可追加，但程序禁止自动晋级。只有用户本轮明确重新确认该记录可作为更高等级规则时，才设置 explicit_reconfirmation=true；不得根据普通支持或相似表述自行解除。"
+        prompt += "\n每条 records 还必须提供 title 和 content：title 是不超过 40 字、可用于索引和列表的简要标题；content 是可独立理解的具体事实、约束、适用条件和必要背景。claim 保持与 title 一致，用于兼容旧记录。text_feedback 必须提供 user_requirements 和 revision_direction；程序会保存 source_event_ids 对应的完整用户原始输入并将三部分一起落盘。若仅凭这些原始输入、当前 Trace 和已有记录无法判断，顶层额外返回 needs_trace_context:true 及 trace_context_ids（只能选 Existing text feedback 已列出的 trace_id）；程序才会回查这些 Trace 的局部上下文并让你重新输出完整 JSON。"
+
         data = self._json(await self._extract(prompt, branch_messages))
         if data.get("needs_trace_context"):
             extra_context = await self._requested_trace_context(data, feedback_context, project_id)
@@ -107,19 +113,26 @@ class FileTraceAnalyzer:
                 if related:
                     merged = files.merge_text_feedback(related, item, record_trace_id, ids, user_inputs)
                     merged["trace_ids"] = list(dict.fromkeys([*merged.get("trace_ids", []), *record_trace_ids]))
+                    if item.get("explicit_reconfirmation") is True:
+                        merged = files.confirm_auto_promotion(merged)
                     if feedback_relation == "cross_text_support":
                         bonus = 35 if item.get("signal") == "strong" else 15
                         merged["weight"] = min(MAX_RECORD_WEIGHT, float(merged.get("weight", 0)) + bonus)
                         merged["support_count"] = int(merged.get("support_count", 1)) + 1
-                    saved = files._move(merged, "memory") if layer == "memory" and related_layer == "evidence" else files.write(related_layer, merged)
-                    if feedback_relation == "cross_text_support" and saved["layer"] == "memory" and saved["weight"] >= PATTERN_PROMOTION_WEIGHT and saved["support_count"] >= 3:
-                        files.write("pattern", {"title": saved.get("title", saved["claim"]), "claim": saved["claim"], "content": saved.get("content", saved["claim"]), "category": saved["category"], "domain": saved["domain"], "memory_ids": [saved["id"]], "trace_ids": record_trace_ids, "weight": saved["weight"], "support_count": saved["support_count"]})
+                    can_promote = files.can_auto_promote(merged)
+                    saved = files._move(merged, "memory") if layer == "memory" and related_layer == "evidence" and can_promote else files.write(related_layer, merged)
+                    if feedback_relation == "cross_text_support" and saved["layer"] == "memory" and files.can_auto_promote(saved) and saved["weight"] >= PATTERN_PROMOTION_WEIGHT and saved["support_count"] >= 3:
+                        files.promote_memory_to_pattern(saved, record_trace_ids)
                 else:
-                    analysis = str(item.get("feedback_analysis") or item.get("content") or claim).strip()
+
+                    user_requirements = str(item.get("user_requirements") or "").strip()
+                    revision_direction = str(item.get("revision_direction") or item.get("feedback_direction") or item.get("content") or claim).strip()
                     files.write(layer, {
                         "title": item.get("title", claim), "claim": claim,
-                        "content": files.render_text_feedback_content(analysis, user_inputs), "feedback_analysis": analysis,
+                        "content": files.render_text_feedback_content(user_requirements, revision_direction, user_inputs),
+                        "user_requirements": user_requirements, "revision_direction": revision_direction,
                         "category": "reference", "domain": item.get("domain", "overall"), "kind": "text_feedback",
+
                         "artifact_path": str(item.get("artifact_path") or "").replace("\\", "/").lstrip("./"),
                         "artifact_revision_id": str(item.get("artifact_revision_id") or ""),
                         "anchor_excerpt": str(item.get("anchor_excerpt") or "")[:700],
@@ -140,13 +153,18 @@ class FileTraceAnalyzer:
                 related["trace_id"] = record_trace_id
                 related["source_event_ids"] = list(dict.fromkeys([*related.get("source_event_ids", []), *ids]))
                 related["trace_ids"] = list(dict.fromkeys([*related.get("trace_ids", []), *record_trace_ids]))
-                saved = files._move(related, "memory") if layer == "memory" and related_layer == "evidence" else files.write(related_layer, related)
-                if layer == "evidence" and saved["weight"] >= 60 and saved["support_count"] >= 3:
+                if item.get("explicit_reconfirmation") is True:
+                    related = files.confirm_auto_promotion(related)
+                can_promote = files.can_auto_promote(related)
+                saved = files._move(related, "memory") if layer == "memory" and related_layer == "evidence" and can_promote else files.write(related_layer, related)
+                if layer == "evidence" and files.can_auto_promote(saved) and saved["weight"] >= 60 and saved["support_count"] >= 3:
                     saved = files._move(saved, "memory")
-                if saved["layer"] == "memory" and saved["weight"] >= PATTERN_PROMOTION_WEIGHT and saved["support_count"] >= 3:
-                    files.write("pattern", {"title": saved.get("title", saved["claim"]), "claim": saved["claim"], "content": saved.get("content", saved["claim"]), "category": saved["category"], "domain": saved["domain"], "memory_ids": [saved["id"]], "trace_ids": record_trace_ids, "weight": saved["weight"], "support_count": saved["support_count"]})
+                if saved["layer"] == "memory" and files.can_auto_promote(saved) and saved["weight"] >= PATTERN_PROMOTION_WEIGHT and saved["support_count"] >= 3:
+                    files.promote_memory_to_pattern(saved, record_trace_ids)
             else:
+
                 files.write(layer, {"title": item.get("title", claim), "claim": claim, "content": item.get("content", claim), "category": item.get("category", "project"), "domain": item.get("domain", "overall"), "trace_id": record_trace_id, "trace_ids": record_trace_ids, "source_event_ids": ids, "confidence": item.get("confidence", .5), "weight": 65 if item.get("signal") == "strong" else 15, "support_count": 1})
+
         for event in agent_feedback_events:
             already_recorded = any(
                 item.get("trace_id") == event_trace_ids.get(event["event_id"], trace_id) and event["event_id"] in item.get("source_event_ids", [])
@@ -248,9 +266,11 @@ class FileTraceAnalyzer:
         })
         messages.append({"role": "user", "content": (
             "根据本次临时检索结果完成核查。现在不得再调用工具；只输出完整的最终 JSON。\\n"
-            "资料库结果不得进入任何 JSON 字段，也不得单独增加权重。若检索不足以消除不确定性，在 feedback_analysis 中保留待确认点。"
+            "资料库结果不得进入任何 JSON 字段，也不得单独增加权重。若检索不足以消除不确定性，"
+            "在 user_requirements 或 revision_direction 中明确保留待确认点。"
         )})
         return self._json(await self._chat_text(messages, position)) or candidate
+
 
     async def _chat_with_tools(self, messages: list[dict], position: str) -> tuple[str, list]:
         text, calls = "", []

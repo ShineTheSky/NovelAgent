@@ -27,7 +27,7 @@ security:
 session:
   token_limit: 150000           # 消息列表Token上限
   compression_threshold: 0.8    # 压缩触发阈值（80%）
-  max_turns: 20                # 单次任务最大循环轮次
+  max_turns: 30                # 单次任务最大循环轮次
 
 # Agent Loop 配置
 agent:

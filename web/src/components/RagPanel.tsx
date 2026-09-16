@@ -175,7 +175,7 @@ export function RagPanel({ onClose }: RagPanelProps) {
         </div>
         {error && <div className="mt-2 rounded-md bg-red-50 px-2 py-1.5 text-xs text-red-600">{error}</div>}
         {embeddingMessage && <div className="mt-2 rounded-md bg-emerald-50 px-2 py-1.5 text-xs text-emerald-700">{embeddingMessage}</div>}
-        {results.length > 0 && <div className="mt-3 border-t border-gray-100 pt-3"><div className="mb-2 text-[11px] font-medium text-gray-500">检索结果</div><div className="max-h-[28rem] space-y-2 overflow-y-auto pr-1">{results.map(result => <article key={result.chunk_id} className="relative rounded-md bg-gray-50 p-2.5 pr-28 text-xs text-gray-600"><div className="absolute right-2 top-2 flex flex-col items-end gap-1 text-[10px] font-medium"><span className={`rounded px-1.5 py-0.5 ${scoreClass(result.score)}`}>混合 {formatScore(result.score)}</span><span className="rounded bg-violet-100 px-1.5 py-0.5 text-violet-700">Emb {result.embedding_score === null ? '—' : formatScore(result.embedding_score)}</span><span className="rounded bg-sky-100 px-1.5 py-0.5 text-sky-700">BM25 {formatScore(result.bm25_score)}</span></div><div className="mb-1 truncate pr-2 font-medium text-gray-700">{result.title}</div><div className="whitespace-pre-wrap leading-5">{result.content}</div></article>)}</div></div>}
+        {results.length > 0 && <div className="mt-3 border-t border-gray-100 pt-3"><div className="mb-2 text-[11px] font-medium text-gray-500">检索结果</div><div className="max-h-[28rem] space-y-2 overflow-y-auto pr-1">{results.map(result => <article key={result.chunk_id} className="relative rounded-md bg-gray-50 p-2.5 pr-28 text-xs text-gray-600"><div className="absolute right-2 top-2 flex flex-col items-end gap-1 text-[10px] font-medium"><span className="rounded bg-emerald-100 px-1.5 py-0.5 text-emerald-700">RRF {formatRrfScore(result.score)}</span><span className="rounded bg-violet-100 px-1.5 py-0.5 text-violet-700">Emb {result.embedding_score === null ? '—' : formatScore(result.embedding_score)}</span><span className="rounded bg-sky-100 px-1.5 py-0.5 text-sky-700">BM25 {formatScore(result.bm25_score)}</span></div><div className="mb-1 truncate pr-2 font-medium text-gray-700">{result.title}</div><div className="whitespace-pre-wrap leading-5">{result.content}</div></article>)}</div></div>}
         {results.length === 0 && <div className="mt-4 grid min-h-[18rem] grid-cols-[minmax(0,0.9fr)_minmax(0,1.6fr)] gap-3 border-t border-gray-100 pt-3">
           <div className="min-w-0 border-r border-gray-100 pr-3">
             <div className="mb-2 text-[11px] font-medium text-gray-500">已导入资料 · {documents.length}</div>
@@ -198,10 +198,8 @@ export function RagPanel({ onClose }: RagPanelProps) {
   );
 }
 
-function scoreClass(score: number) {
-  if (score >= 0.75) return 'bg-emerald-100 text-emerald-700';
-  if (score >= 0.55) return 'bg-amber-100 text-amber-700';
-  return 'bg-rose-100 text-rose-700';
+function formatRrfScore(score: number) {
+  return score.toFixed(4);
 }
 
 function formatScore(score: number) {

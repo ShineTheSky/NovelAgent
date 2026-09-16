@@ -57,7 +57,18 @@ async def downgrade_file_record(project_id: str, layer: str, record_id: str, req
     return result
 
 
+@router.post("/projects/{project_id}/{layer}/{record_id}/cancel-manual-review")
+async def cancel_file_record_manual_review(project_id: str, layer: str, record_id: str, request: Request):
+    if layer not in {"evidence", "memory"}:
+        raise HTTPException(status_code=422, detail="只能取消 Evidence 或 Memory 的手动降级标注")
+    result = _files(request, project_id).cancel_manual_review(layer, record_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    return result
+
+
 @router.post("/sessions/{session_id}/traces/import-history")
+
 async def import_session_history_as_traces(session_id: str, request: Request):
     """Explicit, idempotent legacy import. Imported traces never create memories by themselves."""
     from novelagent.storage import models

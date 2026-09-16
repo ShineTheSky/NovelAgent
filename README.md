@@ -124,11 +124,11 @@ positions:
 | 预设 | 工具 | 继承历史 | max_turns | 用途 |
 |------|------|---------|-----------|------|
 | `chapter_writer` | Read, Write, Edit, Glob, Grep, Bash | 否 | 15 | 章节撰写 |
-| `chapter_polisher` | Read, Write, Edit, Glob, Grep | 否 | 10 | 润色章节 |
-| `reviewer` | Read, Glob, Grep | 否 | 8 | 独立审阅 |
-| `character_designer` | Read, Write, Edit, Glob, Grep | 否 | 10 | 人物设定 |
-| `outliner` | Read, Write, Glob, Grep, Bash, AskUserQuestion, Edit | 否 | 8 | 大纲规划 |
-| `memory_extractor` | Read, Write, Grep, Glob | 是 | 3 | 保留的手动提取预设；默认生命周期由后台 Trace 分析处理 |
+| `chapter_polisher` | Read, Write, Edit, Glob, Grep, SearchRag | 否 | 12 | 润色章节 |
+| `reviewer` | Read, Glob, Grep, AskUserQuestion | 否 | 10 | 独立审阅 |
+| `character_designer` | Read, Write, Edit, Glob, Grep | 否 | 12 | 人物设定 |
+| `outliner` | Read, Write, Glob, Grep, Bash, AskUserQuestion, Edit | 否 | 12 | 大纲规划 |
+| `memory_extractor` | Read, Write, Grep, Glob | 是 | 6 | 保留的手动提取预设；默认生命周期由后台 Trace 分析处理 |
 
 ### Write 权限规则
 

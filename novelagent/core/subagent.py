@@ -11,13 +11,15 @@ from novelagent.core.llm_turn import query
 class SubAgentRunner:
     """子Agent执行器"""
 
-    def __init__(self, llm_client, tool_registry, permission_checker, context_builder, working_dir: str = "./workspace"):
+    def __init__(self, llm_client, tool_registry, permission_checker, context_builder,
+                 working_dir: str = "./workspace", bad_case_recorder=None):
         self.llm = llm_client
         self.tools = tool_registry
         self.security = permission_checker
         self.context = context_builder
         self.presets_tool = SubAgentTool()
         self.working_dir = working_dir
+        self.bad_cases = bad_case_recorder
         from novelagent.context.prompt_manager import PromptManager
         self.prompt_manager = PromptManager("prompts")
 
@@ -161,6 +163,18 @@ class SubAgentRunner:
                     yield ResponseChunk(type="tool_result", data={**src, "tool": ev["tool"], "success": ev["success"], "data": ev["data"], "error": ev["error"]})
                 elif ev["type"] == "question_ask":
                     yield ResponseChunk(type="question_ask", data={**src, "questions": ev["questions"]})
+                elif ev["type"] == "max_turns_exhausted":
+                    if self.bad_cases:
+                        await self.bad_cases.capture(
+                            source_trace_id=operation_id or parent_run_id or current_run_id,
+                            session_id=parent_session.session_id,
+                            project_id=parent_session.project_id,
+                            failure_kind="max_turns_exhausted",
+                            actor=preset_name,
+                            error=f"子 Agent 达到 {ev['turns']} 轮上限，最后一轮仍调用工具，已触发强制收尾",
+                            params={"max_turns": ev["turns"], "preset": preset_name},
+                            messages=ev["messages"],
+                        )
                 elif ev["type"] == "error":
                     yield ResponseChunk(type="error", data={**src, "message": f"子Agent执行失败: {ev['error']}"})
                     return

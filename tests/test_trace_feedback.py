@@ -39,19 +39,68 @@ def test_same_anchor_feedback_refreshes_without_weight(tmp_path):
         title="补充压抑感",
         content="减少解释，并让动作停顿持续更久。",
         feedback_direction="减少解释，延长动作停顿。",
-        feedback_analysis="减少解释，并让动作停顿持续更久。",
+        user_requirements="减少直白解释，但保留人物承压时的克制感。",
+        revision_direction="压缩解释，通过更长的动作停顿表现压力。",
     ), "trace_b", ["event_b"], [{"trace_id": "trace_b", "event_id": "event_b", "content": "这句还是太直白，压着一点写。"}])
     saved = store.write("memory", refreshed)
 
     assert saved["weight"] == 65
     assert saved["support_count"] == 1
     assert saved["feedback_count"] == 2
-    assert saved["feedback_analysis"] == "减少解释，并让动作停顿持续更久。"
+    assert saved["user_requirements"] == "减少直白解释，但保留人物承压时的克制感。"
+    assert saved["revision_direction"] == "压缩解释，通过更长的动作停顿表现压力。"
+    assert "## 用户要求" in saved["content"]
+    assert "## 修改方向" in saved["content"]
     assert "这句话太直白，压着一点写。" in saved["content"]
     assert "这句还是太直白，压着一点写。" in saved["content"]
 
 
+def test_manual_downgrade_blocks_auto_promotion_until_reconfirmed(tmp_path):
+    store = FileLifecycleStore(str(tmp_path), "project-a")
+    pattern = store.write("pattern", _feedback(weight=240, support_count=4))
+
+    downgraded = store.downgrade("pattern", pattern["id"])
+
+    assert downgraded["layer"] == "memory"
+    assert downgraded["promotion_status"] == "manual_review"
+    assert not store.can_auto_promote(downgraded)
+    assert "用户认为该记录目前不应保持原有等级" in downgraded["downgrade_reason"]
+    assert "## 用户降级备注" in downgraded["content"]
+
+    reconfirmed = store.cancel_manual_review("memory", downgraded["id"])
+    assert reconfirmed["layer"] == "memory"
+    assert reconfirmed["promotion_status"] == "auto"
+    assert reconfirmed["explicitly_reconfirmed_at"]
+    assert reconfirmed["manual_review_cancelled_at"]
+    assert "downgrade_reason" not in reconfirmed
+    assert "downgraded_from" not in reconfirmed
+    assert "用户降级备注" not in reconfirmed["content"]
+    assert store.can_auto_promote(reconfirmed)
+    assert store.get("memory", downgraded["id"])["promotion_status"] == "auto"
+
+
+def test_same_memory_only_creates_one_pattern(tmp_path):
+    store = FileLifecycleStore(str(tmp_path), "project-a")
+    memory = store.write("memory", _feedback(weight=220, support_count=3))
+
+    first = store.promote_memory_to_pattern(memory, ["trace_a"])
+    memory["weight"] = 250
+    memory["support_count"] = 4
+    second = store.promote_memory_to_pattern(memory, ["trace_b"])
+
+    patterns = store.list("pattern")
+    assert len(patterns) == 1
+    assert second["id"] == first["id"]
+    assert second["memory_ids"] == [memory["id"]]
+    assert second["trace_ids"] == ["trace_a", "trace_b"]
+    assert second["weight"] == 250
+    assert second["support_count"] == 4
+
+
 def test_feedback_keeps_multiple_text_anchors_for_targeted_reading(tmp_path):
+
+
+
     store = FileLifecycleStore(str(tmp_path), "project-a")
     original = store.write("memory", _feedback())
     merged = store.merge_text_feedback(original, _feedback(

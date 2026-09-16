@@ -11,7 +11,7 @@ from novelagent.core.session import InternalRequest, ResponseChunk, Session
 from novelagent.tools.base import ToolContext, ToolResult, PermissionResult
 from novelagent.context.message_manager import Message, MessageManager
 from novelagent.security.audit import audit_log
-from novelagent.core.llm_turn import build_assistant_message
+from novelagent.core.llm_turn import FINALIZATION_PROMPT, build_assistant_message
 from novelagent.trace.recorder import TraceRecorder, sanitize_payload
 from novelagent.trace.agent_bad_cases import AgentBadCaseRecorder
 from novelagent.memory.memory_manager import MemoryManager
@@ -656,6 +656,48 @@ class AgentLoop:
             else:
                 self._loop_count = 0
             last_tool_calls = current_tool_calls
+
+        if not final_text.strip() and turn >= self.max_turns and last_tool_calls:
+            capture_bad_case(
+                "max_turns_exhausted", "main_agent",
+                f"主 Agent 达到 {self.max_turns} 轮上限，最后一轮仍调用工具，已触发强制收尾",
+                params={"max_turns": self.max_turns, "last_tool_call_count": len(last_tool_calls)},
+            )
+            ctx.messages.append(Message(role="user", content=FINALIZATION_PROMPT))
+            await record("llm_request", "main_agent", {
+                "turn": turn + 1, "position": "main_loop", "message_count": len(ctx.to_llm_messages()),
+                "tool_count": 0, "forced_finalization": True,
+            })
+            final_reasoning = ""
+            try:
+                async for chunk in self.llm.chat(
+                    position="main_loop", messages=ctx.to_llm_messages(),
+                    tools=None, stream=True, tag=":main:finalize",
+                ):
+                    if chunk.type == "thinking":
+                        final_reasoning += chunk.content
+                        yield ResponseChunk(type="thinking", data={"content": chunk.content})
+                    elif chunk.type == "text_delta":
+                        final_text += chunk.content
+                        yield ResponseChunk(type="text_delta", data={"delta": chunk.content})
+                    elif chunk.type == "error":
+                        capture_bad_case("main_agent_failure", "main_agent", chunk.error,
+                                         params={"forced_finalization": True})
+                        break
+                    elif chunk.type == "done":
+                        break
+            except Exception as exc:
+                capture_bad_case("main_agent_failure", "main_agent", str(exc),
+                                 params={"forced_finalization": True})
+            if final_text.strip():
+                ctx.messages.append(Message(
+                    role="assistant", content=final_text, reasoning_content=final_reasoning,
+                ))
+                await record("assistant_turn", "main_agent", {
+                    "turn": turn + 1, "content": final_text,
+                    "reasoning_content": final_reasoning, "tool_names": [],
+                    "forced_finalization": True,
+                })
 
         # 7. The analyzer derives trace-backed atomic memories after the immutable trace is complete.
         if not final_text.strip():

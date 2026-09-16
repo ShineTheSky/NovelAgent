@@ -4,6 +4,13 @@ import json
 from dataclasses import dataclass, field
 
 
+FINALIZATION_PROMPT = """你已达到本次任务允许的最大执行轮数，刚才的工具结果是当前可用的最后信息。现在是额外的强制收尾轮，不能再调用任何工具。
+请立即根据已有信息给出最终回复：
+1. 如果工作已经完成，明确总结完成结果、写入内容和必要的验证信息。
+2. 如果工作未完成，明确说明当前完成到哪一步、未完成事项、无法完成的具体原因，以及建议的下一步。
+3. 不得声称未实际完成的操作已经成功，不得只回复空内容或继续请求调用工具。"""
+
+
 async def query(
     llm_client,
     *,
@@ -25,6 +32,7 @@ async def query(
       {"type": "text_delta", "content": str}
       {"type": "tool_call", "tool": str, "params": dict, "tool_call_id": str}
       {"type": "tool_result", "tool": str, "success": bool, "data": str, "error": str}
+      {"type": "max_turns_exhausted", "turns": int, "messages": list[dict]}
       {"type": "done"}
       {"type": "error", "error": str}
       {"type": "result", "final_text": str}  # 最后一条
@@ -35,7 +43,6 @@ async def query(
         if stop_check and stop_check():
             break
 
-        # 一轮 LLM 流式调用
         turn_result = _TurnResult()
         async for chunk in llm_client.chat(
             position=position, messages=full_messages,
@@ -63,7 +70,6 @@ async def query(
         if turn_result.error:
             return
 
-        # 最终回复
         if not turn_result.tool_calls:
             full_messages.append({
                 "role": "assistant",
@@ -73,12 +79,10 @@ async def query(
             yield {"type": "result", "final_text": turn_result.full_response}
             return
 
-        # 工具调用 → 追加 assistant(tool_calls)
         full_messages.append(build_assistant_message(
             turn_result.full_response, turn_result.full_reasoning,
             turn_result.tool_calls, turn))
 
-        # 执行每个工具
         for tc in turn_result.tool_calls:
             tid = getattr(tc, 'tool_call_id', '') or tc.tool_name
             if tc.tool_name == "AskUserQuestion":
@@ -90,6 +94,28 @@ async def query(
                 "tool_call_id": tid,
                 "content": data if success else f"Error: {error}",
             })
+    else:
+        yield {"type": "max_turns_exhausted", "turns": max_turns, "messages": list(full_messages)}
+        full_messages.append({"role": "user", "content": FINALIZATION_PROMPT})
+        final_result = _TurnResult()
+        async for chunk in llm_client.chat(
+            position=position, messages=full_messages, tools=None,
+            stream=True, sub_type=sub_type, tag=f"{tag}:finalize",
+        ):
+            if chunk.type == "thinking":
+                final_result.full_reasoning += chunk.content
+                yield {"type": "thinking", "content": chunk.content}
+            elif chunk.type == "text_delta":
+                final_result.full_response += chunk.content
+                yield {"type": "text_delta", "content": chunk.content}
+            elif chunk.type == "done":
+                yield {"type": "done"}
+                break
+            elif chunk.type == "error":
+                yield {"type": "error", "error": chunk.error}
+                return
+        yield {"type": "result", "final_text": final_result.full_response}
+        return
 
     yield {"type": "result", "final_text": ""}
 

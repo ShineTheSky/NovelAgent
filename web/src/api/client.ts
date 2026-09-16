@@ -385,7 +385,12 @@ export function downgradeLifecycleRecord(projectId: string, layer: 'memory' | 'p
   return requestJson<LifecycleRecord>(`/projects/${resourceId(projectId)}/${layer}/${resourceId(recordId)}/downgrade`, { method: 'POST' });
 }
 
+export function cancelLifecycleManualReview(projectId: string, layer: 'evidence' | 'memory', recordId: string) {
+  return requestJson<LifecycleRecord>(`/projects/${resourceId(projectId)}/${layer}/${resourceId(recordId)}/cancel-manual-review`, { method: 'POST' });
+}
+
 export function fetchTraceMemories(projectId: string) {
+
   return requestJson<TraceMemory[]>(`/projects/${resourceId(projectId)}/trace-memories`);
 }
 

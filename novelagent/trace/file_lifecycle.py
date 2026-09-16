@@ -113,8 +113,64 @@ class FileLifecycleStore:
     def is_text_feedback(item: dict) -> bool:
         return item.get("category") == "reference" and item.get("kind") == "text_feedback"
 
+    @staticmethod
+    def can_auto_promote(item: dict) -> bool:
+        return item.get("promotion_status", "auto") != "manual_review"
+
+    @staticmethod
+    def confirm_auto_promotion(item: dict) -> dict:
+        confirmed = dict(item)
+        confirmed["promotion_status"] = "auto"
+        confirmed["explicitly_reconfirmed_at"] = datetime.now(timezone.utc).isoformat()
+        return confirmed
+
+    def cancel_manual_review(self, layer: str, record_id: str) -> dict | None:
+        item = self.get(layer, record_id)
+        if not item:
+            return None
+        if item.get("promotion_status") != "manual_review":
+            return item
+        item = self.confirm_auto_promotion(item)
+        item["manual_review_cancelled_at"] = item["explicitly_reconfirmed_at"]
+        item.pop("downgrade_reason", None)
+        item.pop("downgraded_from", None)
+        note_marker = "\n\n## 用户降级备注\n"
+        item["content"] = str(item.get("content") or "").partition(note_marker)[0].rstrip()
+        result = self.write(layer, item)
+        self.rebuild_indexes()
+        return result
+
+    def promote_memory_to_pattern(self, memory: dict, trace_ids: list[str]) -> dict:
+        """Create one Pattern per source Memory, even if semantic matching missed it."""
+        memory_id = str(memory["id"])
+        existing = next(
+            (item for item in self.list("pattern") if memory_id in item.get("memory_ids", [])),
+            None,
+        )
+        if existing:
+            existing["trace_ids"] = list(dict.fromkeys([*existing.get("trace_ids", []), *trace_ids]))
+            existing["weight"] = max(float(existing.get("weight", 0)), float(memory.get("weight", 0)))
+            existing["support_count"] = max(
+                int(existing.get("support_count", 1)), int(memory.get("support_count", 1)),
+            )
+            return self.write("pattern", existing)
+        return self.write("pattern", {
+            "title": memory.get("title", memory["claim"]),
+            "claim": memory["claim"],
+            "content": memory.get("content", memory["claim"]),
+            "category": memory["category"],
+            "domain": memory["domain"],
+            "memory_ids": [memory_id],
+            "trace_ids": trace_ids,
+            "weight": memory["weight"],
+            "support_count": memory["support_count"],
+        })
+
     def merge_text_feedback(self, existing: dict, incoming: dict, trace_id: str,
                             source_event_ids: list[str], user_inputs: list[dict]) -> dict:
+
+
+
         """Refresh one reference-memory interpretation without treating repeats as votes."""
         merged = dict(existing)
         history = list(merged.get("feedback_history") or [])
@@ -169,20 +225,46 @@ class FileLifecycleStore:
             value = incoming.get(key)
             if value:
                 merged[key] = value
-        # Trace remains the immutable full evidence source.  The normal Memory
-        # keeps the original user inputs beside the current Agent interpretation,
-        # so a repeat analysis normally needs no Trace lookup.
-        analysis = str(incoming.get("feedback_analysis") or incoming.get("content") or merged.get("feedback_analysis") or merged.get("content") or "").strip()
-        merged["feedback_analysis"] = analysis
-        merged["content"] = self.render_text_feedback_content(analysis, inputs)
+        # Trace remains the immutable full evidence source.  Repeated feedback
+        # refreshes the user's requirements and revision direction without
+        # treating the same text anchor as another promotion vote.
+        user_requirements = str(
+            incoming.get("user_requirements")
+            or merged.get("user_requirements")
+            or ""
+        ).strip()
+        revision_direction = str(
+            incoming.get("revision_direction")
+            or incoming.get("feedback_direction")
+            or incoming.get("feedback_analysis")
+            or incoming.get("content")
+            or merged.get("revision_direction")
+            or merged.get("feedback_direction")
+            or merged.get("feedback_analysis")
+            or merged.get("content")
+            or ""
+        ).strip()
+        merged["user_requirements"] = user_requirements
+        merged["revision_direction"] = revision_direction
+        merged.pop("feedback_analysis", None)
+        merged["content"] = self.render_text_feedback_content(user_requirements, revision_direction, inputs)
         if incoming.get("title"):
             merged["title"] = str(incoming["title"])
             merged["claim"] = str(incoming.get("claim") or incoming["title"])
         return merged
 
     @staticmethod
-    def render_text_feedback_content(analysis: str, user_inputs: list[dict]) -> str:
-        lines = ["## 当前 Agent 分析", analysis or "（尚待进一步判断）", "", "## 用户原始反馈"]
+    def render_text_feedback_content(user_requirements: str, revision_direction: str,
+                                     user_inputs: list[dict]) -> str:
+        lines = [
+            "## 用户要求",
+            user_requirements or "（尚待进一步提炼）",
+            "",
+            "## 修改方向",
+            revision_direction or "（尚待进一步判断）",
+            "",
+            "## 用户原始反馈",
+        ]
         if not user_inputs:
             lines.append("（未能定位原始用户输入；可按 trace_id 回查。）")
         for row in user_inputs:
@@ -192,6 +274,7 @@ class FileLifecycleStore:
             event_id = row.get("event_id", "")
             lines.extend([f"### Trace {trace_id} / Event {event_id}", str(row.get("content") or "")])
         return "\n".join(lines).strip()
+
 
     def text_feedback_for_artifact(self, relative_path: str, body: str, limit: int = 5) -> list[dict]:
         """Find normal reference memories whose quoted text belongs to this artifact."""
@@ -234,10 +317,12 @@ class FileLifecycleStore:
         item["manual_downgrade_count"] = count
         item["manual_downgraded_at"] = datetime.now(timezone.utc).isoformat()
         item["downgraded_from"] = layer
+        item["promotion_status"] = "manual_review"
+        item["downgrade_reason"] = "用户认为该记录目前不应保持原有等级，需保留不同意见并重新验证。"
         note = (
             f"用户于 {item['manual_downgraded_at']} 将本条从 {layer} 降级。"
-            "该信息可能不符合用户当前偏好或需要重新验证；后续相似反馈只能作为低幅证据，"
-            "除非用户明确重新确认，否则不能直接恢复高优先级。"
+            "后续证据可以继续追加，但不得触发自动晋级；只有用户明确重新确认后，"
+            "才能恢复自动晋级。"
         )
         content = str(item.get("content") or item.get("claim") or "").strip()
         item["content"] = content if note in content else f"{content}\n\n## 用户降级备注\n{note}"

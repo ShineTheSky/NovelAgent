@@ -9,6 +9,16 @@ from novelagent.storage.database import get_connection
 
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]")
+_RRF_K = 60
+
+
+def reciprocal_rank_fusion(*rankings: list[str], k: int = _RRF_K) -> dict[str, float]:
+    """Fuse ranked chunk IDs without comparing scores from different retrievers."""
+    fused_scores: dict[str, float] = {}
+    for ranking in rankings:
+        for rank, chunk_id in enumerate(ranking, start=1):
+            fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (k + rank)
+    return fused_scores
 
 
 def tokenize(text: str) -> list[str]:
@@ -291,20 +301,23 @@ class RagStore:
             except Exception as exc:
                 print(f"[rag] semantic search unavailable; BM25 remains active: {exc}", flush=True)
 
-        lexical_max = max(lexical_scores.values(), default=1.0)
-        scored = []
-        for row in rows:
-            bm25_score = lexical_scores.get(row["chunk_id"], 0.0)
-            lexical = bm25_score / lexical_max
-            embedding_score = semantic_scores.get(row["chunk_id"])
-            semantic = max(0.0, embedding_score or 0.0)
-            score = 0.45 * lexical + 0.55 * semantic if semantic_scores else lexical
-            if score > 0:
-                scored.append((score, row, bm25_score, embedding_score))
-        scored.sort(key=lambda item: item[0], reverse=True)
+        lexical_ranking = sorted(lexical_scores, key=lexical_scores.get, reverse=True)
+        semantic_ranking = sorted(
+            (chunk_id for chunk_id, score in semantic_scores.items() if score > 0),
+            key=semantic_scores.get,
+            reverse=True,
+        )
+        fused_scores = reciprocal_rank_fusion(lexical_ranking, semantic_ranking)
+        rows_by_id = {row["chunk_id"]: row for row in rows}
+        ranked_ids = sorted(fused_scores, key=fused_scores.get, reverse=True)
         return [
-            {**row, "score": score, "bm25_score": bm25_score, "embedding_score": embedding_score}
-            for score, row, bm25_score, embedding_score in scored[:max(1, min(limit, 20))]
+            {
+                **rows_by_id[chunk_id],
+                "score": fused_scores[chunk_id],
+                "bm25_score": lexical_scores.get(chunk_id, 0.0),
+                "embedding_score": semantic_scores.get(chunk_id),
+            }
+            for chunk_id in ranked_ids[:max(1, min(limit, 20))]
         ]
 
     async def format_context(self, query: str, limit: int = 5) -> tuple[str, list[dict]]:

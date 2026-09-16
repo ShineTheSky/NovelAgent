@@ -27,6 +27,7 @@ from novelagent.core.subagent import SubAgentRunner
 from novelagent.trace.store import TraceStore
 from novelagent.trace.recorder import TraceRecorder
 from novelagent.trace.file_analyzer import FileTraceAnalyzer, FilePatternContextProvider
+from novelagent.trace.agent_bad_cases import AgentBadCaseRecorder
 from novelagent.trace.bad_case_analyzer import BadCaseAnalyzer
 from novelagent.trace.bash_cases import BashCaseRecorder
 from novelagent.trace.bash_case_analyzer import BashCaseAnalyzer
@@ -89,6 +90,7 @@ def create_app() -> FastAPI:
     trace_store = TraceStore()
     trace_recorder = TraceRecorder(trace_store)
     bad_case_analyzer = BadCaseAnalyzer(llm_client, working_dir, cfg.get("bad_case_analysis"))
+    bad_case_recorder = AgentBadCaseRecorder(trace_store, working_dir, bad_case_analyzer)
     embedding_gate = EmbeddingGate(
         str(get_project_root() / embedding_cfg.get("model_path", "models/bge-base-zh-v1.5")),
         enabled=embedding_cfg.get("enabled", True),
@@ -107,7 +109,9 @@ def create_app() -> FastAPI:
         "write_allow_rules": security_cfg.get("write_allow_rules", []),
     }
 
-    subagent_runner = SubAgentRunner(llm_client, registry, permission_checker, context_builder, working_dir)
+    subagent_runner = SubAgentRunner(
+        llm_client, registry, permission_checker, context_builder, working_dir, bad_case_recorder,
+    )
     # 注入已解析的预设路径
     for tool in registry.list_all():
         if tool.name == "SubAgent":

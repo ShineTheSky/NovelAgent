@@ -290,7 +290,7 @@ presets:
       附简要说明写入了哪些文件。
     tools: [Read, Write, Edit, Glob, Grep, Bash]
     inherit_history: false
-    max_turns: 10
+    max_turns: 15
     memory_enabled: false
     show_result: true
 
@@ -390,7 +390,7 @@ presets:
       [列出已修改的要点与最终修订号；正文已经写入文件，禁止在回复中重复整章内容]
     tools: [Read, Write, Edit, Glob, Grep, SearchRag]
     inherit_history: false
-    max_turns: 8
+    max_turns: 12
     memory_enabled: false
     show_result: true
 
@@ -436,7 +436,7 @@ presets:
       **影响：** …
     tools: [Read, Glob, Grep,AskUserQuestion]
     inherit_history: false
-    max_turns: 8
+    max_turns: 10
     memory_enabled: false
     show_result: true
 
@@ -460,7 +460,7 @@ presets:
       以结构化的人物卡形式输出，包含性格、外貌、背景、关系等。
     tools: [Read, Write, Edit, Glob, Grep]
     inherit_history: false
-    max_turns: 10
+    max_turns: 12
     memory_enabled: false
     show_result: true
 
@@ -631,7 +631,7 @@ presets:
 
     tools: [Read, Write, Glob, Grep, Bash, AskUserQuestion, Edit]
     inherit_history: false
-    max_turns: 8
+    max_turns: 12
     memory_enabled: false
     show_result: true
 
@@ -672,7 +672,7 @@ presets:
       4. 确认索引已更新，否则回到步骤3
     tools: [Read, Write, Grep, Glob]
     inherit_history: true
-    max_turns: 3
+    max_turns: 6
     memory_enabled: true
     show_result: false
 
