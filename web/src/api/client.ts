@@ -9,7 +9,7 @@ import type {
   StreamEvent,
 } from '../types/chat';
 import type { LLMPositionUpdate, LLMSettings, ProviderSettingsUpdate } from '../types/llm';
-import type { LifecycleRecord, MemoryPattern, TraceEvidence, TraceMemory } from '../types/insights';
+import type { LifecycleRecord, TraceEvidence } from '../types/insights';
 import type { MaterialDocument, MaterialTree, NovelDocument, NovelTree } from '../types/novel';
 
 const BASE = '/api';
@@ -365,10 +365,6 @@ export function saveProviderSettings(providers: Record<string, ProviderSettingsU
   });
 }
 
-export function fetchMemoryPatterns(projectId: string) {
-  return requestJson<MemoryPattern[]>(`/projects/${resourceId(projectId)}/memory-patterns`);
-}
-
 export function fetchEvidence(projectId: string) {
   return requestJson<LifecycleRecord[]>(`/projects/${resourceId(projectId)}/evidence`);
 }
@@ -389,32 +385,12 @@ export function cancelLifecycleManualReview(projectId: string, layer: 'evidence'
   return requestJson<LifecycleRecord>(`/projects/${resourceId(projectId)}/${layer}/${resourceId(recordId)}/cancel-manual-review`, { method: 'POST' });
 }
 
-export function fetchTraceMemories(projectId: string) {
-
-  return requestJson<TraceMemory[]>(`/projects/${resourceId(projectId)}/trace-memories`);
-}
-
-export function fetchProjectRules(projectId: string) {
-  return requestJson<TraceMemory[]>(`/projects/${resourceId(projectId)}/rules`);
-}
-
 export function fetchProjectTraces(projectId: string) {
   return requestJson<TraceEvidence[]>(`/projects/${resourceId(projectId)}/traces`);
 }
 
 export function fetchTrace(traceId: string) {
   return requestJson<TraceEvidence>(`/traces/${resourceId(traceId)}`);
-}
-
-export function fetchTraceMemory(projectId: string, memoryId: string) {
-  return requestJson<TraceMemory>(`/projects/${resourceId(projectId)}/trace-memories/${resourceId(memoryId)}`);
-}
-
-export function downgradeTraceMemory(projectId: string, memoryId: string) {
-  return requestJson<{ action: 'rule_to_memory' | 'memory_to_trace' }>(
-    `/projects/${resourceId(projectId)}/trace-memories/${resourceId(memoryId)}/downgrade`,
-    { method: 'POST' },
-  );
 }
 
 export type { Message };

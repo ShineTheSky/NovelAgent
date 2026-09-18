@@ -183,6 +183,9 @@ class TraceStore:
 
     async def append_session_turn(self, session_id: str, user_content: str, assistant_content: str,
                                   events: list[dict] | None = None, source_trace_id: str = "") -> int:
+        from novelagent.trace.stream_compaction import compact_trace_snapshot_events
+
+        events = compact_trace_snapshot_events(events or [])
         conn = await get_connection()
         cursor = await conn.execute(
             "SELECT COALESCE(MAX(turn_no), 0) FROM session_trace_turns WHERE session_id = ?", (session_id,)
@@ -193,7 +196,7 @@ class TraceStore:
             """INSERT INTO session_trace_turns
                (session_id, turn_no, user_content, assistant_content, events_json, source_trace_id)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (session_id, turn_no, user_content, assistant_content, json.dumps(events or [], ensure_ascii=False), source_trace_id or None),
+            (session_id, turn_no, user_content, assistant_content, json.dumps(events, ensure_ascii=False), source_trace_id or None),
         )
         if source_trace_id:
             previous = await conn.execute(

@@ -49,6 +49,15 @@ class ReviewPolishWorkflow:
         lines.append("若反馈互相矛盾、引用已无法定位，或修改方向仍不明确，先用 AskUserQuestion 澄清；否则据此直接审阅或润色。")
         return "\n\n".join(lines)
 
+    def _memory_context(self, project_id: str) -> str:
+        project_dir = self.working_dir / project_id
+        store = FileLifecycleStore(str(self.working_dir), project_id)
+        parts = [f"## 项目记忆（按需遵守）\n{self._read_if_exists(project_dir, '.memory/memory.md')}"]
+        recurring_issues = store.review_issue_context()
+        if recurring_issues:
+            parts.append(recurring_issues)
+        return "\n\n".join(parts)
+
     def _artifact_context(self, project_id: str, chapter_path: str) -> tuple[str, str]:
         normalized = chapter_path.replace("\\", "/")
         match = _CHAPTER_PATH.match(normalized)
@@ -65,9 +74,8 @@ class ReviewPolishWorkflow:
             f"### 对应卷纲：{volume_outline}\n{self._read_if_exists(project_dir, volume_outline)}",
             f"### 对应章纲：{chapter_outline}\n{self._read_if_exists(project_dir, chapter_outline)}",
         ])
-        memory = self._read_if_exists(project_dir, ".memory/memory.md")
         feedback = self._reference_feedback_context(project_id, normalized, body)
-        extra = f"## 项目记忆（按需遵守）\n{memory}"
+        extra = self._memory_context(project_id)
         return context, f"{extra}\n\n{feedback}" if feedback else extra
 
     def build_context(self, project_id: str, chapter_path: str) -> tuple[str, str]:
@@ -88,11 +96,11 @@ class ReviewPolishWorkflow:
 
         prior = int(section) - 1
         if prior <= 0:
-            return "", self._read_if_exists(project_dir, ".memory/memory.md")
+            return "", self._memory_context(project_id)
         previous_path = f"chapters/content_{int(volume)}.{int(chapter)}.{prior}.md"
         previous = project_dir / previous_path
         if not previous.is_file():
-            return "", self._read_if_exists(project_dir, ".memory/memory.md")
+            return "", self._memory_context(project_id)
         volume_outline = f"outlines/outline_{int(volume)}.0.0.md"
         chapter_outline = f"outlines/outline_{int(volume)}.{int(chapter)}.0.md"
         context = "\n\n".join([
@@ -101,7 +109,7 @@ class ReviewPolishWorkflow:
             f"### 对应卷纲：{volume_outline}\n{self._read_if_exists(project_dir, volume_outline)}",
             f"### 对应章纲：{chapter_outline}\n{self._read_if_exists(project_dir, chapter_outline)}",
         ])
-        return context, f"## 项目记忆（按需遵守）\n{self._read_if_exists(project_dir, '.memory/memory.md')}"
+        return context, self._memory_context(project_id)
 
     async def run(self, parent_session, chapter_path: str, writer_task: str, operation_id: str, parent_run_id: str = ""):
         artifact_context, memory_context = self._artifact_context(parent_session.project_id, chapter_path)

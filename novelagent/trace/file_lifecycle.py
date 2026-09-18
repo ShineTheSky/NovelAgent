@@ -114,6 +114,28 @@ class FileLifecycleStore:
         return item.get("category") == "reference" and item.get("kind") == "text_feedback"
 
     @staticmethod
+    def is_review_issue(item: dict) -> bool:
+        return item.get("domain") == "writing" and item.get("kind") == "review_issue"
+
+    def review_issue_context(self, limit: int = 12) -> str:
+        """Render recurring reviewer findings as actionable writing context."""
+        records = [
+            item for layer in ("pattern", "memory") for item in self.list(layer)
+            if self.is_review_issue(item)
+        ]
+        selected = sorted(records, key=self._rank, reverse=True)[:limit]
+        if not selected:
+            return ""
+        lines = ["## 高频写作错误（写作、审阅和润色时检查）"]
+        for item in selected:
+            lines.append(
+                f"### {item.get('title', item.get('claim', '写作问题'))}"
+                f"（累计 {item.get('support_count', 1)} 次）\n"
+                f"{item.get('content', item.get('claim', ''))}"
+            )
+        return "\n\n".join(lines)
+
+    @staticmethod
     def can_auto_promote(item: dict) -> bool:
         return item.get("promotion_status", "auto") != "manual_review"
 
@@ -160,6 +182,7 @@ class FileLifecycleStore:
             "content": memory.get("content", memory["claim"]),
             "category": memory["category"],
             "domain": memory["domain"],
+            "kind": memory.get("kind", ""),
             "memory_ids": [memory_id],
             "trace_ids": trace_ids,
             "weight": memory["weight"],

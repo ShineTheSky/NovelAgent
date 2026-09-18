@@ -107,6 +107,9 @@ async def save_messages(session_id: str, messages: list[dict], token_count: int 
 
 async def save_display_turn(session_id: str, events: list[dict]) -> None:
     """Persist UI-only SSE events separately from the model conversation."""
+    from novelagent.trace.stream_compaction import compact_display_events
+
+    events = compact_display_events(events)
     conn = await get_connection()
     cursor = await conn.execute(
         "SELECT COALESCE(MAX(turn_no), 0) FROM session_display_turns WHERE session_id = ?", (session_id,)

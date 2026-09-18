@@ -4,6 +4,9 @@ from types import SimpleNamespace
 
 from novelagent.trace.file_analyzer import FileTraceAnalyzer
 from novelagent.trace.file_lifecycle import FileLifecycleStore
+from novelagent.core.review_workflow import ReviewPolishWorkflow
+from novelagent.tools.base import ToolContext
+from novelagent.tools.get_trace_context import GetTraceContextTool
 
 
 def _feedback(**overrides):
@@ -97,6 +100,98 @@ def test_same_memory_only_creates_one_pattern(tmp_path):
     assert second["support_count"] == 4
 
 
+def test_review_issue_keeps_writing_domain_and_kind_when_promoted(tmp_path):
+    store = FileLifecycleStore(str(tmp_path), "project-a")
+    memory = store.write("memory", {
+        "title": "对话连续缺少动作支点",
+        "claim": "连续对话需要动作或空间变化作为支点。",
+        "content": "出现三轮以上连续对白时，检查是否缺少动作、视线或位置变化。",
+        "category": "project",
+        "domain": "writing",
+        "kind": "review_issue",
+        "weight": 220,
+        "support_count": 4,
+    })
+
+    pattern = store.promote_memory_to_pattern(memory, ["trace-a"])
+
+    assert pattern["category"] == "project"
+    assert pattern["domain"] == "writing"
+    assert pattern["kind"] == "review_issue"
+
+
+def test_review_issue_context_is_injected_for_future_writing_and_review(tmp_path):
+    store = FileLifecycleStore(str(tmp_path), "project-a")
+    store.write("memory", {
+        "title": "场景空间关系容易丢失",
+        "claim": "动作场景需要持续标记相对位置。",
+        "content": "多人移动后检查站位、距离与视线是否仍可追踪。",
+        "category": "project",
+        "domain": "writing",
+        "kind": "review_issue",
+        "weight": 60,
+        "support_count": 4,
+    })
+    workflow = ReviewPolishWorkflow(None, str(tmp_path))
+
+    context = workflow._memory_context("project-a")
+
+    assert "高频写作错误" in context
+    assert "场景空间关系容易丢失" in context
+    assert "累计 4 次" in context
+
+
+def test_reviewer_result_is_visible_to_trace_memory_extraction():
+    summary = FileTraceAnalyzer._event_summary({
+        "event_id": "event-review",
+        "trace_id": "trace-a",
+        "event_type": "workflow_subagent_done",
+        "payload": {
+            "preset": "reviewer",
+            "workflow": "auto_review",
+            "run_id": "run-review",
+            "result": "问题：连续对白缺少动作支点。证据：三轮对白中人物位置没有变化。",
+        },
+    })
+
+    assert summary["preset"] == "reviewer"
+    assert summary["workflow"] == "auto_review"
+    assert "连续对白缺少动作支点" in summary["result"]
+
+
+def test_legacy_main_agent_reviewer_summary_is_treated_as_auto_review():
+    summary = FileTraceAnalyzer._event_summary({
+        "event_id": "event-legacy-review",
+        "trace_id": "trace-a",
+        "event_type": "assistant_turn",
+        "payload": {
+            "content": "**审阅结论（reviewer）**\n现实侧信息堆砌，需要压缩。",
+        },
+    })
+
+    assert summary["preset"] == "reviewer"
+    assert summary["workflow"] == "auto_review"
+    assert summary["legacy_summary"] is True
+
+
+def test_checkpoint_reason_is_visible_to_trace_memory_extraction():
+    event = {
+        "event_id": "event-checkpoint",
+        "trace_id": "trace-a",
+        "event_type": "tool_call",
+        "payload": {
+            "tool": "CreateTraceCheckpoint",
+            "params": {"reason": "用户指出具体正文描写不够生动。"},
+        },
+    }
+
+    summary = FileTraceAnalyzer._event_summary(event)
+    reasons = FileTraceAnalyzer._checkpoint_reasons([event])
+
+    assert summary["params"]["reason"] == "用户指出具体正文描写不够生动。"
+    assert reasons == [{"event_id": "event-checkpoint", "reason": "用户指出具体正文描写不够生动。"}]
+
+
 def test_feedback_keeps_multiple_text_anchors_for_targeted_reading(tmp_path):
 
 
@@ -164,3 +259,82 @@ def test_only_reference_text_feedback_enters_rag_review():
         {"category": "project", "kind": "text_feedback"},
         {"category": "reference", "kind": "other"},
     ]})
+
+
+class _TraceContextStore:
+    async def get_project_trace(self, project_id, trace_id):
+        sessions = {"trace-a": "session-a", "trace-b": "session-a", "trace-other": "session-b"}
+        if project_id == "project-a" and trace_id in sessions:
+            return {"trace_id": trace_id, "project_id": project_id, "session_id": sessions[trace_id]}
+        return None
+
+    async def get_trace_event_window(self, trace_id, event_ids, before, after):
+        assert trace_id == "trace-a"
+        assert event_ids == ["event-a"]
+        assert (before, after) == (2, 2)
+        return [{
+            "event_id": "event-a", "trace_id": "trace-a", "event_type": "user_message",
+            "payload": {"content": "这句话太直白，压着一点写。"},
+        }]
+
+    async def list_events(self, trace_id, limit):
+        assert trace_id == "trace-b"
+        assert limit == 40
+        return [{
+            "event_id": "event-b", "trace_id": "trace-b", "event_type": "assistant_turn",
+            "payload": {"content": "同一 Session 的较早回复。"},
+        }]
+
+
+class _TraceContextLLM:
+    def __init__(self):
+        self.calls = []
+
+    async def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs["tools"]:
+            yield SimpleNamespace(
+                type="tool_use", tool_name="GetTraceContext", tool_call_id="trace-call",
+                tool_input={"trace_ids": ["trace-a"]},
+            )
+        else:
+            yield SimpleNamespace(type="text_delta", content='{"items": [], "records": []}')
+
+
+def test_trace_analyzer_uses_real_tool_for_bounded_context_lookup(tmp_path):
+    llm = _TraceContextLLM()
+    tool = GetTraceContextTool(_TraceContextStore(), "session-a", {"trace-a": ["event-a"]})
+    analyzer = FileTraceAnalyzer(llm, str(tmp_path), _TraceContextStore())
+
+    result = asyncio.run(analyzer._extract(
+        "分析 Trace", None, trace_tool=tool, project_id="project-a", source_trace_id="trace-current",
+        session_id="session-a",
+    ))
+
+    assert json.loads(result) == {"items": [], "records": []}
+    assert len(llm.calls) == 2
+    assert llm.calls[0]["tools"][0]["name"] == "GetTraceContext"
+    assert llm.calls[1]["tools"] is None
+    tool_result = next(message for message in llm.calls[1]["messages"] if message["role"] == "tool_result")
+    assert "这句话太直白" in tool_result["content"]
+
+
+def test_trace_context_tool_allows_any_trace_in_current_session():
+    tool = GetTraceContextTool(_TraceContextStore(), "session-a", {"trace-a": ["event-a"]})
+    context = ToolContext(session_id="session-a", project_id="project-a", working_dir=".")
+
+    result = asyncio.run(tool.execute({"trace_ids": ["trace-b"]}, context))
+
+    assert result.success
+    assert result.data["traces"][0]["trace_id"] == "trace-b"
+    assert "同一 Session" in result.data["traces"][0]["events"][0]["content"]
+
+
+def test_trace_context_tool_rejects_trace_from_another_session():
+    tool = GetTraceContextTool(_TraceContextStore(), "session-a")
+    context = ToolContext(session_id="session-a", project_id="project-a", working_dir=".")
+
+    result = asyncio.run(tool.execute({"trace_ids": ["trace-other"]}, context))
+
+    assert not result.success
+    assert "不属于当前 Session" in result.error

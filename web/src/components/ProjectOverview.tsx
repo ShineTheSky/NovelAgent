@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
-import { fetchProjectRules, fetchTraceMemories } from '../api/client';
-import type { TraceMemory } from '../types/insights';
+import { useEffect, useState } from 'react';
+import { fetchMemories, fetchPatterns } from '../api/client';
+import type { LifecycleRecord } from '../types/insights';
 import type { ProjectInfo, SessionInfo } from '../types/chat';
 
 interface ProjectOverviewProps {
@@ -15,25 +15,24 @@ function kindLabel(kind: string) {
 }
 
 export function ProjectOverview({ project, sessions, onNewSession, onSelectSession }: ProjectOverviewProps) {
-  const [rules, setRules] = useState<TraceMemory[]>([]);
-  const [memories, setMemories] = useState<TraceMemory[]>([]);
+  const [patterns, setPatterns] = useState<LifecycleRecord[]>([]);
+  const [memories, setMemories] = useState<LifecycleRecord[]>([]);
 
-  const loadInsights = useCallback(async () => {
-    try {
-      const [nextRules, nextMemories] = await Promise.all([
-        fetchProjectRules(project.project_id),
-        fetchTraceMemories(project.project_id),
-      ]);
-      setRules(nextRules);
-      setMemories(nextMemories);
-    } catch {
-      // The project remains usable when a background insight request fails.
-      setRules([]);
-      setMemories([]);
-    }
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all([fetchPatterns(project.project_id), fetchMemories(project.project_id)])
+      .then(([nextPatterns, nextMemories]) => {
+        if (cancelled) return;
+        setPatterns(nextPatterns.filter(item => item.category !== 'agent'));
+        setMemories(nextMemories.filter(item => item.category !== 'agent'));
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setPatterns([]);
+        setMemories([]);
+      });
+    return () => { cancelled = true; };
   }, [project.project_id]);
-
-  useEffect(() => { void loadInsights(); }, [loadInsights]);
 
   const recentMemories = memories.slice(0, 4);
 
@@ -51,21 +50,21 @@ export function ProjectOverview({ project, sessions, onNewSession, onSelectSessi
 
         <div className="grid gap-3 sm:grid-cols-3 mb-8">
           <StatCard label="会话" value={sessions.length} detail="该项目下的任务" />
-          <StatCard label="Pattern" value={rules.length} detail="稳定规则，会注入后续上下文" />
+          <StatCard label="Pattern" value={patterns.length} detail="稳定规则，会注入后续上下文" />
           <StatCard label="原子记忆" value={memories.length} detail="均可回溯到 Trace" />
         </div>
 
         <div className="grid gap-5 lg:grid-cols-2">
           <section className="rounded-xl border border-gray-100 bg-[#fafbfc] p-5">
-            <div className="mb-4 flex items-center justify-between"><h2 className="text-sm font-semibold text-gray-700">生效中的 Pattern</h2><span className="text-xs text-gray-400">{rules.length} 条</span></div>
+            <div className="mb-4 flex items-center justify-between"><h2 className="text-sm font-semibold text-gray-700">生效中的 Pattern</h2><span className="text-xs text-gray-400">{patterns.length} 条</span></div>
             <div className="space-y-3">
-              {rules.slice(0, 4).map(rule => (
-                <div key={rule.memory_id} className="rounded-lg bg-white px-3 py-2.5 border border-gray-100">
-                  <div className="mb-1 flex items-center gap-2 text-[11px] text-gray-400"><span className="text-emerald-600">生效中</span><span>{kindLabel(rule.kind)}</span><span className="ml-auto">重要性 {Math.round(rule.importance)}</span></div>
-                  <p className="text-sm leading-5 text-gray-700">{rule.claim}</p>
+              {patterns.slice(0, 4).map(pattern => (
+                <div key={pattern.id} className="rounded-lg bg-white px-3 py-2.5 border border-gray-100">
+                  <div className="mb-1 flex items-center gap-2 text-[11px] text-gray-400"><span className="text-emerald-600">生效中</span><span>{kindLabel(pattern.kind ?? '')}</span><span className="ml-auto">权重 {Math.round(pattern.weight)}</span></div>
+                  <p className="text-sm leading-5 text-gray-700">{pattern.title || pattern.claim}</p>
                 </div>
               ))}
-              {rules.length === 0 && <p className="py-4 text-sm leading-6 text-gray-400">强烈反馈会先成为记忆；多次相似证据支持后会提升为项目规则。</p>}
+              {patterns.length === 0 && <p className="py-4 text-sm leading-6 text-gray-400">强烈反馈会先成为记忆；多次相似证据支持后会提升为项目规则。</p>}
             </div>
           </section>
 
@@ -73,9 +72,9 @@ export function ProjectOverview({ project, sessions, onNewSession, onSelectSessi
             <div className="mb-4 flex items-center justify-between"><h2 className="text-sm font-semibold text-gray-700">最近记忆</h2><span className="text-xs text-gray-400">Trace 支持</span></div>
             <div className="space-y-3">
               {recentMemories.map(memory => (
-                <div key={memory.memory_id} className="rounded-lg bg-white px-3 py-2.5 border border-gray-100">
-                  <div className="mb-1 text-[11px] text-violet-600">{kindLabel(memory.kind)} · {memory.subtype || '通用'}</div>
-                  <p className="text-sm leading-5 text-gray-700">{memory.claim}</p>
+                <div key={memory.id} className="rounded-lg bg-white px-3 py-2.5 border border-gray-100">
+                  <div className="mb-1 text-[11px] text-violet-600">{kindLabel(memory.kind ?? '')} · {memory.domain}</div>
+                  <p className="text-sm leading-5 text-gray-700">{memory.title || memory.claim}</p>
                 </div>
               ))}
               {memories.length === 0 && <p className="py-4 text-sm leading-6 text-gray-400">暂无长期记忆。普通聊天和一次性指令不会被保存。</p>}

@@ -3,9 +3,7 @@
 import asyncio
 import json
 from fastapi import APIRouter, HTTPException, Request
-from pathlib import Path
 
-from novelagent.memory.file_store import FileStore
 from novelagent.trace.file_lifecycle import FileLifecycleStore
 from novelagent.trace.store import TraceStore
 
@@ -113,53 +111,7 @@ async def get_trace_context(trace_id: str, request: Request, before: int = 2, af
     return context
 
 
-@router.get("/projects/{project_id}/memory-patterns")
-async def list_memory_patterns(project_id: str, request: Request):
-    """Expose reviewed and pending cross-memory patterns for future profile UI."""
-    return await _store(request).list_patterns(project_id, limit=100)
-
-
 @router.get("/projects/{project_id}/traces")
 async def list_project_traces(project_id: str, request: Request):
     """List the project's immutable trace evidence records."""
     return await _store(request).list_project_traces(project_id, limit=100)
-
-
-@router.get("/projects/{project_id}/trace-memories")
-async def list_trace_memories(project_id: str, request: Request):
-    """Return trace-backed atomic memories for the project-insights panel."""
-    return await _store(request).list_memories(project_id, limit=150)
-
-
-@router.get("/projects/{project_id}/rules")
-async def list_project_rules(project_id: str, request: Request):
-    """Return active project rules that may be injected into agent context."""
-    return await _store(request).list_rules(project_id, limit=100)
-
-
-@router.get("/projects/{project_id}/trace-memories/{memory_id}")
-async def get_trace_memory(project_id: str, memory_id: str, request: Request):
-    """Return a single atomic memory with its project-local Markdown body."""
-    memory = await _store(request).get_memory(project_id, memory_id)
-    if memory is None:
-        raise HTTPException(status_code=404, detail="记忆不存在")
-    file_path = memory.get("file_path", "")
-    if file_path.startswith(".memory/"):
-        project_dir = Path(request.app.state.agent_loop.working_dir) / project_id
-        memory["content"] = FileStore(str(project_dir)).read(file_path.removeprefix(".memory/"))
-    else:
-        memory["content"] = memory["claim"]
-    return memory
-
-
-@router.post("/projects/{project_id}/trace-memories/{memory_id}/downgrade")
-async def downgrade_trace_memory(project_id: str, memory_id: str, request: Request):
-    """User-confirmed lifecycle downgrade: Rule → Memory → Trace evidence."""
-    result = await _store(request).downgrade_memory(project_id, memory_id)
-    if result is None:
-        raise HTTPException(status_code=404, detail="记忆不存在或已降为 Trace")
-    memory = result.get("memory") or await _store(request).get_memory(project_id, memory_id)
-    if memory:
-        path = request.app.state.trace_memory_materializer.sync(memory)
-        await _store(request).set_memory_file_path(memory_id, path)
-    return result

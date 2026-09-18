@@ -14,6 +14,7 @@ from novelagent.security.audit import audit_log
 from novelagent.core.llm_turn import FINALIZATION_PROMPT, build_assistant_message
 from novelagent.trace.recorder import TraceRecorder, sanitize_payload
 from novelagent.trace.agent_bad_cases import AgentBadCaseRecorder
+from novelagent.trace.stream_compaction import TraceStreamBuffer
 from novelagent.memory.memory_manager import MemoryManager
 from novelagent.core.review_workflow import ReviewPolishWorkflow
 
@@ -497,6 +498,7 @@ class AgentLoop:
                     subagent_failed = False
                     writer_revision_events = []
                     subagent_run_id = uuid.uuid4().hex
+                    subagent_trace_stream = TraceStreamBuffer(record)
                     async for sub_chunk in self.subagent_runner.spawn_and_run(
                         preset, task, session, inherit,
                         attachments=attachments if not artifact_context else None,
@@ -507,7 +509,9 @@ class AgentLoop:
                         run_id=subagent_run_id,
                         context_as_user_message=preset == "reviewer",
                     ):
-                        await record(f"subagent_{sub_chunk.type}", f"subagent:{preset}", sub_chunk.data, tool_event_id)
+                        await subagent_trace_stream.add(
+                            f"subagent_{sub_chunk.type}", f"subagent:{preset}", sub_chunk.data, tool_event_id,
+                        )
                         if sub_chunk.type == "tool_result" and not sub_chunk.data.get("success", False):
                             capture_bad_case(
                                 "tool_failure", f"subagent:{preset}", sub_chunk.data.get("error", "子 Agent 工具调用失败"),
@@ -539,6 +543,7 @@ class AgentLoop:
                                 })
                         else:
                             yield sub_chunk  # 转发子Agent的所有事件到前端
+                    await subagent_trace_stream.flush()
 
                     # Writer commits are the only automatic trigger.  Polisher commits do not recurse.
                     workflow_summaries = []
@@ -546,6 +551,7 @@ class AgentLoop:
                         chapter_events = [event for event in writer_revision_events if self.review_workflow.is_chapter(event.get("path", ""))]
                         for event in chapter_events:
                             yield ResponseChunk(type="thinking", data={"content": "章节已写入，正在自动审阅并润色…", "workflow": "auto_review"})
+                            workflow_trace_stream = TraceStreamBuffer(record)
                             async for workflow_chunk in self.review_workflow.run(
                                 session, event["path"], task, f"{tool_ctx.operation_id}:{event['revision_id']}",
                                 parent_run_id=subagent_run_id,
@@ -556,7 +562,7 @@ class AgentLoop:
                                     and not workflow_chunk.data.get("empty_result")
                                 ):
                                     workflow_summaries.append(workflow_chunk.data.get("result", ""))
-                                await record(
+                                await workflow_trace_stream.add(
                                     f"workflow_{workflow_chunk.type}",
                                     f"workflow:{workflow_chunk.data.get('workflow', 'review_polish')}",
                                     workflow_chunk.data, tool_event_id,
@@ -576,6 +582,7 @@ class AgentLoop:
                                         tool=workflow_chunk.data.get("tool", ""), params=workflow_chunk.data.get("params", {}),
                                     )
                                 yield workflow_chunk
+                            await workflow_trace_stream.flush()
 
                     if workflow_summaries:
                         # Keep only the concise post-write handoff in the coordinator history;
