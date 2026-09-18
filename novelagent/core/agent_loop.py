@@ -6,9 +6,11 @@ import uuid
 import hashlib
 import json
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from novelagent.core.session import InternalRequest, ResponseChunk, Session
 from novelagent.tools.base import ToolContext, ToolResult, PermissionResult
+
 from novelagent.context.message_manager import Message, MessageManager
 from novelagent.security.audit import audit_log
 from novelagent.core.llm_turn import FINALIZATION_PROMPT, build_assistant_message
@@ -19,12 +21,21 @@ from novelagent.memory.memory_manager import MemoryManager
 from novelagent.core.review_workflow import ReviewPolishWorkflow
 
 
+@dataclass
+class MainTurnResult:
+    text: str = ""
+    reasoning: str = ""
+    tool_calls: list = field(default_factory=list)
+    error: str = ""
+
+
 class AgentLoop:
     def __init__(self, llm_client, tool_registry, permission_checker, context_builder, memory_manager,
                  config: dict | None = None, subagent_runner=None, trace_recorder: TraceRecorder | None = None,
                  post_turn_analyzer=None, preference_context_provider=None, rag_store=None, bash_case_recorder=None,
                  bad_case_analyzer=None):
         self.llm = llm_client
+
         self.tools = tool_registry
         self.security = permission_checker
         self.context_builder = context_builder
@@ -45,9 +56,51 @@ class AgentLoop:
         self.review_workflow = ReviewPolishWorkflow(subagent_runner, self.working_dir) if subagent_runner else None
         self._trace_capture_locks: dict[str, asyncio.Lock] = {}
 
+    async def _stream_main_turn(self, messages: list[dict], tools: list[dict] | None,
+                                tag: str, result: MainTurnResult):
+        """Run one main-agent LLM turn and stream user-visible chunks."""
+        print(f"[LLM:main] 请求: messages={len(messages)}", flush=True)
+        for index, message in enumerate(messages):
+            print(f"  [{index}] {json.dumps(message, ensure_ascii=False)}", flush=True)
+
+        async for chunk in self.llm.chat(
+            position="main_loop", messages=messages,
+            tools=tools, stream=True, tag=tag,
+        ):
+            if chunk.type == "thinking":
+                result.reasoning += chunk.content
+                yield ResponseChunk(type="thinking", data={"content": chunk.content})
+            elif chunk.type == "text_delta":
+                result.text += chunk.content
+                yield ResponseChunk(type="text_delta", data={"delta": chunk.content})
+            elif chunk.type == "tool_use":
+                if chunk.tool_name:
+                    result.tool_calls.append(chunk)
+                    yield ResponseChunk(type="tool_call", data={
+                        "tool": chunk.tool_name, "params": chunk.tool_input,
+                    })
+            elif chunk.type == "error":
+                result.error = chunk.error
+                return
+            elif chunk.type == "done":
+                return
+
+    async def _persist_turn(self, session: Session, ctx) -> None:
+        """Synchronize the current context to the session and persistent store."""
+        session.messages = [message.to_dict() for message in ctx.messages]
+        session.token_count = self.context_builder.token_counter.count_messages(ctx.to_llm_messages())
+        try:
+            from novelagent.storage import models
+            await models.save_messages(
+                session.session_id, session.messages, session.token_count, llm_client=self.llm,
+            )
+        except Exception as exc:
+            print(f"[save] 保存失败: {exc}", flush=True)
+
     async def run(self, request: InternalRequest, session: Session, project_info: dict | None = None) -> ResponseChunk:
         trace_id = await self.trace.start(session.session_id, session.project_id, request.content) if self.trace else f"op_{uuid.uuid4().hex}"
         # The HTTP route can finish this trace if a client disconnects while the
+
         # generator is awaiting a tool or model response.
         session.active_trace_id = trace_id
         deferred_trace_events: list[dict] = []
@@ -302,58 +355,41 @@ class AgentLoop:
                 "turn": turn, "position": "main_loop", "message_count": len(llm_messages), "tool_count": len(tool_schemas),
             })
 
-            # Debug: 打印请求消息
-            import sys
-            sys.stdout.flush()
-            print(f"[LLM:main] 请求: messages={len(llm_messages)}", flush=True)
-            for i, m in enumerate(llm_messages):
-                print(f"  [{i}] {json.dumps(m, ensure_ascii=False)}", flush=True)
-
-            # LLM 流式调用
-            full_response = ""
-            full_reasoning = ""
-            current_tool_calls = []
+            turn_result = MainTurnResult()
             try:
-                async for chunk in self.llm.chat(
-                    position="main_loop", messages=llm_messages,
-                    tools=tool_schemas, stream=True, tag=":main",
+                async for response_chunk in self._stream_main_turn(
+                    llm_messages, tool_schemas, ":main", turn_result,
                 ):
-                    if chunk.type == "thinking":
-                        full_reasoning += chunk.content
-                        yield ResponseChunk(type="thinking", data={"content": chunk.content})
-                    elif chunk.type == "text_delta":
-                        full_response += chunk.content
-                        yield ResponseChunk(type="text_delta", data={"delta": chunk.content})
-                    elif chunk.type == "tool_use":
-                        if not chunk.tool_name:
-                            continue
-                        current_tool_calls.append(chunk)
-                        yield ResponseChunk(type="tool_call", data={"tool": chunk.tool_name, "params": chunk.tool_input})
-                    elif chunk.type == "error":
-                        print(f"[LLM:main] 请求消息数={len(llm_messages)}", flush=True)
-                        for i, m in enumerate(llm_messages[-6:]):
-                            print(f"  [{i}] {json.dumps(m, ensure_ascii=False)[:200]}", flush=True)
-                        await record("error", "main_agent", {"message": chunk.error, "turn": turn})
-                        capture_bad_case("main_agent_failure", "main_agent", chunk.error)
-                        await finish("failed")
-                        schedule_trace_capture(full_response)
-                        yield ResponseChunk(type="error", data={"message": chunk.error,
-                                                                  "trace_id": ""})
-                        return
-                    elif chunk.type == "done":
-                        break
-            except Exception as e:
+                    yield response_chunk
+            except Exception as exc:
                 import traceback
-                print(f"[LLM] 调用异常: {e}", flush=True)
+                print(f"[LLM] 调用异常: {exc}", flush=True)
                 traceback.print_exc()
-                await record("error", "main_agent", {"message": str(e), "turn": turn})
-                capture_bad_case("main_agent_failure", "main_agent", str(e))
+                await record("error", "main_agent", {"message": str(exc), "turn": turn})
+                capture_bad_case("main_agent_failure", "main_agent", str(exc))
                 await finish("failed")
-                schedule_trace_capture(full_response)
-                yield ResponseChunk(type="error", data={"message": f"LLM调用失败: {e}",
-                                                          "trace_id": ""})
+                schedule_trace_capture(turn_result.text)
+                yield ResponseChunk(type="error", data={
+                    "message": f"LLM调用失败: {exc}", "trace_id": "",
+                })
                 return
 
+            if turn_result.error:
+                print(f"[LLM:main] 请求消息数={len(llm_messages)}", flush=True)
+                for index, message in enumerate(llm_messages[-6:]):
+                    print(f"  [{index}] {json.dumps(message, ensure_ascii=False)[:200]}", flush=True)
+                await record("error", "main_agent", {"message": turn_result.error, "turn": turn})
+                capture_bad_case("main_agent_failure", "main_agent", turn_result.error)
+                await finish("failed")
+                schedule_trace_capture(turn_result.text)
+                yield ResponseChunk(type="error", data={
+                    "message": turn_result.error, "trace_id": "",
+                })
+                return
+
+            full_response = turn_result.text
+            full_reasoning = turn_result.reasoning
+            current_tool_calls = turn_result.tool_calls
             await record("assistant_turn", "main_agent", {
                 "turn": turn,
                 "content": full_response,
@@ -371,6 +407,7 @@ class AgentLoop:
             # 追加assistant(tool_calls)消息
             assistant_msg = build_assistant_message(full_response, full_reasoning, current_tool_calls, turn)
             ctx.messages.append(Message(**assistant_msg))
+
 
             # Process tool calls
             for tc in current_tool_calls:
@@ -641,16 +678,11 @@ class AgentLoop:
                 ))
 
             # 每轮结束后更新 + 立即同步持久化
-            session.messages = [m.to_dict() for m in ctx.messages]
-            session.token_count = self.context_builder.token_counter.count_messages(ctx.to_llm_messages())
-            try:
-                from novelagent.storage import models
-                await models.save_messages(session.session_id, session.messages, session.token_count, llm_client=self.llm)
-            except Exception as _e:
-                print(f"[save] 保存失败: {_e}", flush=True)
+            await self._persist_turn(session, ctx)
 
             # Loop detection
             if current_tool_calls == last_tool_calls:
+
                 loop_count = getattr(self, '_loop_count', 0) + 1
                 self._loop_count = loop_count
                 if loop_count >= self.loop_threshold:
@@ -675,38 +707,32 @@ class AgentLoop:
                 "turn": turn + 1, "position": "main_loop", "message_count": len(ctx.to_llm_messages()),
                 "tool_count": 0, "forced_finalization": True,
             })
-            final_reasoning = ""
+            final_result = MainTurnResult()
             try:
-                async for chunk in self.llm.chat(
-                    position="main_loop", messages=ctx.to_llm_messages(),
-                    tools=None, stream=True, tag=":main:finalize",
+                async for response_chunk in self._stream_main_turn(
+                    ctx.to_llm_messages(), None, ":main:finalize", final_result,
                 ):
-                    if chunk.type == "thinking":
-                        final_reasoning += chunk.content
-                        yield ResponseChunk(type="thinking", data={"content": chunk.content})
-                    elif chunk.type == "text_delta":
-                        final_text += chunk.content
-                        yield ResponseChunk(type="text_delta", data={"delta": chunk.content})
-                    elif chunk.type == "error":
-                        capture_bad_case("main_agent_failure", "main_agent", chunk.error,
-                                         params={"forced_finalization": True})
-                        break
-                    elif chunk.type == "done":
-                        break
+                    yield response_chunk
             except Exception as exc:
-                capture_bad_case("main_agent_failure", "main_agent", str(exc),
-                                 params={"forced_finalization": True})
+                final_result.error = str(exc)
+            if final_result.error:
+                capture_bad_case(
+                    "main_agent_failure", "main_agent", final_result.error,
+                    params={"forced_finalization": True},
+                )
+            final_text = final_result.text
             if final_text.strip():
                 ctx.messages.append(Message(
-                    role="assistant", content=final_text, reasoning_content=final_reasoning,
+                    role="assistant", content=final_text, reasoning_content=final_result.reasoning,
                 ))
                 await record("assistant_turn", "main_agent", {
                     "turn": turn + 1, "content": final_text,
-                    "reasoning_content": final_reasoning, "tool_names": [],
+                    "reasoning_content": final_result.reasoning, "tool_names": [],
                     "forced_finalization": True,
                 })
 
         # 7. The analyzer derives trace-backed atomic memories after the immutable trace is complete.
+
         if not final_text.strip():
             capture_bad_case(
                 "empty_response", "main_agent", "主 Agent 未返回有效内容",
