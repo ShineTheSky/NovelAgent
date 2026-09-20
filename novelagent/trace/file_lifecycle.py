@@ -15,6 +15,23 @@ PATTERN_PROMOTION_WEIGHT = 200
 MAX_RECORD_WEIGHT = 300
 
 
+def _merge_trace_refs(*groups: list[dict]) -> list[dict]:
+    merged: dict[tuple[str, int], list[str]] = {}
+    for refs in groups:
+        for ref in refs or []:
+            if not isinstance(ref, dict) or not ref.get("trace_id"):
+                continue
+            try:
+                key = (str(ref["trace_id"]), int(ref.get("turn") or 1))
+            except (TypeError, ValueError):
+                continue
+            merged.setdefault(key, []).extend(str(value) for value in ref.get("source_event_ids", []) if value)
+    return [
+        {"trace_id": trace_id, "turn": turn, "source_event_ids": list(dict.fromkeys(event_ids))}
+        for (trace_id, turn), event_ids in merged.items()
+    ]
+
+
 class FileLifecycleStore:
     def __init__(self, workspace_dir: str, project_id: str):
         self.project = Path(workspace_dir) / project_id
@@ -171,6 +188,7 @@ class FileLifecycleStore:
         )
         if existing:
             existing["trace_ids"] = list(dict.fromkeys([*existing.get("trace_ids", []), *trace_ids]))
+            existing["trace_refs"] = _merge_trace_refs(existing.get("trace_refs", []), memory.get("trace_refs", []))
             existing["weight"] = max(float(existing.get("weight", 0)), float(memory.get("weight", 0)))
             existing["support_count"] = max(
                 int(existing.get("support_count", 1)), int(memory.get("support_count", 1)),
@@ -185,6 +203,7 @@ class FileLifecycleStore:
             "kind": memory.get("kind", ""),
             "memory_ids": [memory_id],
             "trace_ids": trace_ids,
+            "trace_refs": memory.get("trace_refs", []),
             "weight": memory["weight"],
             "support_count": memory["support_count"],
         })
@@ -206,6 +225,7 @@ class FileLifecycleStore:
             })
         entry = {
             "trace_id": trace_id,
+            "trace_refs": list(incoming.get("trace_refs") or []),
             "source_event_ids": list(dict.fromkeys(source_event_ids)),
             "feedback_direction": str(incoming.get("feedback_direction") or "").strip(),
             "relation": str(incoming.get("feedback_relation") or "").strip(),
@@ -223,6 +243,7 @@ class FileLifecycleStore:
         merged["user_inputs"] = inputs
         merged["trace_id"] = trace_id
         merged["trace_ids"] = list(dict.fromkeys([*merged.get("trace_ids", []), trace_id]))
+        merged["trace_refs"] = _merge_trace_refs(merged.get("trace_refs", []), incoming.get("trace_refs", []))
         merged["source_event_ids"] = list(dict.fromkeys([*merged.get("source_event_ids", []), *source_event_ids]))
         anchors = list(merged.get("anchor_examples") or [])
         if not anchors and merged.get("anchor_excerpt"):

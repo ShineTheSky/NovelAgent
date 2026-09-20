@@ -78,7 +78,10 @@ def create_app() -> FastAPI:
 
     embedding_model = LocalEmbeddingModel(str(get_project_root() / embedding_cfg.get("model_path", "models/bge-base-zh-v1.5")))
     rag_store = RagStore(embedding_model)
-    bash_case_analyzer = BashCaseAnalyzer(llm_client, working_dir, cfg.get("bash_case_analysis"))
+    trace_store = TraceStore()
+    bash_case_analyzer = BashCaseAnalyzer(
+        llm_client, working_dir, cfg.get("bash_case_analysis"), trace_store,
+    )
     bash_case_recorder = BashCaseRecorder(working_dir, bash_case_analyzer)
     registry = ToolRegistry()
     for tool in [ReadTool(), WriteTool(), EditTool(), GlobTool(), GrepTool(), BashTool(bash_case_recorder), SubAgentTool(), AskUserQuestionTool(), CreateTraceCheckpointTool(), SearchRagTool(rag_store)]:
@@ -87,10 +90,12 @@ def create_app() -> FastAPI:
     permission_checker = PermissionChecker(working_dir)
     context_builder = ContextBuilder("prompts", token_limit=session_cfg.get("token_limit", 150_000))
     memory_manager = MemoryManager(working_dir, llm_client)
-    trace_store = TraceStore()
     trace_recorder = TraceRecorder(trace_store)
-    bad_case_analyzer = BadCaseAnalyzer(llm_client, working_dir, cfg.get("bad_case_analysis"))
+    bad_case_analyzer = BadCaseAnalyzer(
+        llm_client, working_dir, cfg.get("bad_case_analysis"), trace_store,
+    )
     bad_case_recorder = AgentBadCaseRecorder(trace_store, working_dir, bad_case_analyzer)
+    bash_case_analyzer.bad_case_recorder = bad_case_recorder
     embedding_gate = EmbeddingGate(
         str(get_project_root() / embedding_cfg.get("model_path", "models/bge-base-zh-v1.5")),
         enabled=embedding_cfg.get("enabled", True),
@@ -98,7 +103,9 @@ def create_app() -> FastAPI:
         routine_min_margin=float(embedding_cfg.get("routine_min_margin", 0.12)),
     )
     embedding_gate.embedding_model = embedding_model
-    post_turn_analyzer = FileTraceAnalyzer(llm_client, working_dir, trace_store, embedding_gate, rag_store)
+    post_turn_analyzer = FileTraceAnalyzer(
+        llm_client, working_dir, trace_store, embedding_gate, rag_store, bad_case_recorder,
+    )
     preference_context_provider = FilePatternContextProvider(working_dir)
 
     agent_config = {

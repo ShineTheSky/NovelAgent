@@ -10,12 +10,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from novelagent.trace.agent_run import AgentRunTrace
 
 
 class BashCaseAnalyzer:
     """Annotate each Bash case, then aggregate cases with the same LLM-defined purpose."""
 
-    def __init__(self, llm_client, workspace_dir: str, config: dict | None = None):
+    def __init__(self, llm_client, workspace_dir: str, config: dict | None = None, trace_store=None):
         settings = config or {}
         self.llm = llm_client
         self.directory = Path(workspace_dir).resolve().parent / "data" / "bash_cases"
@@ -23,6 +24,29 @@ class BashCaseAnalyzer:
         self.batch_size = max(2, int(settings.get("batch_size", 3)))
         self.max_cases = max(self.batch_size, int(settings.get("max_cases", 20)))
         self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self.trace_store = trace_store
+        self.bad_case_recorder = None
+
+    async def _start_trace(self, actor: str, title: str, *, session_id: str = "bash-case-analysis",
+                           project_id: str = "__agent_bad_cases__", source_trace_id: str = ""):
+        if not self.trace_store:
+            return None
+        return await AgentRunTrace.try_start(
+            self.trace_store, session_id=session_id, project_id=project_id,
+            actor=actor, position="bash_case_analysis", source_trace_id=source_trace_id, title=title,
+        )
+
+    async def _capture_failure(self, agent_trace, actor: str, error: Exception | str,
+                               prompt: str, session_id: str, project_id: str) -> None:
+        if agent_trace:
+            await agent_trace.finish("failed", error=str(error))
+        if self.bad_case_recorder:
+            await self.bad_case_recorder.capture(
+                source_trace_id=agent_trace.trace_id if agent_trace else "",
+                session_id=session_id, project_id=project_id,
+                failure_kind="bash_case_analysis_failure", actor=actor,
+                error=str(error), messages=[{"role": "user", "content": prompt}],
+            )
 
     @staticmethod
     def classify(command: str) -> str:
@@ -59,20 +83,47 @@ class BashCaseAnalyzer:
 只输出 JSON：{{"purpose":"一句中文说明实际用途","semantic_family":"稳定的英文 snake_case 用途分类","suggested_tool":"Read|Grep|Glob|SearchRag|其他工具名|none","reason":"为何可或不可替代为专用工具","confidence":0.0}}。
 复合命令要按整体目的分类；仅检查文件、版本、关键词、字数等属于读取/验证，不得误判为写入。semantic_family 必须只含小写字母、数字和下划线。'''
         text = ""
+        session_id = str(payload.get("session_id") or "bash-case-analysis")
+        project_id = str(payload.get("project_id") or "__agent_bad_cases__")
+        agent_trace = await self._start_trace(
+            "bash_case_annotator", f"[bash_case_annotator] {payload.get('id', '')}",
+            session_id=session_id, project_id=project_id,
+            source_trace_id=str(payload.get("source_trace_id") or ""),
+        )
         try:
+            if agent_trace:
+                agent_trace.add_request(
+                    position="bash_case_analysis", tag=":bash-case-annotation",
+                    messages=[{"role": "user", "content": prompt}], tools=None,
+                )
             async for chunk in self.llm.chat(
                 position="bash_case_analysis", messages=[{"role": "user", "content": prompt}],
                 tools=None, stream=False, tag=":bash-case-annotation", max_tokens=512,
             ):
                 if chunk.type == "text_delta":
                     text += chunk.content
+                    if agent_trace:
+                        agent_trace.add("text_delta", {"content": chunk.content})
+                elif chunk.type == "thinking" and agent_trace:
+                    agent_trace.add("thinking", {"content": chunk.content})
+                elif chunk.type == "error":
+                    raise RuntimeError(chunk.error or "Bash 用途标注调用失败")
         except Exception as exc:
             print(f"[bash_case] annotation failed: {exc}", flush=True)
+            await self._capture_failure(
+                agent_trace, "bash_case_annotator", exc, prompt, session_id, project_id,
+            )
             return {}
         data = self._json(text)
         purpose = str(data.get("purpose", "")).strip()
         if not purpose:
+            await self._capture_failure(
+                agent_trace, "bash_case_annotator", "Bash 用途标注未返回有效 JSON",
+                prompt, session_id, project_id,
+            )
             return {}
+        if agent_trace:
+            await agent_trace.finish("completed", text)
         try:
             confidence = float(data.get("confidence", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -129,18 +180,39 @@ class BashCaseAnalyzer:
 只输出 JSON：{{"summary":"","observed_pattern":"","risks":[{{"risk":"","evidence_case_ids":[""]}}],"tool_candidates":[{{"name":"","purpose":"","parameters":"","permission":"allow|ask|block","evidence_case_ids":[""]}}],"needs_more_evidence":false}}。
 只提出待人工审核的候选工具，不要声称已创建或已替换 Bash；如果样本不足、用途差异大或风险不清楚，needs_more_evidence=true。'''
         text = ""
+        agent_trace = await self._start_trace(
+            "bash_case_analyzer", f"[bash_case_analyzer] {family}",
+        )
         try:
+            if agent_trace:
+                agent_trace.add_request(
+                    position="bash_case_analysis", tag=":bash-case-analysis",
+                    messages=[{"role": "user", "content": prompt}], tools=None,
+                )
             async for chunk in self.llm.chat(
                 position="bash_case_analysis", messages=[{"role": "user", "content": prompt}],
                 tools=None, stream=False, tag=":bash-case-analysis", max_tokens=2048,
             ):
                 if chunk.type == "text_delta":
                     text += chunk.content
+                    if agent_trace:
+                        agent_trace.add("text_delta", {"content": chunk.content})
+                elif chunk.type == "thinking" and agent_trace:
+                    agent_trace.add("thinking", {"content": chunk.content})
+                elif chunk.type == "error":
+                    raise RuntimeError(chunk.error or "Bash 聚合分析调用失败")
             data = self._json(text)
-            if data:
-                await asyncio.to_thread(self._write_analysis, family, cases, data)
+            if not data:
+                raise ValueError("Bash 聚合分析未返回有效 JSON")
+            if agent_trace:
+                await agent_trace.finish("completed", text)
+            await asyncio.to_thread(self._write_analysis, family, cases, data)
         except Exception as exc:
             print(f"[bash_case] analysis failed for {family}: {exc}", flush=True)
+            await self._capture_failure(
+                agent_trace, "bash_case_analyzer", exc, prompt,
+                "bash-case-analysis", "__agent_bad_cases__",
+            )
 
     @staticmethod
     def _json(text: str) -> dict:

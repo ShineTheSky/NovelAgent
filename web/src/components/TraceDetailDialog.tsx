@@ -1,16 +1,21 @@
 import { useMemo } from 'react';
-import type { TraceEvent, TraceEvidence } from '../types/insights';
+import type { TraceEvent, TraceEvidence, TraceValidation } from '../types/insights';
 
 interface TraceDetailDialogProps {
   trace: TraceEvidence | null;
   loading: boolean;
   error: string | null;
   onClose: () => void;
+  validation?: TraceValidation | null;
+  onOpenTrace?: (traceId: string) => void;
+  onEventPage?: (offset: number) => void;
 }
 
-export function TraceDetailDialog({ trace, loading, error, onClose }: TraceDetailDialogProps) {
+export function TraceDetailDialog({ trace, loading, error, onClose, validation, onOpenTrace, onEventPage }: TraceDetailDialogProps) {
   const events = useMemo(() => compactTraceEvents(trace?.events ?? []), [trace?.events]);
   const loadedEvents = events.length;
+  const rawLoadedEvents = trace?.events?.length ?? 0;
+  const eventOffset = trace?.event_offset ?? 0;
   const totalEvents = trace?.event_count ?? loadedEvents;
 
   return (
@@ -35,15 +40,37 @@ export function TraceDetailDialog({ trace, loading, error, onClose }: TraceDetai
             <Metadata label="状态" value={trace.status} />
             <Metadata label="来源" value={trace.source === 'historical' ? '历史导入' : '实时采集'} />
             <Metadata label="操作类型" value={trace.operation_kind} />
+            <Metadata label="来源 Agent" value={trace.source_agent} mono />
+            <Metadata label="Agent Position" value={trace.agent_position} mono />
             <Metadata label="分析状态" value={trace.analysis_status} />
             <Metadata label="Token" value={String(trace.token_count ?? 0)} />
-            <Metadata label="事件" value={`${loadedEvents}${totalEvents > loadedEvents ? ` / ${totalEvents}` : ''}`} />
+            <Metadata label="事件" value={`${rawLoadedEvents}${totalEvents > rawLoadedEvents ? ` / ${totalEvents}` : ''}`} />
             <Metadata label="开始" value={formatDateTime(trace.started_at)} />
             <Metadata label="结束" value={formatDateTime(trace.finished_at)} />
             {trace.turn_no !== undefined && trace.turn_no !== null && <Metadata label="会话轮次" value={String(trace.turn_no)} />}
-            {trace.previous_trace_id && <Metadata label="上一 Trace" value={trace.previous_trace_id} mono />}
-            {trace.next_trace_id && <Metadata label="下一 Trace" value={trace.next_trace_id} mono />}
+            {trace.previous_trace_id && <TraceLink label="上一 Trace" traceId={trace.previous_trace_id} onOpenTrace={onOpenTrace} />}
+            {trace.next_trace_id && <TraceLink label="下一 Trace" traceId={trace.next_trace_id} onOpenTrace={onOpenTrace} />}
           </section>
+
+          {validation && <section className={`rounded-xl border p-4 ${validation.valid ? 'border-emerald-100 bg-emerald-50/50' : 'border-red-100 bg-red-50/50'}`}>
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <h4 className="text-sm font-semibold text-gray-700">完整性校验</h4>
+              <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${validation.valid ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>{validation.valid ? '链路正常' : '发现异常'}</span>
+            </div>
+            <div className="space-y-2">
+              {validation.checks.map(check => <div key={check.key} className="flex items-start gap-2 text-xs leading-5 text-gray-600">
+                <span className={check.status === 'pass' ? 'text-emerald-600' : check.status === 'warning' ? 'text-amber-600' : 'text-red-600'}>{check.status === 'pass' ? '✓' : check.status === 'warning' ? '!' : '✕'}</span>
+                <span>{check.message}</span>
+              </div>)}
+            </div>
+            {validation.chain_trace_ids.length > 1 && <div className="mt-3 flex flex-wrap items-center gap-1 text-[11px]">
+              <span className="mr-1 text-gray-400">链路</span>
+              {validation.chain_trace_ids.map((traceId, index) => <span key={traceId} className="flex items-center gap-1">
+                {index > 0 && <span className="text-gray-300">→</span>}
+                <button type="button" onClick={() => onOpenTrace?.(traceId)} disabled={!onOpenTrace || traceId === trace.trace_id} title={traceId} className="max-w-44 truncate rounded bg-white px-1.5 py-0.5 font-mono text-purple-600 disabled:text-gray-500">{traceId}</button>
+              </span>)}
+            </div>}
+          </section>}
 
           <TextSection title="用户输入" content={trace.user_message} empty="（无用户输入）" />
           <TextSection title="最终回答" content={trace.final_answer} empty="（无最终回答）" />
@@ -62,9 +89,9 @@ export function TraceDetailDialog({ trace, loading, error, onClose }: TraceDetai
           <section>
             <div className="mb-2 flex items-center justify-between gap-3">
               <h4 className="text-sm font-semibold text-gray-700">事件记录</h4>
-              <span className="text-[11px] text-gray-400">已加载 {loadedEvents} 条</span>
+              <span className="text-[11px] text-gray-400">已加载 {eventOffset + (rawLoadedEvents ? 1 : 0)}–{eventOffset + rawLoadedEvents} / {totalEvents}</span>
             </div>
-            {totalEvents > loadedEvents && <p className="mb-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700">该 Trace 共 {totalEvents} 个事件，接口当前返回前 {loadedEvents} 个。</p>}
+            {totalEvents > rawLoadedEvents && <p className="mb-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700">该 Trace 共 {totalEvents} 个事件，当前显示从第 {eventOffset + 1} 条开始的 {rawLoadedEvents} 条。</p>}
             <div className="space-y-3">
               {events.map(event => <article key={event.event_id} className="rounded-xl border border-gray-100 bg-white p-4 shadow-sm">
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-gray-400">
@@ -84,11 +111,24 @@ export function TraceDetailDialog({ trace, loading, error, onClose }: TraceDetai
               </article>)}
               {!events.length && <div className="rounded-xl border border-dashed border-gray-200 py-10 text-center text-sm text-gray-400">该 Trace 没有事件。</div>}
             </div>
+            {onEventPage && totalEvents > rawLoadedEvents && <div className="mt-4 flex justify-end gap-2">
+              <button type="button" disabled={eventOffset === 0} onClick={() => onEventPage(Math.max(0, eventOffset - 500))} className="rounded-md border px-3 py-1.5 text-xs text-gray-600 disabled:opacity-40">上一批事件</button>
+              <button type="button" disabled={eventOffset + rawLoadedEvents >= totalEvents} onClick={() => onEventPage(eventOffset + rawLoadedEvents)} className="rounded-md border px-3 py-1.5 text-xs text-purple-600 disabled:opacity-40">下一批事件</button>
+            </div>}
           </section>
         </div>}
       </main>
     </div>
   );
+}
+
+function TraceLink({ label, traceId, onOpenTrace }: { label: string; traceId: string; onOpenTrace?: (traceId: string) => void }) {
+  return <div className="min-w-0">
+    <div className="text-[11px] text-gray-400">{label}</div>
+    {onOpenTrace
+      ? <button type="button" onClick={() => onOpenTrace(traceId)} title={traceId} className="mt-1 break-all text-left font-mono text-[11px] text-purple-600 hover:underline">{traceId}</button>
+      : <div title={traceId} className="mt-1 break-all font-mono text-[11px]">{traceId}</div>}
+  </div>;
 }
 
 function Metadata({ label, value, mono = false }: { label: string; value?: string; mono?: boolean }) {

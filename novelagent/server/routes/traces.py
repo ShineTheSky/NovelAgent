@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from novelagent.trace.file_lifecycle import FileLifecycleStore
 from novelagent.trace.store import TraceStore
@@ -90,14 +90,27 @@ async def list_session_traces(session_id: str, request: Request):
 
 
 @router.get("/traces/{trace_id}")
-async def get_trace(trace_id: str, request: Request):
+async def get_trace(trace_id: str, request: Request, event_limit: int = Query(500, ge=1, le=500),
+                    event_offset: int = Query(0, ge=0)):
     """Return one immutable trace and its ordered, nested events for replay/analysis."""
     trace = await _store(request).get_trace(trace_id)
     if trace is None:
         raise HTTPException(status_code=404, detail="Trace 不存在")
-    trace["events"] = await _store(request).list_events(trace_id, limit=500)
+    trace["events"] = await _store(request).list_events(
+        trace_id, limit=event_limit, offset=event_offset,
+    )
+    trace["event_count"] = await _store(request).count_events(trace_id)
+    trace["event_offset"] = event_offset
     trace["classification"] = await _store(request).get_trace_classification(trace_id)
     return trace
+
+
+@router.get("/traces/{trace_id}/validation")
+async def validate_trace(trace_id: str, request: Request):
+    result = await _store(request).validate_trace_chain(trace_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Trace 不存在")
+    return result
 
 
 @router.get("/traces/{trace_id}/context")
@@ -115,3 +128,23 @@ async def get_trace_context(trace_id: str, request: Request, before: int = 2, af
 async def list_project_traces(project_id: str, request: Request):
     """List the project's immutable trace evidence records."""
     return await _store(request).list_project_traces(project_id, limit=100)
+
+
+@router.get("/projects/{project_id}/trace-management")
+async def manage_project_traces(
+    project_id: str, request: Request, q: str = "", session_id: str = "",
+    status: str = "", operation_kind: str = "", analysis_status: str = "", source_agent: str = "",
+    limit: int = Query(25, ge=1, le=100), offset: int = Query(0, ge=0),
+):
+    """Read-only, filtered Trace inventory for the management panel."""
+    return await _store(request).list_project_traces_page(
+        project_id, search=q.strip(), session_id=session_id.strip(),
+        status=status.strip(), operation_kind=operation_kind.strip(),
+        analysis_status=analysis_status.strip(), source_agent=source_agent.strip(),
+        limit=limit, offset=offset,
+    )
+
+
+@router.get("/projects/{project_id}/trace-agent-stats")
+async def trace_agent_stats(project_id: str, request: Request):
+    return await _store(request).get_project_trace_agent_stats(project_id)

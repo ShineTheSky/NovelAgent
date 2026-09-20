@@ -18,6 +18,8 @@ class AgentBadCaseRecorder:
         self.store = store
         self.directory = Path(workspace_dir).resolve().parent / "data" / "agent_bad_cases"
         self.analyzer = analyzer
+        if analyzer is not None:
+            analyzer.bad_case_recorder = self
 
     @staticmethod
     def _snapshot(messages: list[dict] | None) -> list[dict]:
@@ -45,11 +47,14 @@ class AgentBadCaseRecorder:
         params: dict | None = None,
         messages: list[dict] | None = None,
         duration_ms: float | None = None,
+        schedule_analysis: bool = True,
     ) -> str:
         """Persist a separate bad-case trace and review file. Never raises to the caller."""
         try:
             title = f"[Agent bad case] {failure_kind}: {tool or actor}"
-            trace_id = await self.store.create_trace(session_id, GLOBAL_PROJECT_ID, title)
+            trace_id = await self.store.create_trace(
+                session_id, GLOBAL_PROJECT_ID, title, source_agent=actor, agent_position="bad_case",
+            )
             await self.store.set_trace_operation(trace_id, "agent_bad_case", "skipped")
             metadata = sanitize_payload({
                 "source_trace_id": source_trace_id,
@@ -73,7 +78,7 @@ class AgentBadCaseRecorder:
             })
             await self.store.finish_trace(trace_id, "failed", str(error)[:16_000])
             await asyncio.to_thread(self._write_file, trace_id, metadata, self._snapshot(messages))
-            if self.analyzer:
+            if self.analyzer and schedule_analysis:
                 self.analyzer.schedule(trace_id, metadata)
             return trace_id
         except Exception as exc:

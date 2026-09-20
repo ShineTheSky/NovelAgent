@@ -41,9 +41,43 @@ class TraceRecorder:
         self._states: dict[str, dict] = {}
 
     async def start(self, session_id: str, project_id: str, user_message: str) -> str:
-        trace_id = await self.store.create_trace(session_id, project_id, user_message)
+        trace_id = await self.store.create_trace(
+            session_id, project_id, user_message, source_agent="main_agent", agent_position="main_loop",
+        )
         self._states[trace_id] = {"sequence": 0, "lock": asyncio.Lock()}
         await self.record(trace_id, "user_message", "user", {"content": user_message})
+        return trace_id
+
+    async def start_continuation(self, session_id: str, project_id: str, previous_trace_id: str,
+                                 messages: list[dict], reason: str = "context_compression") -> str:
+        """Start a new main Trace after the active context has been replaced."""
+        latest_user_content = next((
+            str(message.get("content", "")).strip()
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") == "user"
+            and not str(message.get("content", "")).startswith("[上下文压缩]")
+        ), "continuation")
+        trace_id = await self.store.create_trace(
+            session_id, project_id, f"[{reason}] {latest_user_content[:200]}",
+            source_agent="main_agent", agent_position="main_loop",
+        )
+        await self.store.link_trace_successor(previous_trace_id, trace_id)
+        self._states[trace_id] = {"sequence": 0, "lock": asyncio.Lock()}
+        await self.record(trace_id, "trace_continued", "system", {
+            "previous_trace_id": previous_trace_id, "reason": reason,
+        })
+        chunk_size = 12_000
+        for message_index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            content = str(message.get("content", ""))
+            chunks = [content[index:index + chunk_size] for index in range(0, len(content), chunk_size)] or [""]
+            metadata = {key: value for key, value in message.items() if key != "content"}
+            for chunk_index, chunk in enumerate(chunks):
+                await self.record(trace_id, "context_snapshot_message", "system", {
+                    "message_index": message_index, "chunk_index": chunk_index,
+                    "chunk_count": len(chunks), "content": chunk, **metadata,
+                })
         return trace_id
 
     async def record(self, trace_id: str, event_type: str, actor: str, payload: dict | None = None,

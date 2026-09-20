@@ -12,9 +12,11 @@ from novelagent.core.session import InternalRequest, ResponseChunk, Session
 from novelagent.tools.base import ToolContext, ToolResult, PermissionResult
 
 from novelagent.context.message_manager import Message, MessageManager
+from novelagent.context.compression import build_cumulative_compression
 from novelagent.security.audit import audit_log
 from novelagent.core.llm_turn import FINALIZATION_PROMPT, build_assistant_message
 from novelagent.trace.recorder import TraceRecorder, sanitize_payload
+from novelagent.trace.store import TraceStore
 from novelagent.trace.agent_bad_cases import AgentBadCaseRecorder
 from novelagent.trace.stream_compaction import TraceStreamBuffer
 from novelagent.memory.memory_manager import MemoryManager
@@ -44,6 +46,7 @@ class AgentLoop:
         self._config = config or {}
         self.max_turns = self._config.get("max_turns", 20)
         self.token_limit = self._config.get("token_limit", 150_000)
+        self.compression_threshold = float(self._config.get("compression_threshold", 0.8))
         self.loop_threshold = self._config.get("loop_detection_threshold", 3)
         self.trace_interval = self._config.get("trace_interval", 5)
         self.working_dir = self._config.get("working_dir", "./workspace")
@@ -113,6 +116,7 @@ class AgentLoop:
             event_id = await self.trace.record(trace_id, event_type, actor, payload, parent_event_id, duration_ms) if self.trace else f"deferred_{trace_event_sequence}"
             deferred_trace_events.append({
                 "event_id": event_id,
+                "trace_id": trace_id,
                 "event_type": event_type,
                 "actor": actor,
                 "payload": sanitize_payload(payload or {}),
@@ -128,6 +132,7 @@ class AgentLoop:
 
         pi = project_info or {}
         trace_checkpoint_requested = False
+        compression_trace_requested = False
 
         # 项目记忆预取仍与项目工作区绑定；自动 Trace 记忆则持久化到 SQLite。
         import os as _os
@@ -135,6 +140,10 @@ class AgentLoop:
             _os.path.join(self.working_dir, session.project_id),
             self.llm,
             self._config.get("global_memory_dir"),
+            bad_case_recorder=self.bad_cases,
+            session_id=session.session_id,
+            project_id=session.project_id,
+            source_trace_id=trace_id,
         )
 
         # 1. Read memory.md once and start relevance prefetch from that same snapshot.
@@ -165,11 +174,12 @@ class AgentLoop:
         )
 
         def capture_bad_case(failure_kind: str, actor: str, error: str, *, tool: str = "",
-                             params: dict | None = None, duration_ms: float | None = None) -> None:
+                             params: dict | None = None, duration_ms: float | None = None,
+                             source_agent_trace_id: str = "") -> None:
             if not self.bad_cases:
                 return
             asyncio.create_task(self.bad_cases.capture(
-                source_trace_id=trace_id,
+                source_trace_id=source_agent_trace_id or trace_id,
                 session_id=session.session_id,
                 project_id=session.project_id,
                 failure_kind=failure_kind,
@@ -245,8 +255,10 @@ class AgentLoop:
                 snapshot,
                 event_snapshot,
                 token_count if token_count is not None else self.context_builder.token_counter.count_messages(snapshot),
-                trace_checkpoint_requested or force_capture,
-                "agent_request" if trace_checkpoint_requested else reason,
+                trace_checkpoint_requested or compression_trace_requested or force_capture,
+                "agent_request" if trace_checkpoint_requested else (
+                    "compression" if compression_trace_requested else reason
+                ),
                 append_turn,
             ))
 
@@ -259,7 +271,7 @@ class AgentLoop:
         # 3. Wait for memory prefetch (1.5s timeout)
         memory_injection = []
         try:
-            memories = await asyncio.wait_for(prefetch_task, timeout=1.5)
+            memories = await prefetch_task
             if memories:
                 memory_injection = memories
                 injection_text = "[相关记忆附件]\n" + "\n---\n".join(memories)
@@ -284,42 +296,80 @@ class AgentLoop:
 
         # 5.5. 进入循环前先检查是否需要压缩
         pre_check_tokens = self.context_builder.token_counter.count_messages(ctx.to_llm_messages())
-        if self.context_builder.token_counter.needs_compression(ctx.to_llm_messages(), self.token_limit):
+        if self.context_builder.token_counter.needs_compression(
+            ctx.to_llm_messages(), self.token_limit, self.compression_threshold,
+        ):
             t0 = time.time()
             print(f"[compress] 进入循环前触发压缩: {pre_check_tokens} tokens", flush=True)
             yield ResponseChunk(type="thinking", data={"content": "上下文过长，正在压缩…"})
             await record("context_compression", "system", {"before_token_count": pre_check_tokens})
-            # Copy the complete context before compression, then persist and
-            # analyze it in the background without delaying compression.
-            schedule_trace_capture(
-                force_capture=True,
-                append_turn=False,
-                messages_snapshot=ctx.to_llm_messages(),
-                token_count=pre_check_tokens,
-                reason="compression",
-            )
-            # 发送完整消息历史给 LLM 生成摘要
+            compression_meta = {}
             try:
-                non_system = [m for m in ctx.messages if m.role != "system"]
-                history_text = "\n".join(f"[{m.role}]: {m.content[:500]}" for m in non_system if m.content)
-                prompt = f"请将以下对话历史压缩为一段简洁摘要（300字以内），保留关键决策、人物变更、用户偏好：\n\n{history_text[-8000:]}"
-                summary = ""
-                async for chunk in self.llm.chat(
-                    position="context_compression",
-                    messages=[{"role": "user", "content": prompt}],
-                    tools=None, stream=False, tag=":compress",
-                ):
-                    if chunk.type == "text_delta":
-                        summary += chunk.content
-                summary = summary.strip()[:500]
-            except Exception:
-                summary = f"项目={pi.get('name', '')}，已完成{len(session.messages)}轮对话"
-            # 保留最近4条消息 + LLM摘要
-            recent = non_system[-4:] if len(non_system) > 4 else non_system
-            summary_msg = Message(role="user", content=f"[上下文压缩] {summary}")
-            ctx.messages = [summary_msg] + recent
+                compression_store = self.trace.store if self.trace else TraceStore()
+                compression_meta = await build_cumulative_compression(
+                    compression_store, session.session_id,
+                    current_user_message=request.content,
+                    legacy_messages=session.messages,
+                )
+                compressed_messages = [
+                    Message.from_dict(message) for message in compression_meta["messages"]
+                ]
+                await compression_store.save_session_compression_state(
+                    session.session_id,
+                    compression_meta.get("last_compressed_turn_no", 0),
+                    compression_meta.get("state_messages", []),
+                )
+            except Exception as exc:
+                capture_bad_case(
+                    "context_compression_failure", "context_compression", str(exc),
+                    params={"token_count": pre_check_tokens},
+                    source_agent_trace_id="",
+                )
+                await finish("failed")
+                yield ResponseChunk(type="error", data={
+                    "message": f"上下文压缩失败，原会话未修改：{exc}",
+                })
+                return
+            # Compression is a pure composition: memory summary + uncovered turns.
+            ctx.messages = compressed_messages
             session.messages = [m.to_dict() for m in ctx.messages]
             session.token_count = self.context_builder.token_counter.count_messages(ctx.to_llm_messages())
+            previous_trace_id = trace_id
+            continuation_trace_id = await self.trace.start_continuation(
+                session.session_id, session.project_id, previous_trace_id,
+                ctx.to_llm_messages(), reason="context_compression",
+            ) if self.trace else f"op_{uuid.uuid4().hex}"
+            if self.trace:
+                await self.trace.record(continuation_trace_id, "compression_summary_source", "system", {
+                    "summary_window_ids": compression_meta.get("summary_window_ids", []),
+                    "summary_trace_ids": compression_meta.get("summary_trace_ids", []),
+                    "summary_count": compression_meta.get("summary_count", 0),
+                    "previous_compression_turn_no": compression_meta.get("previous_compression_turn_no", 0),
+                    "last_compressed_turn_no": compression_meta.get("last_compressed_turn_no", 0),
+                    "uncovered_turn_count": compression_meta.get("uncovered_turn_count", 0),
+                })
+            await record("context_compression_completed", "system", {
+                "before_token_count": pre_check_tokens,
+                "after_token_count": session.token_count,
+                "next_trace_id": continuation_trace_id,
+                "compression_trace_id": "",
+                "summary_window_ids": compression_meta.get("summary_window_ids", []),
+                "summary_count": compression_meta.get("summary_count", 0),
+                "previous_compression_turn_no": compression_meta.get("previous_compression_turn_no", 0),
+                "last_compressed_turn_no": compression_meta.get("last_compressed_turn_no", 0),
+                "uncovered_turn_count": compression_meta.get("uncovered_turn_count", 0),
+            })
+            if self.trace:
+                await self.trace.finish(
+                    previous_trace_id, "compressed",
+                    f"使用 {compression_meta.get('summary_count', 0)} 个 Memory Summary",
+                    pre_check_tokens,
+                )
+            trace_id = continuation_trace_id
+            compression_trace_requested = True
+            session.active_trace_id = trace_id
+            tool_ctx.operation_id = f"op_{session.session_id}_{trace_id}"
+            tool_ctx.source_trace_id = trace_id
             try:
                 project_memory.rebuild_index()
             except OSError as exc:
@@ -545,32 +595,20 @@ class AgentLoop:
                         operation_id=f"{tool_ctx.operation_id}:{preset}",
                         run_id=subagent_run_id,
                         context_as_user_message=preset == "reviewer",
+                        source_trace_id=trace_id,
                     ):
                         await subagent_trace_stream.add(
                             f"subagent_{sub_chunk.type}", f"subagent:{preset}", sub_chunk.data, tool_event_id,
                         )
-                        if sub_chunk.type == "tool_result" and not sub_chunk.data.get("success", False):
-                            capture_bad_case(
-                                "tool_failure", f"subagent:{preset}", sub_chunk.data.get("error", "子 Agent 工具调用失败"),
-                                tool=sub_chunk.data.get("tool", ""), params=sub_chunk.data.get("params", {}),
-                            )
                         if sub_chunk.type == "error":
                             subagent_failed = True
                             subagent_result_text = f"Error: {sub_chunk.data.get('message', '子 Agent 执行失败')}"
-                            capture_bad_case(
-                                "subagent_failure", f"subagent:{preset}", sub_chunk.data.get("message", "子 Agent 执行失败"),
-                                tool="SubAgent", params={"preset": preset, "task": task},
-                            )
                         if sub_chunk.type == "subagent_done":
                             subagent_result_text = sub_chunk.data.get("result", "")
                             writer_revision_events = sub_chunk.data.get("revision_events", [])
                             if sub_chunk.data.get("empty_result"):
                                 subagent_failed = True
                                 subagent_result_text = "Error: 子 Agent 未返回有效内容"
-                                capture_bad_case(
-                                    "empty_response", f"subagent:{preset}", "子 Agent 未返回有效内容",
-                                    tool="SubAgent", params={"preset": preset, "task": task, "run_id": subagent_run_id},
-                                )
                             # 转发subagent_done让前端显示完成消息+结果预览
                             yield sub_chunk
                             if show_result and not sub_chunk.data.get("empty_result") and subagent_result_text and not subagent_result_text.startswith("Error:"):
@@ -592,6 +630,7 @@ class AgentLoop:
                             async for workflow_chunk in self.review_workflow.run(
                                 session, event["path"], task, f"{tool_ctx.operation_id}:{event['revision_id']}",
                                 parent_run_id=subagent_run_id,
+                                source_trace_id=trace_id,
                             ):
                                 if (
                                     workflow_chunk.type == "subagent_done"
@@ -604,20 +643,6 @@ class AgentLoop:
                                     f"workflow:{workflow_chunk.data.get('workflow', 'review_polish')}",
                                     workflow_chunk.data, tool_event_id,
                                 )
-                                if workflow_chunk.type == "error":
-                                    capture_bad_case(
-                                        workflow_chunk.data.get("failure_kind", "subagent_failure"),
-                                        f"workflow:{workflow_chunk.data.get('workflow', 'review_polish')}",
-                                        workflow_chunk.data.get("message", "自动审阅或润色失败"),
-                                        tool="SubAgent", params={"workflow": workflow_chunk.data.get("workflow", "")},
-                                    )
-                                elif workflow_chunk.type == "tool_result" and not workflow_chunk.data.get("success", False):
-                                    capture_bad_case(
-                                        "tool_failure",
-                                        f"workflow:{workflow_chunk.data.get('workflow', 'review_polish')}",
-                                        workflow_chunk.data.get("error", "工作流工具调用失败"),
-                                        tool=workflow_chunk.data.get("tool", ""), params=workflow_chunk.data.get("params", {}),
-                                    )
                                 yield workflow_chunk
                             await workflow_trace_stream.flush()
 

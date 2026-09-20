@@ -9,7 +9,7 @@ import type {
   StreamEvent,
 } from '../types/chat';
 import type { LLMPositionUpdate, LLMSettings, ProviderSettingsUpdate } from '../types/llm';
-import type { LifecycleRecord, TraceEvidence } from '../types/insights';
+import type { LifecycleRecord, TraceAgentStats, TraceEvidence, TracePage, TraceValidation } from '../types/insights';
 import type { MaterialDocument, MaterialTree, NovelDocument, NovelTree } from '../types/novel';
 
 const BASE = '/api';
@@ -389,8 +389,40 @@ export function fetchProjectTraces(projectId: string) {
   return requestJson<TraceEvidence[]>(`/projects/${resourceId(projectId)}/traces`);
 }
 
-export function fetchTrace(traceId: string) {
-  return requestJson<TraceEvidence>(`/traces/${resourceId(traceId)}`);
+export function fetchTrace(traceId: string, eventOffset = 0) {
+  return requestJson<TraceEvidence>(`/traces/${resourceId(traceId)}?event_limit=500&event_offset=${eventOffset}`);
+}
+
+export interface TraceQuery {
+  q?: string;
+  sessionId?: string;
+  status?: string;
+  operationKind?: string;
+  analysisStatus?: string;
+  sourceAgent?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export function fetchManagedTraces(projectId: string, query: TraceQuery = {}) {
+  const params = new URLSearchParams();
+  if (query.q) params.set('q', query.q);
+  if (query.sessionId) params.set('session_id', query.sessionId);
+  if (query.status) params.set('status', query.status);
+  if (query.operationKind) params.set('operation_kind', query.operationKind);
+  if (query.analysisStatus) params.set('analysis_status', query.analysisStatus);
+  if (query.sourceAgent) params.set('source_agent', query.sourceAgent);
+  params.set('limit', String(query.limit ?? 25));
+  params.set('offset', String(query.offset ?? 0));
+  return requestJson<TracePage>(`/projects/${resourceId(projectId)}/trace-management?${params}`);
+}
+
+export function validateTrace(traceId: string) {
+  return requestJson<TraceValidation>(`/traces/${resourceId(traceId)}/validation`);
+}
+
+export function fetchTraceAgentStats(projectId: string) {
+  return requestJson<TraceAgentStats>(`/projects/${resourceId(projectId)}/trace-agent-stats`);
 }
 
 export type { Message };

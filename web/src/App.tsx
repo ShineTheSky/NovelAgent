@@ -9,6 +9,7 @@ import { ProjectOverview } from './components/ProjectOverview';
 import { RagPanel } from './components/RagPanel';
 import { Sidebar } from './components/Sidebar';
 import { TokenBar } from './components/TokenBar';
+import { TraceManagementPanel } from './components/TraceManagementPanel';
 import { useChat } from './hooks/useChat';
 
 export default function App() {
@@ -88,6 +89,7 @@ export default function App() {
           )}
           <div className="flex shrink-0 items-center gap-2">
             {chat.activeSession && <TokenBar tokenCount={chat.tokenCount} limit={150000} onCompress={chat.handleCompress} disabled={chat.loading} />}
+            <TraceManagementPanel key={chat.activeProject ?? 'no-project'} projectId={chat.activeProject} />
             <FileInsightsPanel projectId={chat.activeProject} />
             <button type="button" onClick={() => setShowRag(true)} className="rounded-md border border-gray-200 px-2.5 py-1.5 text-xs text-gray-600 hover:border-purple-300 hover:text-purple-600">资料库</button>
             <LLMSettingsPanel />

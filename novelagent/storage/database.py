@@ -81,6 +81,8 @@ async def init():
         await _ensure_column(db, "traces", "turn_no", "INTEGER")
         await _ensure_column(db, "traces", "previous_trace_id", "TEXT")
         await _ensure_column(db, "traces", "next_trace_id", "TEXT")
+        await _ensure_column(db, "traces", "source_agent", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "traces", "agent_position", "TEXT NOT NULL DEFAULT ''")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS session_trace_turns (
                 session_id TEXT NOT NULL,
@@ -123,6 +125,19 @@ async def init():
                 messages_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 finished_at TEXT,
+                FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+            )
+        """)
+        await _ensure_column(db, "trace_analysis_windows", "summary", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "trace_analysis_windows", "summary_trace_id", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "trace_analysis_windows", "summary_start_turn_no", "INTEGER")
+        await _ensure_column(db, "trace_analysis_windows", "summary_end_turn_no", "INTEGER")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS session_compression_state (
+                session_id TEXT PRIMARY KEY,
+                last_compressed_turn_no INTEGER NOT NULL DEFAULT 0,
+                messages_json TEXT NOT NULL DEFAULT '[]',
+                compressed_at TEXT NOT NULL DEFAULT (datetime('now')),
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
             )
         """)
@@ -178,6 +193,32 @@ async def init():
                 FOREIGN KEY (trace_id) REFERENCES traces(trace_id),
                 UNIQUE(trace_id, sequence_no)
             )
+        """)
+        # Older Trace rows predate explicit Agent provenance. Backfill only
+        # derivable values; future rows record these fields at creation time.
+        await db.execute("""
+            UPDATE traces SET source_agent = CASE
+                WHEN operation_kind = 'agent_run' THEN COALESCE(
+                    (SELECT actor FROM trace_events
+                     WHERE trace_events.trace_id = traces.trace_id AND event_type = 'agent_started'
+                     ORDER BY sequence_no LIMIT 1), '')
+                WHEN operation_kind = 'agent_bad_case' THEN COALESCE(
+                    (SELECT actor FROM trace_events
+                     WHERE trace_events.trace_id = traces.trace_id AND event_type = 'error'
+                     ORDER BY sequence_no LIMIT 1), '')
+                WHEN operation_kind IN ('conversation', 'context_transition', 'routine', 'tool_only')
+                    THEN 'main_agent'
+                ELSE source_agent
+            END
+            WHERE source_agent = ''
+        """)
+        await db.execute("""
+            UPDATE traces SET agent_position = CASE
+                WHEN operation_kind IN ('conversation', 'context_transition', 'routine', 'tool_only')
+                    THEN 'main_loop'
+                ELSE agent_position
+            END
+            WHERE agent_position = ''
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS trace_memories (

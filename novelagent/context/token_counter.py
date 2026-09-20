@@ -1,5 +1,6 @@
 """Token精确计算"""
 
+import json
 import tiktoken
 
 
@@ -18,10 +19,11 @@ class TokenCounter:
         for msg in messages:
             total += self.count(str(msg.get("content", "")))
             total += self.count(msg.get("role", ""))
-            # Tool calls overhead
+            total += self.count(str(msg.get("reasoning_content", "")))
+            total += self.count(str(msg.get("tool_call_id", "")))
+            total += self.count(str(msg.get("name", "")))
             for tc in msg.get("tool_calls", []):
-                total += self.count(str(tc.get("name", "")))
-                total += self.count(str(tc.get("input", "")))
+                total += self.count(json.dumps(tc, ensure_ascii=False, default=str))
         return total
 
     def needs_compression(self, messages: list[dict], token_limit: int, threshold: float = 0.8) -> bool:

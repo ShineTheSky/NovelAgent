@@ -65,7 +65,7 @@ positions:
     # provider: deepseek
     # model: deepseek-v4-pro
     model: MiniMax-M2.7
-    max_tokens: 16384
+    max_tokens: 300000
     timeout: 600
 
   sub_agent:
@@ -73,20 +73,21 @@ positions:
     # provider: deepseek
     # model: deepseek-v4-pro
     model: MiniMax-M2.7
-    max_tokens: 8192
+    max_tokens: 300000
     temperature: 0.6
     timeout: 90
     overrides:
       chapter_writer:
         provider: minimax
         model: MiniMax-M2.7
-        max_tokens: 16384
+        max_tokens: 300000
       reviewer:
         temperature: 0.3
       character_designer:
         temperature: 0.5
       outliner:
         temperature: 0.4
+        max_tokens: 300000
 
   memory_prefetch:
     provider: minimax

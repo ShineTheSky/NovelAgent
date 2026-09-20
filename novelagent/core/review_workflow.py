@@ -111,7 +111,8 @@ class ReviewPolishWorkflow:
         ])
         return context, self._memory_context(project_id)
 
-    async def run(self, parent_session, chapter_path: str, writer_task: str, operation_id: str, parent_run_id: str = ""):
+    async def run(self, parent_session, chapter_path: str, writer_task: str, operation_id: str,
+                  parent_run_id: str = "", source_trace_id: str = ""):
         artifact_context, memory_context = self._artifact_context(parent_session.project_id, chapter_path)
         reviewer_task = (
             f"审阅 `{chapter_path}`。这是写作 Agent 刚提交的版本；只输出可执行的结构化审阅报告，"
@@ -127,6 +128,7 @@ class ReviewPolishWorkflow:
             actor="reviewer", operation_id=f"{operation_id}:review",
             parent_run_id=parent_run_id, workflow="auto_review",
             context_as_user_message=True,
+            source_trace_id=source_trace_id,
         ):
             if chunk.type == "subagent_done":
                 reviewer_result = chunk.data.get("result", "")
@@ -157,6 +159,7 @@ class ReviewPolishWorkflow:
             extra_context=memory_context, artifact_context=artifact_context,
             actor="polisher", operation_id=f"{operation_id}:polish",
             parent_run_id=parent_run_id, workflow="auto_polish",
+            source_trace_id=source_trace_id,
         ):
             if chunk.type == "subagent_done":
                 polisher_result = chunk.data.get("result", "")

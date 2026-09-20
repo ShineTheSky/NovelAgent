@@ -7,6 +7,8 @@ export interface LifecycleRecord {
   domain: 'writing' | 'outline' | 'overall';
   kind?: 'text_feedback' | 'review_issue' | string;
   trace_id?: string;
+  trace_ids?: string[];
+  trace_refs?: Array<{ trace_id: string; turn: number; source_event_ids?: string[] }>;
   source_event_ids?: string[];
   weight: number;
   support_count?: number;
@@ -47,13 +49,16 @@ export interface TraceEvidence {
   final_answer: string;
   status: string;
   source: 'live' | 'historical';
-  operation_kind: 'conversation' | 'routine' | 'tool_only' | 'system';
+  operation_kind: 'conversation' | 'context_transition' | 'agent_run' | 'routine' | 'tool_only' | 'system' | string;
   analysis_status: 'pending' | 'complete' | 'skipped';
   token_count: number;
   event_count?: number;
+  event_offset?: number;
   turn_no?: number | null;
   previous_trace_id?: string | null;
   next_trace_id?: string | null;
+  source_agent?: string;
+  agent_position?: string;
   started_at: string;
   finished_at?: string;
   has_error: boolean;
@@ -63,4 +68,29 @@ export interface TraceEvidence {
   is_classified?: boolean;
   classification?: TraceClassification | null;
   events?: TraceEvent[];
+}
+
+export interface TracePage {
+  items: TraceEvidence[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface TraceValidation {
+  trace_id: string;
+  valid: boolean;
+  chain_trace_ids: string[];
+  terminal_trace_id: string;
+  checks: Array<{
+    key: string;
+    status: 'pass' | 'fail' | 'warning';
+    message: string;
+  }>;
+}
+
+export interface TraceAgentStats {
+  sources: Array<{ agent: string; count: number }>;
+  participants: Array<{ agent: string; count: number }>;
+  total: number;
 }

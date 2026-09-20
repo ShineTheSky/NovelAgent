@@ -11,6 +11,8 @@ from pydantic import BaseModel
 from novelagent.core.session import InternalRequest, Session
 from novelagent.server.sse import sse_stream
 from novelagent.storage.database import get_connection
+from novelagent.trace.recorder import TraceRecorder
+from novelagent.context.compression import build_cumulative_compression
 
 router = APIRouter(prefix="/api")
 
@@ -40,7 +42,6 @@ async def delete_session(session_id: str, request: Request):
 @router.post("/sessions/{session_id}/compress")
 async def force_compress(session_id: str, request: Request):
     """立即执行上下文压缩，保留最近消息 + 摘要，重整索引"""
-    import sys
     from novelagent.context.token_counter import TokenCounter
 
     session = await _get_or_load_session(session_id, request)
@@ -50,40 +51,63 @@ async def force_compress(session_id: str, request: Request):
 
     token_counter = TokenCounter()
     original_count = token_counter.count_messages(msg_dicts)
-    token_limit = request.app.state.config.get("session", {}).get("token_limit", 64000)
+    trace_store = request.app.state.trace_store
+    try:
+        compression_meta = await build_cumulative_compression(
+            trace_store, session.session_id, legacy_messages=msg_dicts,
+        )
+    except Exception as exc:
+        bad_cases = request.app.state.agent_loop.bad_cases
+        if bad_cases:
+            await bad_cases.capture(
+                source_trace_id=await trace_store.latest_session_turn_trace(session_id),
+                session_id=session.session_id, project_id=session.project_id,
+                failure_kind="context_compression_failure", actor="context_compression",
+                error=str(exc), messages=msg_dicts[-8:],
+            )
+        raise HTTPException(status_code=500, detail=f"上下文压缩失败，原会话未修改：{exc}") from exc
 
-    # 压缩: 保留最近6条纯对话消息（剔除工具调用，防止 tool_call_id 断裂）
-    keep_n = 6
-    pure_msgs = [m for m in msg_dicts if m.get("role") in ("user", "assistant") and not m.get("tool_calls")]
-    recent = pure_msgs[-keep_n:] if len(pure_msgs) > keep_n else pure_msgs
-    older = pure_msgs[:-keep_n] if len(pure_msgs) > keep_n else []
-
-    if older:
-        try:
-            llm = request.app.state.agent_loop.llm
-            history_text = "\n".join(f"[{m.get('role','')}]: {(m.get('content','') or '')[:500]}" for m in older[-50:])
-            prompt = f"请将以下对话历史压缩为一段简洁摘要（300字以内），保留关键决策、人物变更、用户偏好：\n\n{history_text[-8000:]}"
-            summary = ""
-            async for chunk in llm.chat(
-                position="context_compression", messages=[{"role": "user", "content": prompt}],
-                tools=None, stream=False, tag=":compress",
-            ):
-                if chunk.type == "text_delta": summary += chunk.content
-            summary_text = summary.strip()[:500] or "之前的对话已压缩。"
-        except Exception:
-            summary_text = "之前的对话已压缩。"
-    else:
-        summary_text = "对话开始"
-
-    compressed = [{"role": "user", "content": f"[上下文压缩] {summary_text}"}] + recent
+    compressed = compression_meta["messages"]
 
     new_count = token_counter.count_messages(compressed)
+
+    # Manual compression is also a context boundary. Rotate the latest raw
+    # Trace so subsequent requests can trace back through A -> B.
+    previous_trace_id = await trace_store.latest_session_turn_trace(session_id)
+    if previous_trace_id:
+        continuation_recorder = TraceRecorder(trace_store)
+        continuation_trace_id = await continuation_recorder.start_continuation(
+            session.session_id, session.project_id, previous_trace_id,
+            compressed, reason="manual_context_compression",
+        )
+        await continuation_recorder.record(
+            continuation_trace_id, "compression_summary_source", "system", {
+                "summary_window_ids": compression_meta.get("summary_window_ids", []),
+                "summary_trace_ids": compression_meta.get("summary_trace_ids", []),
+                "summary_count": compression_meta.get("summary_count", 0),
+                "previous_compression_turn_no": compression_meta.get("previous_compression_turn_no", 0),
+                "last_compressed_turn_no": compression_meta.get("last_compressed_turn_no", 0),
+                "uncovered_turn_count": compression_meta.get("uncovered_turn_count", 0),
+            },
+        )
+        await continuation_recorder.finish(
+            continuation_trace_id, "completed",
+            f"使用 {compression_meta.get('summary_count', 0)} 个 Memory Summary，"
+            f"保留 {compression_meta.get('uncovered_turn_count', 0)} 个未总结 Turn",
+            new_count,
+        )
+        await trace_store.replace_latest_turn_trace(
+            session_id, previous_trace_id, continuation_trace_id,
+        )
 
     # 更新会话缓存 + 持久化
     session.messages = compressed
     session.token_count = new_count
     from novelagent.storage import models
     await models.save_messages(session_id, compressed, new_count, llm_client=request.app.state.agent_loop.llm)
+    await trace_store.save_session_compression_state(
+        session_id, compression_meta.get("last_compressed_turn_no", 0), compressed,
+    )
 
     print(f"[compress] session={session_id[:8]}... {original_count} → {new_count} tokens", flush=True)
     return {

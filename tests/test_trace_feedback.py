@@ -279,10 +279,17 @@ class _TraceContextStore:
 
     async def list_events(self, trace_id, limit):
         assert trace_id == "trace-b"
-        assert limit == 40
+        assert limit == 500
         return [{
-            "event_id": "event-b", "trace_id": "trace-b", "event_type": "assistant_turn",
-            "payload": {"content": "同一 Session 的较早回复。"},
+            "event_id": "event-b", "trace_id": "trace-b", "sequence_no": 1, "event_type": "assistant_turn",
+            "payload": {"turn": 7, "content": "同一 Session 的较早回复。"},
+        }]
+
+    async def get_trace_turn_range(self, trace_id, start_turn, end_turn, limit):
+        assert (trace_id, start_turn, end_turn, limit) == ("trace-b", 6, 8, 300)
+        return [{
+            "event_id": "event-b", "trace_id": "trace-b", "sequence_no": 1, "event_type": "assistant_turn",
+            "payload": {"turn": 7, "content": "按 turn 区间读取。"},
         }]
 
 
@@ -319,6 +326,62 @@ def test_trace_analyzer_uses_real_tool_for_bounded_context_lookup(tmp_path):
     assert "这句话太直白" in tool_result["content"]
 
 
+def test_cached_trace_analyzer_executes_trace_context_instead_of_rejecting_it(tmp_path):
+    llm = _TraceContextLLM()
+    tool = GetTraceContextTool(_TraceContextStore(), "session-a", {"trace-a": ["event-a"]})
+    analyzer = FileTraceAnalyzer(llm, str(tmp_path), _TraceContextStore())
+
+    result = asyncio.run(analyzer._extract(
+        "分析 Trace", [{"role": "user", "content": "继承的主会话上下文"}],
+        trace_tool=tool, project_id="project-a", source_trace_id="trace-current",
+        session_id="session-a",
+        cached_tools=[{"name": "Read", "description": "读取文件", "parameters": {"type": "object"}}],
+    ))
+
+    assert json.loads(result) == {"items": [], "records": []}
+    assert len(llm.calls) == 2
+    assert [schema["name"] for schema in llm.calls[0]["tools"]] == ["Read", "GetTraceContext"]
+    assert llm.calls[1]["tools"] is None
+    tool_result = next(message for message in llm.calls[1]["messages"] if message["role"] == "tool_result")
+    assert "这句话太直白" in tool_result["content"]
+
+
+class _ReadContextLLM:
+    def __init__(self):
+        self.calls = []
+
+    async def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs["tools"]:
+            yield SimpleNamespace(
+                type="tool_use", tool_name="Read", tool_call_id="read-call",
+                tool_input={"path": "outline.md"},
+            )
+        else:
+            yield SimpleNamespace(type="text_delta", content='{"items": [], "records": []}')
+
+
+def test_cached_trace_analyzer_allows_read_inside_current_project(tmp_path):
+    project_dir = tmp_path / "project-a"
+    project_dir.mkdir()
+    (project_dir / "outline.md").write_text("当前卷纲修订内容", encoding="utf-8")
+    llm = _ReadContextLLM()
+    trace_tool = GetTraceContextTool(_TraceContextStore(), "session-a")
+    analyzer = FileTraceAnalyzer(llm, str(tmp_path), _TraceContextStore())
+
+    result = asyncio.run(analyzer._extract(
+        "分析 Trace", [{"role": "user", "content": "继承的主会话上下文"}],
+        trace_tool=trace_tool, project_id="project-a", source_trace_id="trace-current",
+        session_id="session-a",
+        cached_tools=[{"name": "Read", "description": "读取文件", "parameters": {"type": "object"}}],
+    ))
+
+    assert json.loads(result) == {"items": [], "records": []}
+    assert [schema["name"] for schema in llm.calls[0]["tools"]] == ["Read", "GetTraceContext"]
+    tool_result = next(message for message in llm.calls[1]["messages"] if message["role"] == "tool_result")
+    assert "当前卷纲修订内容" in tool_result["content"]
+
+
 def test_trace_context_tool_allows_any_trace_in_current_session():
     tool = GetTraceContextTool(_TraceContextStore(), "session-a", {"trace-a": ["event-a"]})
     context = ToolContext(session_id="session-a", project_id="project-a", working_dir=".")
@@ -330,6 +393,20 @@ def test_trace_context_tool_allows_any_trace_in_current_session():
     assert "同一 Session" in result.data["traces"][0]["events"][0]["content"]
 
 
+def test_trace_context_tool_reads_requested_turn_range():
+    tool = GetTraceContextTool(_TraceContextStore(), "session-a")
+    context = ToolContext(session_id="session-a", project_id="project-a", working_dir=".")
+
+    result = asyncio.run(tool.execute({
+        "requests": [{"trace_id": "trace-b", "start_turn": 6, "end_turn": 8}],
+    }, context))
+
+    assert result.success
+    assert result.data["traces"][0]["turn_range"] == {"start": 7, "end": 7}
+    assert result.data["traces"][0]["events"][0]["turn"] == 7
+    assert "按 turn 区间读取" in result.data["traces"][0]["events"][0]["content"]
+
+
 def test_trace_context_tool_rejects_trace_from_another_session():
     tool = GetTraceContextTool(_TraceContextStore(), "session-a")
     context = ToolContext(session_id="session-a", project_id="project-a", working_dir=".")
@@ -338,3 +415,160 @@ def test_trace_context_tool_rejects_trace_from_another_session():
 
     assert not result.success
     assert "不属于当前 Session" in result.error
+
+
+def test_local_analysis_keeps_five_turns_around_checkpoint_and_infers_answer_turn():
+    events = []
+    sequence = 0
+    for turn in range(1, 13):
+        sequence += 1
+        events.append({
+            "event_id": f"llm-{turn}", "trace_id": "trace-a", "sequence_no": sequence,
+            "event_type": "assistant_turn", "payload": {"turn": turn, "content": f"turn {turn}"},
+        })
+        if turn == 8:
+            sequence += 1
+            events.append({
+                "event_id": "answer-8", "trace_id": "trace-a", "sequence_no": sequence,
+                "event_type": "user_answer", "payload": {"answers": {"setting": "保留旧球鞋"}},
+            })
+            sequence += 1
+            events.append({
+                "event_id": "checkpoint-8", "trace_id": "trace-a", "sequence_no": sequence,
+                "event_type": "tool_call", "payload": {
+                    "turn": 8, "tool": "CreateTraceCheckpoint", "params": {"reason": "关键设定"},
+                },
+            })
+
+    selected = FileTraceAnalyzer._select_analysis_events(events)
+    turns = {event["trace_turn"] for event in selected}
+    refs = FileTraceAnalyzer._trace_refs(selected, ["answer-8", "checkpoint-8"], "trace-a")
+
+    assert turns == {6, 7, 8, 9, 10}
+    assert refs == [{
+        "trace_id": "trace-a", "turn": 8,
+        "source_event_ids": ["answer-8", "checkpoint-8"],
+    }]
+
+
+def test_cached_branch_source_excerpt_maps_back_to_trace_turn():
+    events = FileTraceAnalyzer._select_analysis_events([
+        {
+            "event_id": "user-4", "trace_id": "trace-a", "sequence_no": 1,
+            "event_type": "user_message", "payload": {"turn": 4, "content": "以后动作场景必须写清人物距离。"},
+        },
+        {
+            "event_id": "assistant-4", "trace_id": "trace-a", "sequence_no": 2,
+            "event_type": "assistant_turn", "payload": {"turn": 4, "content": "明白。"},
+        },
+    ])
+
+    event_id = FileTraceAnalyzer._match_source_event_id(events, "动作场景必须写清人物距离")
+    refs = FileTraceAnalyzer._trace_refs(events, [event_id], "trace-a")
+
+    assert event_id == "user-4"
+    assert refs == [{"trace_id": "trace-a", "turn": 4, "source_event_ids": ["user-4"]}]
+
+
+class _FallbackTraceStore:
+    def __init__(self):
+        self.statuses = []
+
+    async def get_trace(self, trace_id):
+        return {"trace_id": trace_id, "session_id": "session-a", "analysis_status": "pending"}
+
+    async def list_events(self, trace_id, limit):
+        return [{
+            "event_id": "event-user", "trace_id": trace_id, "sequence_no": 1,
+            "event_type": "user_message", "payload": {"turn": 1, "content": "保留这个设定。"},
+        }]
+
+    async def save_trace_classification(self, trace_id, items):
+        pass
+
+    async def set_trace_analysis_status(self, trace_id, status):
+        self.statuses.append((trace_id, status))
+
+
+class _OverflowThenLocalLLM:
+    def __init__(self):
+        self.calls = []
+
+    async def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs["position"] == "main_loop":
+            yield SimpleNamespace(type="error", error="maximum context length exceeded")
+        else:
+            yield SimpleNamespace(type="text_delta", content='{"items": [], "records": []}')
+
+
+def test_trace_analysis_falls_back_to_local_turns_when_cached_branch_overflows(tmp_path):
+    llm = _OverflowThenLocalLLM()
+    store = _FallbackTraceStore()
+    analyzer = FileTraceAnalyzer(llm, str(tmp_path), store)
+
+    asyncio.run(analyzer.analyze(
+        "trace-a", "project-a", branch_messages=[{"role": "user", "content": "主会话前缀"}],
+    ))
+
+    assert [call["position"] for call in llm.calls] == ["main_loop", "auto_memory"]
+    assert llm.calls[0]["messages"][0]["content"] == "主会话前缀"
+    assert "Trace events:" not in llm.calls[0]["messages"][-1]["content"]
+    assert llm.calls[1]["messages"][0]["content"].startswith("[后台 Trace 分支命令]")
+    assert "Trace events:" in llm.calls[1]["messages"][0]["content"]
+    assert store.statuses == [("trace-a", "complete")]
+
+
+class _TwoStageMergeLLM:
+    def __init__(self, related_id):
+        self.related_id = related_id
+        self.calls = []
+
+    async def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs["tag"] == ":trace-fork/reconcile":
+            yield SimpleNamespace(type="text_delta", content=json.dumps({"decisions": [{
+                "candidate_index": 0,
+                "relation": "support",
+                "related_id": self.related_id,
+                "related_layer": "evidence",
+                "reason": "同一条写作要求",
+            }]}, ensure_ascii=False))
+            return
+        yield SimpleNamespace(type="text_delta", content=json.dumps({
+            "window_summary": "当前窗口摘要",
+            "items": [{
+                "event_id": "event-user", "type": "feedback",
+                "summary": "动作距离需要明确", "confidence": 0.9,
+            }],
+            "records": [{
+                "layer": "evidence", "category": "project", "domain": "writing",
+                "title": "动作场景写清距离", "claim": "动作场景写清距离",
+                "content": "动作场景需要明确人物距离。",
+                "source_event_ids": ["event-user"], "signal": "weak",
+                "relation": "new", "confidence": 0.9,
+            }],
+        }, ensure_ascii=False))
+
+
+def test_second_stage_reconciles_new_candidate_into_existing_evidence(tmp_path):
+    files = FileLifecycleStore(str(tmp_path), "project-a")
+    existing = files.write("evidence", {
+        "title": "动作场景写清距离", "claim": "动作场景写清距离",
+        "content": "动作场景需要明确人物距离。",
+        "category": "project", "domain": "writing",
+        "trace_id": "trace-old", "trace_ids": ["trace-old"],
+        "source_event_ids": ["event-old"], "weight": 15, "support_count": 1,
+    })
+    llm = _TwoStageMergeLLM(existing["id"])
+    store = _FallbackTraceStore()
+    analyzer = FileTraceAnalyzer(llm, str(tmp_path), store)
+
+    asyncio.run(analyzer.analyze("trace-a", "project-a"))
+
+    evidence = files.list("evidence")
+    assert len(evidence) == 1
+    assert evidence[0]["id"] == existing["id"]
+    assert evidence[0]["support_count"] == 2
+    assert evidence[0]["weight"] == 30
+    assert [call["tag"] for call in llm.calls] == [":trace-fork", ":trace-fork/reconcile"]

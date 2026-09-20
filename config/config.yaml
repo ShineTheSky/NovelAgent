@@ -26,7 +26,7 @@ security:
 # 会话配置
 session:
   token_limit: 150000           # 消息列表Token上限
-  compression_threshold: 0.8    # 压缩触发阈值（80%）
+  compression_threshold: 0.8    # 约 120K 时压缩；记忆分支超限时改走局部 turn 兜底
   max_turns: 30                # 单次任务最大循环轮次
 
 # Agent Loop 配置

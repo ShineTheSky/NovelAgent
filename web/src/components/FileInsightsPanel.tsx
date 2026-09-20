@@ -125,7 +125,7 @@ function RecordCard({ record, tab, onOpen, onOpenTrace, onDowngrade, onCancelMan
   onDowngrade: () => void;
   onCancelManualReview: () => void;
 }) {
-  const traceIds = relatedTraceIds(record);
+  const traceRefs = relatedTraceRefs(record);
   return <article className={`mb-3 rounded-xl border bg-white p-4 shadow-sm ${record.promotion_status === 'manual_review' ? 'border-amber-200' : 'border-gray-100'}`}>
     <div className="mb-2 flex flex-wrap items-center gap-2 text-[11px] text-gray-400">
       <button type="button" onClick={onOpen} title={`查看 ${record.layer} 完整内容`} className="max-w-full break-all rounded-md bg-purple-50 px-2 py-1 font-mono text-purple-700 hover:bg-purple-100">{record.id}</button>
@@ -139,8 +139,8 @@ function RecordCard({ record, tab, onOpen, onOpenTrace, onDowngrade, onCancelMan
     <button type="button" onClick={onOpen} className="w-full text-left text-sm leading-6 text-gray-700 hover:text-purple-700">{record.title || record.claim}</button>
     {record.promotion_status === 'manual_review' && <p className="mt-2 text-xs leading-5 text-amber-700">{record.downgrade_reason || '用户曾手动降低该记录层级，后续不会自动恢复。'}</p>}
     <div className="mt-3 flex flex-wrap items-center gap-3 text-[11px] text-gray-400">
-      {traceIds.map(traceId => <button type="button" key={traceId} onClick={() => onOpenTrace(traceId)} title={traceId} className="font-mono text-purple-600 hover:text-purple-800 hover:underline">Trace {traceId}</button>)}
-      {traceIds.length === 0 && <span>Trace -</span>}
+      {traceRefs.map(ref => <button type="button" key={`${ref.trace_id}-${ref.turn ?? 'legacy'}`} onClick={() => onOpenTrace(ref.trace_id)} title={ref.trace_id} className="font-mono text-purple-600 hover:text-purple-800 hover:underline">Trace {ref.trace_id}{ref.turn ? ` · Turn ${ref.turn}` : ''}</button>)}
+      {traceRefs.length === 0 && <span>Trace -</span>}
       <span>事件 {record.source_event_ids?.length || 0}</span>
       {record.support_count && <span>支持 {record.support_count}</span>}
       <span className="ml-auto flex gap-3">
@@ -151,10 +151,13 @@ function RecordCard({ record, tab, onOpen, onOpenTrace, onDowngrade, onCancelMan
   </article>;
 }
 
-function relatedTraceIds(record: LifecycleRecord) {
-  const raw = record as unknown as Record<string, unknown>;
-  const traceIds = Array.isArray(raw.trace_ids) ? raw.trace_ids : [];
-  return [...new Set([record.trace_id, ...traceIds].filter((value): value is string => typeof value === 'string' && value.length > 0))];
+function relatedTraceRefs(record: LifecycleRecord) {
+  const refs = (record.trace_refs ?? []).filter(ref => ref && typeof ref.trace_id === 'string');
+  const seen = new Set(refs.map(ref => ref.trace_id));
+  const legacy = [record.trace_id, ...(record.trace_ids ?? [])]
+    .filter((value): value is string => typeof value === 'string' && value.length > 0 && !seen.has(value))
+    .map(trace_id => ({ trace_id, turn: 0 }));
+  return [...refs, ...legacy];
 }
 
 function kindLabel(kind: string) {

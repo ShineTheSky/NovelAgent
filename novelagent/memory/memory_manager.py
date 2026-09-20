@@ -14,12 +14,18 @@ class MemoryManager:
         "archive/", "feedback/", "workflow/", "review/", "agent/", "user_prefs.md",
     )
 
-    def __init__(self, working_dir: str, llm_client=None, global_memory_dir: str | None = None):
+    def __init__(self, working_dir: str, llm_client=None, global_memory_dir: str | None = None, *,
+                 bad_case_recorder=None, session_id: str = "", project_id: str = "",
+                 source_trace_id: str = ""):
         self.working_dir = working_dir
         self.file_store = FileStore(working_dir)
         self.index_manager = IndexManager(self.file_store)
-        self.prefetcher = Prefetcher(self.index_manager, self.file_store, llm_client)
-        self.auto_memory = AutoMemory(self.index_manager, self.file_store, llm_client)
+        agent_context = {
+            "bad_case_recorder": bad_case_recorder, "session_id": session_id,
+            "project_id": project_id, "source_trace_id": source_trace_id,
+        }
+        self.prefetcher = Prefetcher(self.index_manager, self.file_store, llm_client, **agent_context)
+        self.auto_memory = AutoMemory(self.index_manager, self.file_store, llm_client, **agent_context)
         self.auto_interval = 5
         project_dir = Path(working_dir)
         self.global_memory_dir = Path(global_memory_dir) if global_memory_dir else project_dir.parent.parent / "global_memory"
