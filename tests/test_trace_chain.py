@@ -89,12 +89,8 @@ def test_raw_traces_keep_request_chain_and_window_references(tmp_path, monkeypat
 
         analyzer.llm.calls.clear()
         await analyzer.analyze_window(window["window_id"], "project-a", _tools=main_tools)
-        assert len(analyzer.llm.calls) == 1
-        assert analyzer.llm.calls[0]["tag"] == ":trace-fork/cached"
-        assert not any(
-            "Raw trace events:" in str(message.get("content", ""))
-            for message in analyzer.llm.calls[0]["messages"]
-        )
+        assert analyzer.llm.calls == []
+        assert (await store.get_trace_window(window["window_id"]))["status"] == "complete"
 
     asyncio.run(scenario())
 

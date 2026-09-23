@@ -599,6 +599,9 @@ class TraceStore:
         result["trajectory_provenance"] = json.loads(
             result.pop("trajectory_provenance_json", "[]") or "[]"
         )
+        result["prepared_payload"] = json.loads(
+            result.pop("prepared_payload_json", "{}") or "{}"
+        )
         cursor = await conn.execute(
             "SELECT trace_id FROM trace_window_members WHERE window_id = ? ORDER BY member_no ASC", (window_id,)
         )
@@ -623,8 +626,66 @@ class TraceStore:
                 window_id,
             ),
         )
+        await conn.execute(
+            "UPDATE trace_analysis_windows SET status = 'normalized', last_error = '' WHERE window_id = ?",
+            (window_id,),
+        )
         await conn.commit()
         await conn.close()
+
+    async def save_trace_window_prepared(self, window_id: str, payload: dict) -> None:
+        """Persist the final validated write plan before any file-backed side effect."""
+        conn = await get_connection()
+        await conn.execute(
+            """UPDATE trace_analysis_windows
+               SET status = 'prepared', prepared_payload_json = ?, prepared_at = ?, last_error = ''
+               WHERE window_id = ?""",
+            (json.dumps(payload, ensure_ascii=False), _now(), window_id),
+        )
+        await conn.commit()
+        await conn.close()
+
+    async def record_trace_window_failure(self, window_id: str, error: str, max_retries: int = 3) -> dict:
+        """Record a bounded retry using SQLite time so restart recovery is deterministic."""
+        conn = await get_connection()
+        cursor = await conn.execute(
+            "SELECT retry_count FROM trace_analysis_windows WHERE window_id = ?", (window_id,)
+        )
+        row = await cursor.fetchone()
+        retry_count = int(row[0]) + 1 if row else 1
+        delay_seconds = min(300, 5 * (2 ** max(0, retry_count - 1)))
+        status = "failed" if retry_count >= max_retries else "retry_wait"
+        await conn.execute(
+            """UPDATE trace_analysis_windows
+               SET status = ?, retry_count = ?, last_error = ?,
+                   next_retry_at = datetime('now', ?), finished_at = ?
+               WHERE window_id = ?""",
+            (
+                status, retry_count, str(error)[:8000], f"+{delay_seconds} seconds",
+                _now() if status == "failed" else None, window_id,
+            ),
+        )
+        await conn.commit()
+        await conn.close()
+        return {"status": status, "retry_count": retry_count, "delay_seconds": delay_seconds}
+
+    async def list_recoverable_trace_windows(self, max_retries: int = 3,
+                                             include_waiting: bool = False) -> list[dict]:
+        """Return durable work that was never completed, including interrupted running stages."""
+        conn = await get_connection()
+        waiting_clause = "" if include_waiting else "AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))"
+        cursor = await conn.execute(
+            f"""SELECT window_id, project_id, status,
+                       CAST(MAX(0, (julianday(next_retry_at) - julianday('now')) * 86400) AS INTEGER) AS delay_seconds
+                FROM trace_analysis_windows
+                WHERE status IN ('pending', 'running', 'normalized', 'prepared', 'retry_wait')
+                  AND retry_count < ? {waiting_clause}
+                ORDER BY project_id, start_turn_no, created_at""",
+            (max_retries,),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+        await conn.close()
+        return rows
 
     async def get_latest_trace_window_summary(self, session_id: str) -> dict | None:
         """Return the newest completed per-window summary for one Session."""
@@ -715,9 +776,10 @@ class TraceStore:
 
     async def set_trace_window_status(self, window_id: str, status: str) -> None:
         conn = await get_connection()
+        finished_at = _now() if status in {"complete", "failed"} else None
         await conn.execute(
             "UPDATE trace_analysis_windows SET status = ?, finished_at = ? WHERE window_id = ?",
-            (status, _now(), window_id),
+            (status, finished_at, window_id),
         )
         await conn.commit()
         await conn.close()
@@ -737,7 +799,8 @@ class TraceStore:
         await conn.execute(
             """UPDATE trace_analysis_windows
                SET status = 'complete', summary = ?, summary_trace_id = ?,
-                   summary_start_turn_no = ?, summary_end_turn_no = ?, finished_at = ?
+                   summary_start_turn_no = ?, summary_end_turn_no = ?, finished_at = ?,
+                   last_error = '', next_retry_at = NULL
                WHERE window_id = ?""",
             (summary, summary_trace_id, start_turn_no, end_turn_no, _now(), window_id),
         )

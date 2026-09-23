@@ -114,6 +114,7 @@ def create_app() -> FastAPI:
     embedding_gate.embedding_model = embedding_model
     post_turn_analyzer = FileTraceAnalyzer(
         llm_client, working_dir, trace_store, embedding_gate, rag_store, bad_case_recorder,
+        agent_trace_tasks,
     )
     preference_context_provider = FilePatternContextProvider(working_dir)
 
@@ -137,7 +138,7 @@ def create_app() -> FastAPI:
     agent_loop = AgentLoop(
         llm_client, registry, permission_checker, context_builder, memory_manager, agent_config, subagent_runner,
         trace_recorder, post_turn_analyzer, preference_context_provider,
-        rag_store, bash_case_recorder, bad_case_analyzer,
+        rag_store, bash_case_recorder, bad_case_analyzer, agent_trace_tasks,
     )
 
     # Inject into app state
@@ -163,6 +164,9 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup():
         await db_init()
+        agent_trace_tasks.submit(
+            post_turn_analyzer.recover_pending_windows(), label="trace-window-recovery",
+        )
 
     @app.on_event("shutdown")
     async def shutdown():

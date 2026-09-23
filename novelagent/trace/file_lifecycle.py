@@ -1,6 +1,7 @@
 """File-backed derived records for immutable SQLite traces."""
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -109,18 +110,23 @@ class FileLifecycleStore:
         (self._base(layer) / f"{layer}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def _move(self, item: dict, target_layer: str, *, reason: str | None = None) -> dict:
-        path = self.project / item["file_path"]
-        path.unlink(missing_ok=True)
+        source_path = self.project / item["file_path"]
         source_layer = item.get("layer")
-        if source_layer == "memory" and target_layer == "insight":
-            item["origin_memory_id"] = item["id"]
+        source_id = str(item["id"])
+        moved = dict(item)
+        if source_layer in {"memory", "pattern"} and target_layer == "insight":
+            moved[f"origin_{source_layer}_id"] = source_id
             if reason:
-                item["demotion_reason"] = reason
-            item["id"] = f"ins_{uuid.uuid4().hex}"
+                moved["demotion_reason"] = reason
+            stable_key = f"novelagent:{source_layer}:{source_id}:insight:{reason or ''}"
+            moved["id"] = f"ins_{uuid.uuid5(uuid.NAMESPACE_URL, stable_key).hex}"
         elif source_layer == "insight" and target_layer == "memory":
-            item["origin_insight_id"] = item["id"]
-            item["id"] = f"mem_{uuid.uuid4().hex}"
-        return self.write(target_layer, item)
+            moved["origin_insight_id"] = source_id
+            stable_key = f"novelagent:insight:{source_id}:memory:{reason or ''}"
+            moved["id"] = f"mem_{uuid.uuid5(uuid.NAMESPACE_URL, stable_key).hex}"
+        saved = self.write(target_layer, moved)
+        source_path.unlink(missing_ok=True)
+        return saved
 
     def enforce_memory_capacity(self) -> list[dict]:
         """Demote least-active novel memories; Agent records are unbounded."""
@@ -145,6 +151,27 @@ class FileLifecycleStore:
 
     def get(self, layer: str, record_id: str) -> dict | None:
         return next((item for item in self.list(layer) if item["id"] == record_id), None)
+
+    def resolve(self, layer: str, record_id: str) -> tuple[str, dict] | tuple[None, None]:
+        """Resolve a record after a retry-safe layer promotion or demotion."""
+        direct = self.get(layer, record_id)
+        if direct:
+            return layer, direct
+        if layer == "insight":
+            promoted = next(
+                (item for item in self.list("memory") if item.get("origin_insight_id") == record_id),
+                None,
+            )
+            if promoted:
+                return "memory", promoted
+        if layer in {"memory", "pattern"}:
+            demoted = next(
+                (item for item in self.list("insight") if item.get(f"origin_{layer}_id") == record_id),
+                None,
+            )
+            if demoted:
+                return "insight", demoted
+        return None, None
 
     @staticmethod
     def is_text_feedback(item: dict) -> bool:
@@ -174,13 +201,45 @@ class FileLifecycleStore:
 
     @staticmethod
     def can_auto_promote(item: dict) -> bool:
-        return item.get("promotion_status", "auto") != "manual_review"
+        return item.get("promotion_status", "auto") == "auto"
+
+    @staticmethod
+    def support_keys(item: dict, trace_ids: list[str], source_event_ids: list[str]) -> list[str]:
+        """Return stable, independent support keys for retry-safe promotion accounting."""
+        if item.get("artifact_path"):
+            anchor = str(item.get("anchor_sha256") or item.get("artifact_revision_id") or "")
+            if anchor:
+                return [f"scene:{item['artifact_path']}:{anchor}"]
+        if trace_ids:
+            return [f"trace:{trace_id}" for trace_id in dict.fromkeys(trace_ids) if trace_id]
+        return [f"event:{event_id}" for event_id in dict.fromkeys(source_event_ids) if event_id]
+
+    def add_support(self, item: dict, trace_ids: list[str], source_event_ids: list[str], bonus: float,
+                    source_item: dict | None = None) -> tuple[dict, bool]:
+        """Apply weight/count only when at least one independent source is new."""
+        updated = dict(item)
+        known = list(updated.get("support_sources") or self.support_keys(
+            updated,
+            [str(value) for value in updated.get("trace_ids", [])],
+            [str(value) for value in updated.get("source_event_ids", [])],
+        ))
+        incoming = self.support_keys(source_item or updated, trace_ids, source_event_ids)
+        fresh = [key for key in incoming if key not in known]
+        if not fresh:
+            updated["support_sources"] = list(dict.fromkeys(known))
+            return updated, False
+        updated["support_sources"] = list(dict.fromkeys([*known, *fresh]))
+        updated["weight"] = min(MAX_RECORD_WEIGHT, float(updated.get("weight", 0)) + bonus)
+        updated["support_count"] = int(updated.get("support_count", 1)) + 1
+        return updated, True
 
     @staticmethod
     def confirm_auto_promotion(item: dict) -> dict:
         confirmed = dict(item)
         confirmed["promotion_status"] = "auto"
         confirmed["explicitly_reconfirmed_at"] = datetime.now(timezone.utc).isoformat()
+        confirmed.pop("conflict_reason", None)
+        confirmed.pop("conflict_ids", None)
         return confirmed
 
     def cancel_manual_review(self, layer: str, record_id: str) -> dict | None:
@@ -364,14 +423,54 @@ class FileLifecycleStore:
         item["domain"] = item.get("domain") if item.get("domain") in DOMAINS else "overall"
         item["title"] = str(item.get("title") or item.get("claim") or item.get("content") or "").strip().split("\n", 1)[0]
         item["claim"] = str(item.get("claim") or item["title"]).strip()
-        item.setdefault("id", f"{layer[:3]}_{uuid.uuid4().hex}")
+        if not item.get("id"):
+            item["id"] = f"{layer[:3]}_{uuid.uuid4().hex}"
+        if "support_sources" not in item and item.get("support_count"):
+            item["support_sources"] = self.support_keys(
+                item,
+                [str(value) for value in item.get("trace_ids", [])],
+                [str(value) for value in item.get("source_event_ids", [])],
+            )
         item.setdefault("created", datetime.now(timezone.utc).isoformat())
         item["updated"] = datetime.now(timezone.utc).isoformat()
         body = str(item.get("content") or item.get("claim") or "").strip()
         payload = {key: value for key, value in item.items() if key not in {"content", "layer", "file_path"}}
         path = self._root(layer, item["category"]) / f"{item['id']}.md"
-        path.write_text("---\n" + yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).strip() + "\n---\n\n" + body + "\n", encoding="utf-8")
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        temporary.write_text("---\n" + yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).strip() + "\n---\n\n" + body + "\n", encoding="utf-8")
+        os.replace(temporary, path)
         return {**payload, "layer": layer, "content": body, "file_path": str(path.relative_to(self.project)).replace("\\", "/")}
+
+    def downgrade_conflict(self, layer: str, record_id: str, conflict_id: str, reason: str) -> dict | None:
+        """Demote a conflicting durable rule and lock it until explicit resolution."""
+        item = self.get(layer, record_id)
+        if not item:
+            origin_key = f"origin_{layer}_id"
+            result = next(
+                (record for record in self.list("insight") if record.get(origin_key) == record_id),
+                None,
+            )
+            if result and layer == "memory":
+                for pattern in list(self.list("pattern")):
+                    if record_id in pattern.get("memory_ids", []):
+                        self.downgrade_conflict("pattern", pattern["id"], conflict_id, reason)
+            return result
+        item["promotion_status"] = "conflict_review"
+        item["conflict_reason"] = reason
+        item["conflict_ids"] = list(dict.fromkeys([*item.get("conflict_ids", []), conflict_id]))
+        item["downgraded_from"] = layer
+        item["weight"] = max(0, float(item.get("weight", 0)) - 30)
+        history = list(item.get("conflict_history") or [])
+        entry = {"conflict_id": conflict_id, "reason": reason}
+        if entry not in history:
+            history.append(entry)
+        item["conflict_history"] = history
+        result = self.write("insight", item) if layer == "insight" else self._move(item, "insight", reason="conflict")
+        if layer == "memory":
+            for pattern in list(self.list("pattern")):
+                if record_id in pattern.get("memory_ids", []):
+                    self.downgrade_conflict("pattern", pattern["id"], conflict_id, reason)
+        return result
 
     def downgrade(self, layer: str, record_id: str) -> dict | None:
         item = self.get(layer, record_id)

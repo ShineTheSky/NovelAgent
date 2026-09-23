@@ -140,6 +140,11 @@ async def init():
         await _ensure_column(db, "trace_analysis_windows", "trajectory_provenance_json", "TEXT NOT NULL DEFAULT '[]'")
         await _ensure_column(db, "trace_analysis_windows", "trajectory_trace_id", "TEXT NOT NULL DEFAULT ''")
         await _ensure_column(db, "trace_analysis_windows", "normalized_at", "TEXT")
+        await _ensure_column(db, "trace_analysis_windows", "prepared_payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        await _ensure_column(db, "trace_analysis_windows", "prepared_at", "TEXT")
+        await _ensure_column(db, "trace_analysis_windows", "retry_count", "INTEGER NOT NULL DEFAULT 0")
+        await _ensure_column(db, "trace_analysis_windows", "last_error", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "trace_analysis_windows", "next_retry_at", "TEXT")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS session_compression_state (
                 session_id TEXT PRIMARY KEY,

@@ -11,11 +11,14 @@ Web UI (React) ← SSE → FastAPI Server → Agent Loop (ReAct)
                                             │
               ┌─────────────────────────────┼──────────────────────────┐
               │                │            │              │           │
-         工具层 (10 tools)  安全层 (3层)   上下文层      洞察/记忆层  LLM客户端
-         Read/Write/Edit   1a静态规则     Prompt模板    FileStore    多Provider
-         Glob/Grep/Bash    1b风险评估     Token计算     IndexManager  Anthropic
-         SubAgent/SearchRag 1c自主判断    消息管理      Trace分析    DeepSeek
-         AskUserQuestion                  上下文压缩    Pattern注入  OpenAI..
+         工具层 (12 tools)  安全层 (3层)   上下文层      洞察/记忆层  LLM客户端
+         Read/Write/Edit    1a静态规则     Prompt模板    FileStore    多Provider
+         Glob/Grep/Bash     1b风险评估     Token计算     IndexManager  Anthropic
+         TextStats/         1c自主判断     消息管理      Trace分析    DeepSeek
+         CheckContent
+         SubAgent/SearchRag
+         AskUserQuestion/
+         CreateTraceCheckpoint                                         OpenAI..
 ```
 
 | 层级 | 职责 |
@@ -23,7 +26,7 @@ Web UI (React) ← SSE → FastAPI Server → Agent Loop (ReAct)
 | 第1层 Web UI | 对话与小说分屏、流式过程渲染、资料库、项目洞察、弹窗问答 |
 | 第2层 入口传输 | 启动初始化、请求标准化、会话管理、SSE 管道、过程事件持久化与回放 |
 | 第3层 Agent Loop | ReAct 循环、子 Agent 编排、审阅/润色工作流、Trace 触发、工具调用 |
-| 第4层 工具层 | Read / Write / Edit / Glob / Grep / Bash / SubAgent / AskUserQuestion / CreateTraceCheckpoint / SearchRag |
+| 第4层 工具层 | Read / Write / Edit / Glob / Grep / TextStats / CheckContent / Bash / SubAgent / AskUserQuestion / CreateTraceCheckpoint / SearchRag |
 | 第5层 安全层 | 三层权限检查、Bash命令两级分类、路径沙箱、审计 |
 | 第6层 上下文层 | System Prompt 管理、消息列表、Token 计算、压缩、Pattern 和相关记忆注入 |
 | 第7层 洞察/记忆层 | SQLite 不可变 Trace、文件化 Insight/Memory/Pattern、异步分析与索引 |
@@ -86,31 +89,38 @@ uvicorn novelagent.server.app:app --reload --port 8000
 
 ```yaml
 positions:
-  main_loop:           # 主Agent → 最强模型
-    provider: deepseek
-    model: deepseek-v4-pro[1m]
-    timeout: 300
+  main_loop:           # 主 Agent 对话与带分支上下文的 Trace 分析
+    provider: minimax
+    model: MiniMax-M2.7
+    timeout: 600
 
-  sub_agent:           # 子Agent → 可按预设覆写
-    provider: deepseek
-    model: deepseek-v4-pro[1m]
+  sub_agent:           # 子 Agent，可按预设覆写
+    provider: minimax
+    model: MiniMax-M2.7
     overrides:
-      chapter_writer:  # 章节撰写 → 可独立用更强模型
+      chapter_writer:
         provider: minimax
         model: MiniMax-M2.7
 
-  memory_prefetch:     # 记忆预取 → 最快模型
+  memory_prefetch:     # 记忆预取，强调低延迟
     provider: minimax
     model: MiniMax-M2.7
     timeout: 1.5
 
-  context_compression: # 上下文压缩 → 长文本
+  memory_summary_fallback: # 无对话分支时的轨迹、记忆与摘要兜底
     provider: minimax
     model: MiniMax-M2.7
+    timeout: 600
 
-  auto_memory:         # Trace 分析（无对话分支时）→ 最便宜
+  session_title:       # 会话标题生成
     provider: minimax
     model: MiniMax-M2.7
+    timeout: 30
+
+  case_analysis:       # Agent Bad Case 与 Bash Case 分析
+    provider: minimax
+    model: MiniMax-M2.7
+    timeout: 600
 ```
 
 支持的 provider：Anthropic, OpenAI, DeepSeek, MiniMax, OpenRouter, Azure OpenAI, 自部署 (vLLM 兼容)。
@@ -119,16 +129,15 @@ positions:
 
 ### 子Agent预设
 
-`config/subagent_presets.yaml` 定义6种子Agent：
+`config/subagent_presets.yaml` 定义5种子Agent：
 
 | 预设 | 工具 | 继承历史 | max_turns | 用途 |
 |------|------|---------|-----------|------|
-| `chapter_writer` | Read, Write, Edit, Glob, Grep, Bash | 否 | 15 | 章节撰写 |
-| `chapter_polisher` | Read, Write, Edit, Glob, Grep, SearchRag | 否 | 12 | 润色章节 |
-| `reviewer` | Read, Glob, Grep, AskUserQuestion | 否 | 10 | 独立审阅 |
-| `character_designer` | Read, Write, Edit, Glob, Grep | 否 | 12 | 人物设定 |
-| `outliner` | Read, Write, Glob, Grep, Bash, AskUserQuestion, Edit | 否 | 12 | 大纲规划 |
-| `memory_extractor` | Read, Write, Grep, Glob | 是 | 6 | 保留的手动提取预设；默认生命周期由后台 Trace 分析处理 |
+| `chapter_writer` | Read, Write, Edit, Glob, Grep, TextStats, Bash | 否 | 30 | 章节撰写 |
+| `chapter_polisher` | Read, Write, Edit, Glob, Grep, TextStats, SearchRag | 否 | 24 | 润色章节 |
+| `reviewer` | Read, Glob, Grep, TextStats, AskUserQuestion | 否 | 20 | 独立审阅 |
+| `character_designer` | Read, Write, Edit, Glob, Grep, TextStats | 否 | 24 | 人物设定 |
+| `outliner` | Read, Write, Glob, Grep, TextStats, Bash, AskUserQuestion, Edit | 否 | 30 | 大纲规划 |
 
 ### Write 权限规则
 
@@ -245,6 +254,8 @@ NovelAgent2/
 │   │   ├── registry.py        # ToolRegistry
 │   │   ├── read.py, write.py, edit.py
 │   │   ├── glob.py, grep.py, bash.py
+│   │   ├── text_stats.py      # 文本字符数、字数和行数统计
+│   │   ├── check_content.py   # 批量只读内容验收
 │   │   ├── subagent_tool.py   # SubAgent 工具定义
 │   │   └── ask_user_question.py  # AskUserQuestion 工具定义
 │   ├── security/              # 安全层
@@ -261,8 +272,7 @@ NovelAgent2/
 │   │   ├── memory_manager.py  # 记忆总控
 │   │   ├── file_store.py      # 文件读写
 │   │   ├── index_manager.py   # memory.md索引
-│   │   ├── prefetcher.py      # 异步预取
-│   │   └── auto_memory.py     # 旧的自动记忆实现（当前由 Trace 分析替代）
+│   │   └── prefetcher.py      # 异步预取
 │   ├── trace/                 # 不可变 Trace、后台分析、Insight/Memory/Pattern 生命周期
 │   ├── rag/                   # 全局资料库、分块、BM25 + Embedding 混合检索
 │   ├── embeddings/            # 本地 SentenceTransformer 模型封装

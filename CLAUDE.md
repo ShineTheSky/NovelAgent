@@ -79,8 +79,10 @@ web/ (React SSE) ←→ novelagent/server/ (FastAPI + SSE)
 All tools extend `ToolProtocol` (`base.py`): `name`, `description`, `parameters` (JSON Schema), `execute()`, `checkPermissions()`. Registered in `ToolRegistry` (`registry.py`).
 
 - **Read/Write/Edit/Glob/Grep** — File system tools. Write uses a 7-step permission decision (protected dirs, allow_rules, acceptEdits, etc.).
+- **TextStats/CheckContent** — Read-only text statistics and batched content acceptance checks.
 - **Bash** — Shell execution with 3-tier risk classification: ALLOW (read-only), ASK (redirects/git/rm/mv), BLOCKED (sudo, package managers, networking, destructive git). On Windows uses Git Bash if available.
 - **SubAgent** — Spawns sub-agents defined in `config/subagent_presets.yaml`. Returns `subagent_spawn` result; actual execution delegated to `SubAgentRunner`.
+- **AskUserQuestion/CreateTraceCheckpoint/SearchRag** — Interactive clarification, explicit Trace checkpoints, and shared reference-library retrieval.
 
 ### Layer 5 — Security (`novelagent/security/`)
 
@@ -97,24 +99,26 @@ Three-tier permission check in `PermissionChecker.check()`:
 - `PromptManager` renders `prompts/base_system.j2` with includes from `partials/` and `dynamic/`
 - `MessageManager` wraps a `Message` dataclass list with serialization
 - `TokenCounter` uses tiktoken (`cl100k_base`); `needs_compression()` triggers at 80% of limit
+- `build_cumulative_compression()` composes stored Memory Summaries with uncovered turns before continuing in a linked Trace
 
-### Layer 7 — Memory (`novelagent/memory/`)
+### Layer 7 — Memory and Trace (`novelagent/memory/`, `novelagent/trace/`)
 
-- `MemoryManager` is the coordinator: `on_user_input()` → Prefetcher, `on_round_complete()` → AutoMemory, `rebuild_index()` → IndexManager
-- `FileStore` reads/writes `.memory/` directory with YAML frontmatter (type, tags, summary, created, updated, status)
-- `IndexManager` scans all `.memory/*.md` files, generates `memory.md` index table (top 200, archive overflow)
-- `Prefetcher` makes a lightweight LLM call (1.5s timeout) to select relevant memory files
-- `AutoMemory` triggers every N rounds to extract new memories and Write them to `.memory/`
+- `MemoryManager` coordinates project/global memory initialization, relevant-memory prefetch, and `memory.md` index rebuilding
+- `FileStore` reads/writes `.memory/` records; `IndexManager` maintains the top-200 active memory index
+- `Prefetcher` makes a low-latency LLM call (configured by `memory_prefetch`) to select relevant memory files
+- `TraceStore` persists immutable execution evidence in SQLite; background analysis derives `.insight/`, `.memory/`, and `.pattern/` records
+- `normalized_trajectory.py` validates normalized trajectory records and binds each derived record to source Trace events
+- The former `AutoMemory` path has been removed; Trace analysis now owns automatic knowledge extraction and promotion
 
 ### Core — Agent Loop (`novelagent/core/agent_loop.py`)
 
 `AgentLoop.run()` flow:
 1. Kick off async memory prefetch
 2. Build context (system prompt + history + current user message)
-3. Wait for prefetch (1.5s timeout), inject results
-4. ReAct loop: LLM call → parse tool_use → security check → execute tool → append results → detect loops → repeat
-5. On compression threshold: summarize + rebuild memory index
-6. Auto-memory extraction runs in background after completion
+3. Wait for prefetch (configured timeout, currently 1.5s), inject results
+4. Before the ReAct loop, compose cumulative compression when the context reaches the configured threshold
+5. ReAct loop: LLM call → parse tool use → security check → execute tool → append results → detect loops → repeat
+6. Persist linked Trace events and schedule background Trace analysis without blocking the user response
 
 Permission ASK flow: `PermissionResult.ASK` → yield `permission_ask` chunk → `await permission_event.wait()` → check `permission_granted`. The frontend POSTs to `/api/sessions/{id}/permission-response` to unblock.
 
@@ -122,7 +126,7 @@ SubAgent streaming: `SubAgentRunner.spawn_and_run()` runs a mini loop with its o
 
 ### LLM Client (`novelagent/llm/`)
 
-`LLMClient` supports both Anthropic and OpenAI-compatible APIs (DeepSeek, MiniMax, OpenRouter, Azure, self-hosted). Provider routing via `LLMConfigLoader` which reads `config/llm_config.yaml` — each `position` (main_loop, sub_agent, memory_prefetch, context_compression, auto_memory) can use a different model. Sub-agents can further override via `sub_agent.overrides`.
+`LLMClient` supports both Anthropic and OpenAI-compatible APIs (DeepSeek, MiniMax, OpenRouter, Azure, self-hosted). Provider routing via `LLMConfigLoader` reads `config/llm_config.yaml`; current positions are `main_loop`, `sub_agent`, `memory_prefetch`, `memory_summary_fallback`, `session_title`, and `case_analysis`. Sub-agents can further override settings via `sub_agent.overrides`.
 
 ### Storage (`novelagent/storage/`)
 

@@ -35,7 +35,7 @@ class AgentLoop:
     def __init__(self, llm_client, tool_registry, permission_checker, context_builder, memory_manager,
                  config: dict | None = None, subagent_runner=None, trace_recorder: TraceRecorder | None = None,
                  post_turn_analyzer=None, preference_context_provider=None, rag_store=None, bash_case_recorder=None,
-                 bad_case_analyzer=None):
+                 bad_case_analyzer=None, background_tasks=None):
         self.llm = llm_client
 
         self.tools = tool_registry
@@ -57,6 +57,7 @@ class AgentLoop:
         self.preference_context_provider = preference_context_provider
         self.rag_store = rag_store
         self.review_workflow = ReviewPolishWorkflow(subagent_runner, self.working_dir) if subagent_runner else None
+        self.background_tasks = background_tasks
         self._trace_capture_locks: dict[str, asyncio.Lock] = {}
 
     async def _stream_main_turn(self, messages: list[dict], tools: list[dict] | None,
@@ -237,9 +238,13 @@ class AgentLoop:
                         session.session_id, session.project_id, messages_snapshot, token_count, reason,
                     )
                     if captured and self.post_turn_analyzer:
-                        asyncio.create_task(self.post_turn_analyzer.analyze_window(
+                        analysis = self.post_turn_analyzer.analyze_window(
                             captured["window_id"], session.project_id, captured["messages"], main_tool_schemas,
-                        ))
+                        )
+                        if self.background_tasks:
+                            self.background_tasks.submit(analysis, label=f"trace-window:{captured['window_id']}")
+                        else:
+                            asyncio.create_task(analysis)
             except Exception as exc:
                 print(f"[trace] checkpoint capture failed: {exc}", flush=True)
 
@@ -250,7 +255,7 @@ class AgentLoop:
                 return
             snapshot = copy.deepcopy(messages_snapshot if messages_snapshot is not None else ctx.to_llm_messages())
             event_snapshot = copy.deepcopy(deferred_trace_events)
-            asyncio.create_task(capture_trace_if_due(
+            capture = capture_trace_if_due(
                 answer,
                 snapshot,
                 event_snapshot,
@@ -260,7 +265,11 @@ class AgentLoop:
                     "compression" if compression_trace_requested else reason
                 ),
                 append_turn,
-            ))
+            )
+            if self.background_tasks:
+                self.background_tasks.submit(capture, label=f"trace-capture:{session.session_id}")
+            else:
+                asyncio.create_task(capture)
 
         await record("context_built", "system", {
             "history_message_count": len(history_msgs),

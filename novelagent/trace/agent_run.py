@@ -30,8 +30,10 @@ class AgentTraceTaskManager:
         return task
 
     async def drain(self) -> None:
-        tasks = list(self._tasks)
-        if tasks:
+        while True:
+            tasks = list(self._tasks)
+            if not tasks:
+                return
             await asyncio.gather(*tasks, return_exceptions=True)
 
     @property

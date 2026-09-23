@@ -1,10 +1,12 @@
 """LLM extraction of file-backed Insight, Memory and Pattern records."""
+import asyncio
 import json
 import re
+import uuid
 from pathlib import Path
 
 from novelagent.core.llm_turn import build_assistant_message
-from novelagent.trace.file_lifecycle import FileLifecycleStore, MAX_RECORD_WEIGHT, PATTERN_PROMOTION_WEIGHT
+from novelagent.trace.file_lifecycle import FileLifecycleStore, PATTERN_PROMOTION_WEIGHT
 from novelagent.trace.store import TraceStore
 from novelagent.trace.agent_run import AgentRunTrace
 from novelagent.trace.normalized_trajectory import build_trajectory_prompt, validate_trajectory_payload
@@ -20,11 +22,13 @@ class TraceAnalysisCallError(RuntimeError):
 
 class FileTraceAnalyzer:
     def __init__(self, llm_client, workspace_dir: str, trace_store: TraceStore, embedding_gate=None, rag_store=None,
-                 bad_case_recorder=None):
+                 bad_case_recorder=None, background_tasks=None):
         self.llm, self.workspace_dir, self.trace_store, self.embedding_gate = llm_client, workspace_dir, trace_store, embedding_gate
         self.rag_tool = SearchRagTool(rag_store) if rag_store else None
         self.read_tool = ReadTool()
         self.bad_cases = bad_case_recorder
+        self.background_tasks = background_tasks
+        self._project_locks: dict[str, asyncio.Lock] = {}
 
     @staticmethod
     def _execution_event(events: list[dict] | None, event_type: str, payload: dict,
@@ -303,6 +307,14 @@ class FileTraceAnalyzer:
             event_trace_ids = {
                 str(event.get("event_id")): str(event.get("trace_id") or trace_id) for event in events
             }
+        allowed_source_event_ids = list(dict.fromkeys([
+            *[
+                str(event_id)
+                for ref in trajectory.get("provenance", [])
+                for event_id in ref.get("source_event_ids", [])
+            ],
+            *[str(event.get("event_id")) for event in trace_tool.last_events if event.get("event_id")],
+        ]))
         checkpoint_reasons = self._checkpoint_reasons(events)
         if checkpoint_reasons and not data.get("items") and not data.get("records"):
             retry_prompt = f'''[Trace 记忆提取重试]\n上一轮返回了空结果，但当前 Trace 明确调用了 CreateTraceCheckpoint。必须重新判断，不能返回空对象。\n只输出与主 schema 相同的 JSON：{{"window_summary":"仅概括当前分析窗口的摘要","items":[],"records":[]}}。\n用户明确指出具体文本问题时，items 至少包含 correction 或 feedback；records 必须生成 category=reference、domain=writing、kind=text_feedback、layer=memory、signal=strong 的记录，并让 source_event_ids 指向 user_message。\n若 checkpoint 并非写作反馈，也必须给出对应分类；只有确认不应长期记录时 records 才可为空。\nCheckpoint reasons:{json.dumps(checkpoint_reasons, ensure_ascii=False)}\nTrace events:{json.dumps(event_view, ensure_ascii=False)}\nExisting:{json.dumps(context, ensure_ascii=False)}'''
@@ -352,6 +364,51 @@ class FileTraceAnalyzer:
                 )
             if window_summary and not data.get("window_summary"):
                 data["window_summary"] = window_summary
+        if window_id:
+            data = self._stabilize_prepared_data(data, window_id, allowed_source_event_ids)
+            await self.trace_store.save_trace_window_prepared(window_id, {
+                "data": data, "events": events, "source_trace_ids": source_trace_ids,
+                "allowed_source_event_ids": allowed_source_event_ids, "trace_id": trace_id,
+            })
+        await self._apply_prepared_data(
+            data, events, source_trace_ids, trace_id, project_id,
+            allowed_source_event_ids=allowed_source_event_ids,
+        )
+        window_summary = str(data.get("window_summary") or window_summary).strip()[:8000]
+        if require_summary and not window_summary:
+            raise ValueError("记忆分析未返回 window_summary")
+        return window_summary
+
+    @staticmethod
+    def _stabilize_prepared_data(data: dict, window_id: str, allowed_source_event_ids: list[str]) -> dict:
+        prepared = dict(data)
+        valid = set(allowed_source_event_ids)
+        records = []
+        for index, raw in enumerate(data.get("records", [])):
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            operation_id = f"{window_id}:{index}"
+            item["operation_id"] = operation_id
+            prefix = "mem" if item.get("layer") == "memory" else "ins"
+            item["id"] = f"{prefix}_{uuid.uuid5(uuid.NAMESPACE_URL, operation_id).hex}"
+            item["source_status"] = "verified" if any(
+                str(event_id) in valid for event_id in item.get("source_event_ids", [])
+            ) else "unverified"
+            records.append(item)
+        prepared["records"] = records
+        return prepared
+
+    async def _apply_prepared_data(self, data: dict, events: list[dict], source_trace_ids: list[str],
+                                   trace_id: str, project_id: str, *,
+                                   allowed_source_event_ids: list[str] | None = None) -> None:
+        events = TraceStore.annotate_event_turns(events)
+        valid = set(allowed_source_event_ids or [])
+        event_trace_ids = {
+            str(event.get("event_id")): str(event.get("trace_id") or trace_id) for event in events
+        }
+        evidence_events = [event for event in events if str(event.get("event_id")) in valid]
+        files = FileLifecycleStore(self.workspace_dir, project_id)
         classifications = []
         for raw_item in data.get("items", []):
             if not isinstance(raw_item, dict) or raw_item.get("type") not in {"error", "correction", "confirmation", "feedback"}:
@@ -359,15 +416,12 @@ class FileTraceAnalyzer:
             item = dict(raw_item)
             event_id = str(item.get("event_id") or "")
             if event_id not in valid:
-                event_id = self._match_source_event_id(events, str(item.get("source_excerpt") or ""))
-            if not event_id:
-                defaults = self._default_source_event_ids(events, str(item.get("type") or ""))
-                event_id = defaults[-1] if defaults else ""
+                event_id = self._match_source_event_id(evidence_events, str(item.get("source_excerpt") or ""))
             if event_id:
                 item["event_id"] = event_id
                 classifications.append(item)
         agent_feedback_events = [
-            event for event in events
+            event for event in evidence_events
             if event["event_type"] == "user_message" and self._is_agent_feedback(str(event.get("payload", {}).get("content", "")))
         ]
         classified_ids = {item["event_id"] for item in classifications}
@@ -387,10 +441,11 @@ class FileTraceAnalyzer:
         recorded_event_ids: set[str] = set()
         for item in data.get("records", []):
             if not isinstance(item, dict): continue
+            operation_id = str(item.get("operation_id") or "")
             ids = [str(x) for x in item.get("source_event_ids", []) if str(x) in valid]
             if not ids:
-                matched_id = self._match_source_event_id(events, str(item.get("source_excerpt") or ""))
-                ids = [matched_id] if matched_id else self._default_source_event_ids(events, str(item.get("kind") or ""))
+                matched_id = self._match_source_event_id(evidence_events, str(item.get("source_excerpt") or ""))
+                ids = [matched_id] if matched_id else []
             claim = str(item.get("claim", "")).strip()
             layer = item.get("layer")
             if layer not in {"insight", "memory"} or not ids or not claim: continue
@@ -415,18 +470,45 @@ class FileTraceAnalyzer:
                     continue
                 feedback_relation = str(item.get("feedback_relation") or "same_anchor")
                 related_layer = str(item.get("related_layer") or ("memory" if layer == "memory" else "insight"))
-                related = files.get(related_layer, str(item.get("related_id", ""))) if related_layer in {"insight", "memory"} and item.get("related_id") else None
+                resolved_layer, related = files.resolve(related_layer, str(item.get("related_id", ""))) if related_layer in {"insight", "memory"} and item.get("related_id") else (None, None)
                 if related and not files.is_text_feedback(related):
                     related = None
                 if related:
-                    merged = files.merge_text_feedback(related, item, record_trace_id, ids, user_inputs)
+                    related_layer = str(resolved_layer)
+                    if feedback_relation == "cross_text_conflict" and related_layer == "memory":
+                        reason = str(item.get("relation_reason") or "相似文本在同一适用范围内存在无法消解的相反修改方向。")
+                        candidate_id = f"ins_{uuid.uuid5(uuid.NAMESPACE_URL, f'{operation_id}:conflict').hex}"
+                        existing_conflict = files.downgrade_conflict(
+                            "memory", related["id"], candidate_id, reason,
+                        )
+                        user_requirements = str(item.get("user_requirements") or "").strip()
+                        revision_direction = str(item.get("revision_direction") or item.get("feedback_direction") or item.get("content") or claim).strip()
+                        files.write("insight", {
+                            "id": candidate_id, "title": item.get("title", claim), "claim": claim,
+                            "content": files.render_text_feedback_content(user_requirements, revision_direction, user_inputs),
+                            "user_requirements": user_requirements, "revision_direction": revision_direction,
+                            "category": "reference", "domain": item.get("domain", "overall"), "kind": "text_feedback",
+                            "artifact_path": str(item.get("artifact_path") or "").replace("\\", "/").lstrip("./"),
+                            "artifact_revision_id": str(item.get("artifact_revision_id") or ""),
+                            "anchor_excerpt": str(item.get("anchor_excerpt") or "")[:700],
+                            "anchor_sha256": str(item.get("anchor_sha256") or ""),
+                            "feedback_direction": str(item.get("feedback_direction") or claim),
+                            "feedback_count": 1, "feedback_history": [{"trace_id": record_trace_id, "trace_refs": trace_refs, "source_event_ids": ids, "feedback_direction": str(item.get("feedback_direction") or ""), "relation": feedback_relation}],
+                            "user_inputs": user_inputs, "trace_id": record_trace_id,
+                            "trace_ids": record_trace_ids, "trace_refs": trace_refs, "source_event_ids": ids,
+                            "confidence": item.get("confidence", .5), "weight": 15, "support_count": 1,
+                            "promotion_status": "conflict_review", "conflict_reason": reason,
+                            "conflict_ids": [existing_conflict["id"]] if existing_conflict else [],
+                        })
+                        continue
+                    supported = related
+                    if feedback_relation == "cross_text_support":
+                        bonus = 35 if item.get("signal") == "strong" else 15
+                        supported, _ = files.add_support(related, record_trace_ids, ids, bonus, item)
+                    merged = files.merge_text_feedback(supported, item, record_trace_id, ids, user_inputs)
                     merged["trace_ids"] = list(dict.fromkeys([*merged.get("trace_ids", []), *record_trace_ids]))
                     if item.get("explicit_reconfirmation") is True:
                         merged = files.confirm_auto_promotion(merged)
-                    if feedback_relation == "cross_text_support":
-                        bonus = 35 if item.get("signal") == "strong" else 15
-                        merged["weight"] = min(MAX_RECORD_WEIGHT, float(merged.get("weight", 0)) + bonus)
-                        merged["support_count"] = int(merged.get("support_count", 1)) + 1
                     can_promote = files.can_auto_promote(merged)
                     saved = files._move(merged, "memory") if layer == "memory" and related_layer == "insight" and can_promote else files.write(related_layer, merged)
                     if feedback_relation == "cross_text_support" and saved["layer"] == "memory" and files.can_auto_promote(saved) and saved["weight"] >= PATTERN_PROMOTION_WEIGHT and saved["support_count"] >= 3:
@@ -454,8 +536,30 @@ class FileTraceAnalyzer:
                 continue
             related_layer = str(item.get("related_layer") or ("memory" if layer == "memory" else "insight"))
             relation = str(item.get("relation") or "new")
-            related = files.get(related_layer, str(item.get("related_id", ""))) if relation in {"support", "append"} and related_layer in {"insight", "memory", "pattern"} and (related_layer != "pattern" or layer == "memory") else None
+            if relation == "conflict" and related_layer in {"memory", "pattern"}:
+                related_id = str(item.get("related_id") or "")
+                reason = str(item.get("relation_reason") or "同一适用范围内存在无法消解的相反规则。")
+                candidate_id = f"ins_{uuid.uuid5(uuid.NAMESPACE_URL, f'{operation_id}:conflict').hex}"
+                existing_conflict = files.downgrade_conflict(related_layer, related_id, candidate_id, reason)
+                if existing_conflict:
+                    candidate = {
+                        "id": candidate_id, "title": item.get("title", claim), "claim": claim,
+                        "content": item.get("content", claim), "category": item.get("category", "project"),
+                        "domain": item.get("domain", "overall"), "kind": item.get("kind", ""),
+                        "trace_id": record_trace_id, "trace_ids": record_trace_ids,
+                        "trace_refs": trace_refs, "source_event_ids": ids,
+                        "confidence": item.get("confidence", .5), "weight": 15, "support_count": 1,
+                        "promotion_status": "conflict_review", "conflict_reason": reason,
+                        "conflict_ids": [existing_conflict["id"]],
+                    }
+                    files.write("insight", candidate)
+                    continue
+            resolved_layer, related = files.resolve(related_layer, str(item.get("related_id", ""))) if relation in {"support", "append"} and related_layer in {"insight", "memory", "pattern"} and (related_layer != "pattern" or layer == "memory") else (None, None)
             if related:
+                related_layer = str(resolved_layer)
+                if relation == "support":
+                    bonus = 35 if item.get("signal") == "strong" else 15
+                    related, _ = files.add_support(related, record_trace_ids, ids, bonus)
                 related["trace_id"] = record_trace_id
                 related["source_event_ids"] = list(dict.fromkeys([*related.get("source_event_ids", []), *ids]))
                 related["trace_ids"] = list(dict.fromkeys([*related.get("trace_ids", []), *record_trace_ids]))
@@ -474,9 +578,6 @@ class FileTraceAnalyzer:
                     related["relation_history"] = history
                     files.write(related_layer, related)
                     continue
-                bonus = 35 if item.get("signal") == "strong" else 15
-                related["weight"] = min(MAX_RECORD_WEIGHT, float(related.get("weight", 0)) + bonus)
-                related["support_count"] = int(related.get("support_count", 1)) + 1
                 if item.get("explicit_reconfirmation") is True:
                     related = files.confirm_auto_promotion(related)
                 can_promote = files.can_auto_promote(related)
@@ -487,7 +588,7 @@ class FileTraceAnalyzer:
                     files.promote_memory_to_pattern(saved, record_trace_ids)
             else:
 
-                files.write(layer, {"title": item.get("title", claim), "claim": claim, "content": item.get("content", claim), "category": item.get("category", "project"), "domain": item.get("domain", "overall"), "kind": item.get("kind", ""), "trace_id": record_trace_id, "trace_ids": record_trace_ids, "trace_refs": trace_refs, "source_event_ids": ids, "confidence": item.get("confidence", .5), "weight": 65 if item.get("signal") == "strong" else 15, "support_count": 1})
+                files.write(layer, {"id": item.get("id"), "title": item.get("title", claim), "claim": claim, "content": item.get("content", claim), "category": item.get("category", "project"), "domain": item.get("domain", "overall"), "kind": item.get("kind", ""), "trace_id": record_trace_id, "trace_ids": record_trace_ids, "trace_refs": trace_refs, "source_event_ids": ids, "confidence": item.get("confidence", .5), "weight": 65 if item.get("signal") == "strong" else 15, "support_count": 1})
 
         for event in agent_feedback_events:
             already_recorded = any(
@@ -509,10 +610,6 @@ class FileTraceAnalyzer:
         files.rebuild_indexes()
         for source_trace_id in source_trace_ids:
             await self.trace_store.set_trace_analysis_status(source_trace_id, "complete")
-        window_summary = str(data.get("window_summary") or window_summary).strip()[:8000]
-        if require_summary and not window_summary:
-            raise ValueError("记忆分析未返回 window_summary")
-        return window_summary
 
     async def analyze_window(self, window_id: str, project_id: str, branch_messages=None, _tools=None) -> None:
         """Analyze bounded local ReAct turns without inventing an aggregate Trace.
@@ -523,33 +620,76 @@ class FileTraceAnalyzer:
         context for KV-cache reuse.  If that branch fails, an independent fallback
         starts from nearby turns and can request another bounded turn range.
         """
-        window = await self.trace_store.get_trace_window(window_id)
-        if not window:
-            return
-        await self.trace_store.set_trace_window_status(window_id, "running")
-        try:
-            source_trace_ids = window.get("source_trace_ids", [])
-            if not source_trace_ids:
-                await self.trace_store.set_trace_window_status(window_id, "complete")
+        lock = self._project_locks.setdefault(project_id, asyncio.Lock())
+        async with lock:
+            window = await self.trace_store.get_trace_window(window_id)
+            if not window or window.get("status") == "complete":
                 return
-            events = self._select_analysis_events(await self.trace_store.list_trace_window_events(window_id))
-            messages = branch_messages if branch_messages is not None else window.get("messages", [])
-            result = await self.analyze(
-                source_trace_ids[-1], project_id, messages, _tools,
-                events_override=events, source_trace_ids=source_trace_ids,
-                require_summary=True,
-                normalized_trajectory={
-                    "trajectory": window.get("normalized_trajectory", []),
-                    "provenance": window.get("trajectory_provenance", []),
-                },
-                window_id=window_id,
-            )
-            await self.trace_store.complete_trace_window_summary(
-                window_id, result.get("window_summary", ""), result.get("agent_trace_id", ""),
-            )
-        except Exception:
-            await self.trace_store.set_trace_window_status(window_id, "failed")
-            raise
+            await self.trace_store.set_trace_window_status(window_id, "running")
+            try:
+                source_trace_ids = window.get("source_trace_ids", [])
+                if not source_trace_ids:
+                    await self.trace_store.set_trace_window_status(window_id, "complete")
+                    return
+                prepared = window.get("prepared_payload") or {}
+                if prepared.get("data"):
+                    result = {
+                        "window_summary": str(prepared["data"].get("window_summary") or ""),
+                        "agent_trace_id": "",
+                    }
+                    await self._apply_prepared_data(
+                        prepared["data"], prepared.get("events", []),
+                        prepared.get("source_trace_ids", source_trace_ids),
+                        str(prepared.get("trace_id") or source_trace_ids[-1]), project_id,
+                        allowed_source_event_ids=prepared.get("allowed_source_event_ids", []),
+                    )
+                else:
+                    events = self._select_analysis_events(await self.trace_store.list_trace_window_events(window_id))
+                    messages = branch_messages if branch_messages is not None else window.get("messages", [])
+                    result = await self.analyze(
+                        source_trace_ids[-1], project_id, messages, _tools,
+                        events_override=events, source_trace_ids=source_trace_ids,
+                        require_summary=True,
+                        normalized_trajectory={
+                            "trajectory": window.get("normalized_trajectory", []),
+                            "provenance": window.get("trajectory_provenance", []),
+                        },
+                        window_id=window_id,
+                    )
+                await self.trace_store.complete_trace_window_summary(
+                    window_id, result.get("window_summary", ""), result.get("agent_trace_id", ""),
+                )
+            except Exception as exc:
+                state = await self.trace_store.record_trace_window_failure(window_id, str(exc))
+                if state.get("status") == "retry_wait" and self.background_tasks:
+                    self.background_tasks.submit(
+                        self._retry_window_after(
+                            window_id, project_id, int(state.get("delay_seconds") or 0),
+                        ),
+                        label=f"trace-window-retry:{window_id}",
+                    )
+                raise
+
+    async def _retry_window_after(self, window_id: str, project_id: str, delay_seconds: int) -> None:
+        await asyncio.sleep(max(0, delay_seconds))
+        await self.analyze_window(window_id, project_id)
+
+    async def recover_pending_windows(self) -> int:
+        """Resume durable window jobs after process startup or an interrupted write."""
+        windows = await self.trace_store.list_recoverable_trace_windows(include_waiting=True)
+        for window in windows:
+            delay_seconds = int(window.get("delay_seconds") or 0)
+            if self.background_tasks and delay_seconds:
+                self.background_tasks.submit(
+                    self._retry_window_after(window["window_id"], window["project_id"], delay_seconds),
+                    label=f"trace-window-recovery:{window['window_id']}",
+                )
+                continue
+            try:
+                await self.analyze_window(window["window_id"], window["project_id"])
+            except Exception as exc:
+                print(f"[trace] window recovery failed: {window['window_id']}: {exc}", flush=True)
+        return len(windows)
 
     async def _extract(self, prompt: str, branch_messages, *, trace_tool=None,
                        project_id: str = "", session_id: str = "", source_trace_id: str = "",
@@ -674,12 +814,13 @@ class FileTraceAnalyzer:
 对每条候选按 candidate_index 返回一个 decision：
 - new：没有语义相同或同一主题下需要保留的既有记录。
 - support：与既有记录表达同一规则、事实或修改方向；必须填写 related_id 和 related_layer。Insight 可支持 Insight；Memory 可支持 Insight、Memory 或 Pattern。
-- append：与既有记录属于同一主题，但构成补充、修订、例外或冲突；必须填写 related_id 和 related_layer。程序会合并来源和冲突历史，但不会增加支持权重。
-- text_feedback 还要返回 feedback_relation=same_anchor|cross_text_support|cross_text_conflict。
+- append：与既有记录属于同一主题，但只是补充、局部例外或明确替代；必须填写 related_id 和 related_layer，不增加支持权重。
+- conflict：与既有 Memory 或 Pattern 在同一适用范围内方向相反且无法通过条件、例外或新规则替代消解；必须填写 related_id、related_layer 和 reason。程序会把双方降为锁定 Insight，等待人工消解。
+- text_feedback 还要返回 feedback_relation=same_anchor|cross_text_support|cross_text_conflict；cross_text_conflict 仅用于真正无法消解的方向冲突。
 - promotion_status=manual_review 的记录只有用户本轮明确重新确认时，explicit_reconfirmation 才能为 true。
 
 若标题不足以判断，可调用一次 Read 读取 Existing 的 file_path；若必须回看来源，可调用一次 GetTraceContext。只能使用这两个只读工具。
-只输出 JSON：{{"decisions":[{{"candidate_index":0,"relation":"new|support|append","related_id":"","related_layer":"insight|memory|pattern","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict","explicit_reconfirmation":false,"reason":"简要说明"}}]}}。
+只输出 JSON：{{"decisions":[{{"candidate_index":0,"relation":"new|support|append|conflict","related_id":"","related_layer":"insight|memory|pattern","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict","explicit_reconfirmation":false,"reason":"简要说明"}}]}}。
 每条候选必须恰好有一个 decision。
 
 Candidates:{json.dumps(records, ensure_ascii=False)}
@@ -736,15 +877,18 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
             relation = str(decision.get("relation") or "new")
             related_layer = str(decision.get("related_layer") or "")
             related_id = str(decision.get("related_id") or "")
-            if relation not in {"new", "support", "append"}:
+            if relation not in {"new", "support", "append", "conflict"}:
                 relation = "new"
             if relation != "new" and (related_layer not in {"insight", "memory", "pattern"} or not related_id):
                 relation, related_layer, related_id = "new", "", ""
-            if relation != "new" and item.get("layer") == "insight" and related_layer != "insight":
+            if relation in {"support", "append"} and item.get("layer") == "insight" and related_layer != "insight":
+                relation, related_layer, related_id = "new", "", ""
+            if relation == "conflict" and related_layer not in {"memory", "pattern"}:
                 relation, related_layer, related_id = "new", "", ""
             item["relation"] = relation
             item["related_layer"] = related_layer
             item["related_id"] = related_id
+            item["relation_reason"] = str(decision.get("reason") or "").strip()
             if decision.get("feedback_relation") in {
                 "same_anchor", "cross_text_support", "cross_text_conflict",
             }:
@@ -959,35 +1103,6 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
             if content and (needle in content or content in needle):
                 return str(event.get("event_id") or "")
         return ""
-
-    @staticmethod
-    def _default_source_event_ids(events: list[dict], source_kind: str = "") -> list[str]:
-        if not events:
-            return []
-        if source_kind == "error":
-            candidates = [event for event in events if event.get("event_type") == "error"]
-        elif source_kind == "review_issue":
-            candidates = [
-                event for event in events
-                if str((event.get("payload") or {}).get("preset") or "") == "reviewer"
-                or str((event.get("payload") or {}).get("workflow") or "") == "auto_review"
-                or FileTraceAnalyzer._is_legacy_review_summary(
-                    str((event.get("payload") or {}).get("content") or "")
-                )
-            ]
-        else:
-            candidates = [
-                event for event in events if event.get("event_type") in {"user_message", "user_answer"}
-            ]
-        if not candidates:
-            candidates = [
-                event for event in events
-                if event.get("event_type") == "tool_call"
-                and (event.get("payload") or {}).get("tool") == "CreateTraceCheckpoint"
-            ]
-        candidate = (candidates or events)[-1]
-        event_id = str(candidate.get("event_id") or "")
-        return [event_id] if event_id else []
 
     @staticmethod
     def _trace_refs(events: list[dict], event_ids: list[str], default_trace_id: str) -> list[dict]:
