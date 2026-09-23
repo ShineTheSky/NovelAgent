@@ -9,6 +9,27 @@ from novelagent.tools.base import ToolContext
 from novelagent.tools.get_trace_context import GetTraceContextTool
 
 
+def _trajectory_response(kwargs):
+    prompt = kwargs["messages"][-1]["content"]
+    event = json.loads(prompt.split("Raw trace events:", 1)[1])[0]
+    trace_id = event["trace_id"]
+    turn_no = int(event["turn"])
+    return json.dumps({
+        "trajectory": [{
+            "role": "observation",
+            "content": json.dumps(event, ensure_ascii=False),
+            "timestamp": event["timestamp"],
+        }],
+        "provenance": [{
+            "record_index": 0,
+            "trace_id": trace_id,
+            "turn_id": f"{trace_id}:{turn_no}",
+            "turn_no": turn_no,
+            "source_event_ids": [event["event_id"]],
+        }],
+    }, ensure_ascii=False)
+
+
 def _feedback(**overrides):
     item = {
         "title": "减少直白解释",
@@ -32,6 +53,24 @@ def _feedback(**overrides):
     }
     item.update(overrides)
     return item
+
+
+def test_legacy_evidence_directory_is_migrated_to_insight(tmp_path):
+    legacy = tmp_path / "project-a" / ".evidence" / "project"
+    legacy.mkdir(parents=True)
+    (legacy / "evi_legacy.md").write_text(
+        "---\nid: evi_legacy\nclaim: 旧洞察\ncategory: project\ndomain: writing\n"
+        "weight: 15\nupdated: '2026-09-01T00:00:00+00:00'\n---\n\n旧洞察正文\n",
+        encoding="utf-8",
+    )
+
+    records = FileLifecycleStore(str(tmp_path), "project-a").list("insight")
+
+    assert len(records) == 1
+    assert records[0]["id"] == "evi_legacy"
+    assert records[0]["layer"] == "insight"
+    assert records[0]["file_path"] == ".insight/project/evi_legacy.md"
+    assert not (tmp_path / "project-a" / ".evidence").exists()
 
 
 def test_same_anchor_feedback_refreshes_without_weight(tmp_path):
@@ -496,8 +535,10 @@ class _OverflowThenLocalLLM:
 
     async def chat(self, **kwargs):
         self.calls.append(kwargs)
-        if kwargs["position"] == "main_loop":
+        if kwargs["tag"] == ":trace-fork/trajectory" and kwargs["position"] == "main_loop":
             yield SimpleNamespace(type="error", error="maximum context length exceeded")
+        elif kwargs["tag"] == ":trace-fork/trajectory/fallback":
+            yield SimpleNamespace(type="text_delta", content=_trajectory_response(kwargs))
         else:
             yield SimpleNamespace(type="text_delta", content='{"items": [], "records": []}')
 
@@ -511,11 +552,42 @@ def test_trace_analysis_falls_back_to_local_turns_when_cached_branch_overflows(t
         "trace-a", "project-a", branch_messages=[{"role": "user", "content": "主会话前缀"}],
     ))
 
-    assert [call["position"] for call in llm.calls] == ["main_loop", "auto_memory"]
+    assert [call["position"] for call in llm.calls] == [
+        "main_loop", "memory_summary_fallback", "memory_summary_fallback",
+    ]
     assert llm.calls[0]["messages"][0]["content"] == "主会话前缀"
-    assert "Trace events:" not in llm.calls[0]["messages"][-1]["content"]
-    assert llm.calls[1]["messages"][0]["content"].startswith("[后台 Trace 分支命令]")
-    assert "Trace events:" in llm.calls[1]["messages"][0]["content"]
+    assert "Raw trace events:" in llm.calls[0]["messages"][-1]["content"]
+    assert llm.calls[2]["messages"][0]["content"].startswith("[Memory/Summary Agent：轨迹整理轮]")
+    assert "normalized trajectory" in llm.calls[2]["messages"][-1]["content"]
+    assert store.statuses == [("trace-a", "complete")]
+
+
+class _InvalidThenLocalLLM:
+    def __init__(self):
+        self.calls = []
+
+    async def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs["tag"] == ":trace-fork/trajectory" and kwargs["position"] == "main_loop":
+            yield SimpleNamespace(type="text_delta", content="不是 JSON")
+        elif kwargs["tag"] == ":trace-fork/trajectory/fallback":
+            yield SimpleNamespace(type="text_delta", content=_trajectory_response(kwargs))
+        else:
+            yield SimpleNamespace(type="text_delta", content='{"items": [], "records": []}')
+
+
+def test_trace_analysis_falls_back_when_cached_branch_returns_invalid_json(tmp_path):
+    llm = _InvalidThenLocalLLM()
+    store = _FallbackTraceStore()
+    analyzer = FileTraceAnalyzer(llm, str(tmp_path), store)
+
+    asyncio.run(analyzer.analyze(
+        "trace-a", "project-a", branch_messages=[{"role": "user", "content": "主会话前缀"}],
+    ))
+
+    assert [call["position"] for call in llm.calls] == [
+        "main_loop", "memory_summary_fallback", "memory_summary_fallback",
+    ]
     assert store.statuses == [("trace-a", "complete")]
 
 
@@ -526,12 +598,15 @@ class _TwoStageMergeLLM:
 
     async def chat(self, **kwargs):
         self.calls.append(kwargs)
+        if kwargs["tag"] == ":trace-fork/trajectory/fallback":
+            yield SimpleNamespace(type="text_delta", content=_trajectory_response(kwargs))
+            return
         if kwargs["tag"] == ":trace-fork/reconcile":
             yield SimpleNamespace(type="text_delta", content=json.dumps({"decisions": [{
                 "candidate_index": 0,
                 "relation": "support",
                 "related_id": self.related_id,
-                "related_layer": "evidence",
+                "related_layer": "insight",
                 "reason": "同一条写作要求",
             }]}, ensure_ascii=False))
             return
@@ -542,7 +617,7 @@ class _TwoStageMergeLLM:
                 "summary": "动作距离需要明确", "confidence": 0.9,
             }],
             "records": [{
-                "layer": "evidence", "category": "project", "domain": "writing",
+                "layer": "insight", "category": "project", "domain": "writing",
                 "title": "动作场景写清距离", "claim": "动作场景写清距离",
                 "content": "动作场景需要明确人物距离。",
                 "source_event_ids": ["event-user"], "signal": "weak",
@@ -551,9 +626,9 @@ class _TwoStageMergeLLM:
         }, ensure_ascii=False))
 
 
-def test_second_stage_reconciles_new_candidate_into_existing_evidence(tmp_path):
+def test_second_stage_reconciles_new_candidate_into_existing_insight(tmp_path):
     files = FileLifecycleStore(str(tmp_path), "project-a")
-    existing = files.write("evidence", {
+    existing = files.write("insight", {
         "title": "动作场景写清距离", "claim": "动作场景写清距离",
         "content": "动作场景需要明确人物距离。",
         "category": "project", "domain": "writing",
@@ -566,9 +641,11 @@ def test_second_stage_reconciles_new_candidate_into_existing_evidence(tmp_path):
 
     asyncio.run(analyzer.analyze("trace-a", "project-a"))
 
-    evidence = files.list("evidence")
-    assert len(evidence) == 1
-    assert evidence[0]["id"] == existing["id"]
-    assert evidence[0]["support_count"] == 2
-    assert evidence[0]["weight"] == 30
-    assert [call["tag"] for call in llm.calls] == [":trace-fork", ":trace-fork/reconcile"]
+    insights = files.list("insight")
+    assert len(insights) == 1
+    assert insights[0]["id"] == existing["id"]
+    assert insights[0]["support_count"] == 2
+    assert insights[0]["weight"] == 30
+    assert [call["tag"] for call in llm.calls] == [
+        ":trace-fork/trajectory/fallback", ":trace-fork", ":trace-fork/reconcile",
+    ]

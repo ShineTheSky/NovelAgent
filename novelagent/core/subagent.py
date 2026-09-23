@@ -6,14 +6,15 @@ from novelagent.tools.subagent_tool import SubAgentTool
 from novelagent.core.session import Session, ResponseChunk
 from novelagent.tools.base import ToolContext, ToolResult
 from novelagent.core.llm_turn import query
-from novelagent.trace.agent_run import AgentRunTrace
+from novelagent.trace.agent_run import AgentRunTrace, AgentTraceTaskManager
 
 
 class SubAgentRunner:
     """子Agent执行器"""
 
     def __init__(self, llm_client, tool_registry, permission_checker, context_builder,
-                 working_dir: str = "./workspace", bad_case_recorder=None):
+                 working_dir: str = "./workspace", bad_case_recorder=None,
+                 trace_tasks: AgentTraceTaskManager | None = None):
         self.llm = llm_client
         self.tools = tool_registry
         self.security = permission_checker
@@ -21,6 +22,7 @@ class SubAgentRunner:
         self.presets_tool = SubAgentTool()
         self.working_dir = working_dir
         self.bad_cases = bad_case_recorder
+        self.trace_tasks = trace_tasks
         from novelagent.context.prompt_manager import PromptManager
         self.prompt_manager = PromptManager("prompts")
 
@@ -70,7 +72,7 @@ class SubAgentRunner:
             return
 
         inherit = inherit_history if inherit_history is not None else preset.get("inherit_history", True)
-        max_turns = preset.get("max_turns", 8)
+        max_turns = preset.get("max_turns", 20)
         tool_names = preset.get("tools", [])
 
         current_run_id = run_id or uuid.uuid4().hex
@@ -132,7 +134,10 @@ class SubAgentRunner:
                     messages=[{"role": "system", "content": system_prompt}, *initial_messages],
                     tools=sub_tool_schemas,
                 )
-        execution_events: list[dict] = agent_trace.events if agent_trace else []
+
+        def record_agent_event(event_type: str, payload: dict) -> None:
+            if agent_trace:
+                agent_trace.add(event_type, payload, actor=f"subagent:{preset_name}")
 
         async def capture_bad_case(failure_kind: str, error: str, *, messages=None,
                                    tool: str = "SubAgent", params: dict | None = None) -> None:
@@ -188,21 +193,16 @@ class SubAgentRunner:
                 execute_tool=execute_tool, sub_type=preset_name,
             ):
                 if ev["type"] in {"thinking", "text_delta"}:
-                    execution_events.append({
-                        "event_type": ev["type"], "actor": f"subagent:{preset_name}",
-                        "payload": {"content": ev["content"]},
-                    })
+                    record_agent_event(ev["type"], {"content": ev["content"]})
                 elif ev["type"] == "tool_call":
-                    execution_events.append({
-                        "event_type": "tool_call", "actor": f"subagent:{preset_name}",
-                        "payload": {"tool": ev["tool"], "params": ev["params"],
-                                    "tool_call_id": ev["tool_call_id"]},
+                    record_agent_event("tool_call", {
+                        "tool": ev["tool"], "params": ev["params"],
+                        "tool_call_id": ev["tool_call_id"],
                     })
                 elif ev["type"] == "tool_result":
-                    execution_events.append({
-                        "event_type": "tool_result", "actor": f"subagent:{preset_name}",
-                        "payload": {"tool": ev["tool"], "success": ev["success"],
-                                    "data": ev["data"], "error": ev["error"]},
+                    record_agent_event("tool_result", {
+                        "tool": ev["tool"], "success": ev["success"],
+                        "data": ev["data"], "error": ev["error"],
                     })
                     if not ev["success"]:
                         await capture_bad_case(
@@ -226,10 +226,7 @@ class SubAgentRunner:
                         messages=ev["messages"],
                     )
                 elif ev["type"] == "error":
-                    execution_events.append({
-                        "event_type": "error", "actor": f"subagent:{preset_name}",
-                        "payload": {"message": ev["error"]},
-                    })
+                    record_agent_event("error", {"message": ev["error"]})
                     if agent_trace:
                         await agent_trace.finish("failed", error=ev["error"])
                     await capture_bad_case("subagent_failure", ev["error"])
@@ -239,10 +236,7 @@ class SubAgentRunner:
                     empty_result = not ev["final_text"].strip()
                     result_text = ev["final_text"].strip() or "(子Agent未返回内容)"
         except Exception as e:
-            execution_events.append({
-                "event_type": "error", "actor": f"subagent:{preset_name}",
-                "payload": {"message": str(e)},
-            })
+            record_agent_event("error", {"message": str(e)})
             if agent_trace:
                 await agent_trace.finish("failed", error=str(e))
             await capture_bad_case("subagent_failure", str(e))
@@ -254,7 +248,13 @@ class SubAgentRunner:
                 await agent_trace.finish("failed", error="子 Agent 未返回有效内容")
             await capture_bad_case("empty_response", "子 Agent 未返回有效内容")
         elif agent_trace:
-            await agent_trace.finish("completed", result_text)
+            if self.trace_tasks:
+                self.trace_tasks.submit(
+                    agent_trace.finish("completed", result_text),
+                    label=f"trace:{agent_trace.trace_id}",
+                )
+            else:
+                await agent_trace.finish("completed", result_text)
 
         print(f"[sub/{preset_name}] 完成: result_len={len(result_text)} preview={result_text[:100]}...", flush=True)
         yield ResponseChunk(type="subagent_done", data={

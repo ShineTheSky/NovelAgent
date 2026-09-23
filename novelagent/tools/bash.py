@@ -33,8 +33,10 @@ class BashTool(ToolProtocol):
         "nmap", "telnet", "su", "runas", "doas", "pkexec", "systemctl", "service",
     ]
 
-    def __init__(self, case_recorder=None):
+    def __init__(self, case_recorder=None, *, command_timeout: float = 30, max_output_size: int = 10240):
         self.case_recorder = case_recorder
+        self.command_timeout = max(1, float(command_timeout))
+        self.max_output_size = max(1, int(max_output_size))
 
     async def execute(self, params: dict, context: ToolContext) -> ToolResult:
         command = params["command"]
@@ -49,26 +51,26 @@ class BashTool(ToolProtocol):
                     result = subprocess.run(
                         [bash_path, '-c', command],
                         capture_output=True, text=True,
-                        timeout=30, cwd=cwd, encoding='utf-8', errors='replace'
+                        timeout=self.command_timeout, cwd=cwd, encoding='utf-8', errors='replace'
                     )
                 else:
                     result = subprocess.run(
                         command, shell=True, capture_output=True, text=True,
-                        timeout=30, cwd=cwd, encoding='utf-8', errors='replace'
+                        timeout=self.command_timeout, cwd=cwd, encoding='utf-8', errors='replace'
                     )
             else:
                 result = subprocess.run(
                     command, shell=True, capture_output=True, text=True,
-                    timeout=30, cwd=cwd, encoding='utf-8', errors='replace'
+                    timeout=self.command_timeout, cwd=cwd, encoding='utf-8', errors='replace'
                 )
             output = (result.stdout or '') + (result.stderr or '')
             # 输出截断
-            max_size = 10240
+            max_size = self.max_output_size
             if len(output) > max_size:
                 output = output[:max_size] + f"\n[输出截断，超过{max_size}字节]"
             tool_result = ToolResult(success=(result.returncode == 0), data=output.strip() or "(无输出)")
         except subprocess.TimeoutExpired:
-            tool_result = ToolResult(success=False, error="Bash命令超时（30s）")
+            tool_result = ToolResult(success=False, error=f"Bash命令超时（{self.command_timeout:g}s）")
         except Exception as exc:
             tool_result = ToolResult(success=False, error=str(exc))
 

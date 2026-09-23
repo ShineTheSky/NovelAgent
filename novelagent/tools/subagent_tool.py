@@ -12,7 +12,7 @@ class SubAgentTool(ToolProtocol):
     parameters = {
         "type": "object",
         "properties": {
-            "preset": {"type": "string", "description": "预设名称。可用: chapter_writer, chapter_polisher, reviewer, character_designer, outliner, memory_extractor"},
+            "preset": {"type": "string", "description": "预设名称。可用: chapter_writer, chapter_polisher, reviewer, character_designer, outliner"},
             "task": {"type": "string", "description": "分配给子Agent的任务描述"},
             "inherit_history": {"type": "boolean", "description": "覆盖预设的inherit_history设置"},
             "attachments": {

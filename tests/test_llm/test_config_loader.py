@@ -14,8 +14,15 @@ def test_load_positions():
     loader = LLMConfigLoader()
     cfg = loader.load()
     pos = cfg['positions']
-    for key in ['main_loop', 'sub_agent', 'memory_prefetch', 'context_compression', 'auto_memory']:
+    for key in [
+        'main_loop', 'sub_agent', 'memory_prefetch',
+        'memory_summary_fallback', 'session_title', 'case_analysis',
+    ]:
         assert key in pos
+    assert 'context_compression' not in pos
+    assert 'auto_memory' not in pos
+    assert 'bad_case_analysis' not in pos
+    assert 'bash_case_analysis' not in pos
 
 
 def test_defaults_merge():

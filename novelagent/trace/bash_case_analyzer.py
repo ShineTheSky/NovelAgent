@@ -33,7 +33,7 @@ class BashCaseAnalyzer:
             return None
         return await AgentRunTrace.try_start(
             self.trace_store, session_id=session_id, project_id=project_id,
-            actor=actor, position="bash_case_analysis", source_trace_id=source_trace_id, title=title,
+            actor=actor, position="case_analysis", source_trace_id=source_trace_id, title=title,
         )
 
     async def _capture_failure(self, agent_trace, actor: str, error: Exception | str,
@@ -93,12 +93,12 @@ class BashCaseAnalyzer:
         try:
             if agent_trace:
                 agent_trace.add_request(
-                    position="bash_case_analysis", tag=":bash-case-annotation",
+                    position="case_analysis", tag=":bash-case-annotation",
                     messages=[{"role": "user", "content": prompt}], tools=None,
                 )
             async for chunk in self.llm.chat(
-                position="bash_case_analysis", messages=[{"role": "user", "content": prompt}],
-                tools=None, stream=False, tag=":bash-case-annotation", max_tokens=512,
+                position="case_analysis", messages=[{"role": "user", "content": prompt}],
+                tools=None, stream=False, tag=":bash-case-annotation",
             ):
                 if chunk.type == "text_delta":
                     text += chunk.content
@@ -186,12 +186,12 @@ class BashCaseAnalyzer:
         try:
             if agent_trace:
                 agent_trace.add_request(
-                    position="bash_case_analysis", tag=":bash-case-analysis",
+                    position="case_analysis", tag=":bash-case-analysis",
                     messages=[{"role": "user", "content": prompt}], tools=None,
                 )
             async for chunk in self.llm.chat(
-                position="bash_case_analysis", messages=[{"role": "user", "content": prompt}],
-                tools=None, stream=False, tag=":bash-case-analysis", max_tokens=2048,
+                position="case_analysis", messages=[{"role": "user", "content": prompt}],
+                tools=None, stream=False, tag=":bash-case-analysis",
             ):
                 if chunk.type == "text_delta":
                     text += chunk.content

@@ -14,6 +14,8 @@ from novelagent.tools.write import WriteTool
 from novelagent.tools.edit import EditTool
 from novelagent.tools.glob import GlobTool
 from novelagent.tools.grep import GrepTool
+from novelagent.tools.text_stats import TextStatsTool
+from novelagent.tools.check_content import CheckContentTool
 from novelagent.tools.bash import BashTool
 from novelagent.tools.subagent_tool import SubAgentTool
 from novelagent.tools.ask_user_question import AskUserQuestionTool
@@ -26,6 +28,7 @@ from novelagent.core.agent_loop import AgentLoop
 from novelagent.core.subagent import SubAgentRunner
 from novelagent.trace.store import TraceStore
 from novelagent.trace.recorder import TraceRecorder
+from novelagent.trace.agent_run import AgentTraceTaskManager
 from novelagent.trace.file_analyzer import FileTraceAnalyzer, FilePatternContextProvider
 from novelagent.trace.agent_bad_cases import AgentBadCaseRecorder
 from novelagent.trace.bad_case_analyzer import BadCaseAnalyzer
@@ -71,6 +74,7 @@ def create_app() -> FastAPI:
     embedding_cfg = cfg.get("embedding", {})
     security_cfg = cfg.get("security", {})
     bash_cfg = security_cfg.get("bash", {})
+    case_analysis_cfg = cfg.get("case_analysis", {})
 
     # Initialize components
     llm_config_path = str(get_project_root() / "config" / "llm_config.yaml")
@@ -80,19 +84,24 @@ def create_app() -> FastAPI:
     rag_store = RagStore(embedding_model)
     trace_store = TraceStore()
     bash_case_analyzer = BashCaseAnalyzer(
-        llm_client, working_dir, cfg.get("bash_case_analysis"), trace_store,
+        llm_client, working_dir, case_analysis_cfg, trace_store,
     )
     bash_case_recorder = BashCaseRecorder(working_dir, bash_case_analyzer)
     registry = ToolRegistry()
-    for tool in [ReadTool(), WriteTool(), EditTool(), GlobTool(), GrepTool(), BashTool(bash_case_recorder), SubAgentTool(), AskUserQuestionTool(), CreateTraceCheckpointTool(), SearchRagTool(rag_store)]:
+    for tool in [ReadTool(), WriteTool(), EditTool(), GlobTool(), GrepTool(), TextStatsTool(), CheckContentTool(), BashTool(
+        bash_case_recorder,
+        command_timeout=bash_cfg.get("command_timeout", 30),
+        max_output_size=bash_cfg.get("max_output_size", 10240),
+    ), SubAgentTool(), AskUserQuestionTool(), CreateTraceCheckpointTool(), SearchRagTool(rag_store)]:
         registry.register(tool)
 
     permission_checker = PermissionChecker(working_dir)
     context_builder = ContextBuilder("prompts", token_limit=session_cfg.get("token_limit", 150_000))
     memory_manager = MemoryManager(working_dir, llm_client)
     trace_recorder = TraceRecorder(trace_store)
+    agent_trace_tasks = AgentTraceTaskManager()
     bad_case_analyzer = BadCaseAnalyzer(
-        llm_client, working_dir, cfg.get("bad_case_analysis"), trace_store,
+        llm_client, working_dir, case_analysis_cfg, trace_store,
     )
     bad_case_recorder = AgentBadCaseRecorder(trace_store, working_dir, bad_case_analyzer)
     bash_case_analyzer.bad_case_recorder = bad_case_recorder
@@ -118,6 +127,7 @@ def create_app() -> FastAPI:
 
     subagent_runner = SubAgentRunner(
         llm_client, registry, permission_checker, context_builder, working_dir, bad_case_recorder,
+        agent_trace_tasks,
     )
     # 注入已解析的预设路径
     for tool in registry.list_all():
@@ -135,6 +145,7 @@ def create_app() -> FastAPI:
     app.state.registry = registry
     app.state.memory_manager = memory_manager
     app.state.trace_store = trace_store
+    app.state.agent_trace_tasks = agent_trace_tasks
     app.state.config = cfg
     app.state.llm_config_path = llm_config_path
     app.state.rag_store = rag_store
@@ -152,6 +163,10 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup():
         await db_init()
+
+    @app.on_event("shutdown")
+    async def shutdown():
+        await agent_trace_tasks.drain()
 
     return app
 

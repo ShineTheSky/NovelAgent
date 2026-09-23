@@ -158,7 +158,7 @@ async def _generate_title(llm_client, messages: list[dict]) -> str:
         prompt = f'根据以下用户消息，生成一个10字以内的简洁会话标题，只返回标题文本（不含引号）。\n\n{recent}'
         response_text = ''
         async for chunk in llm_client.chat(
-            position='auto_memory',
+            position='session_title',
             messages=[{'role': 'user', 'content': prompt}],
             stream=False,
         ):

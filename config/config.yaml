@@ -9,7 +9,6 @@ memory:
 # 安全配置
 security:
   bash:
-    working_dir: "./workspace"
     command_timeout: 30        # 秒
     max_output_size: 10240     # 字节（10KB）
 
@@ -27,7 +26,7 @@ security:
 session:
   token_limit: 150000           # 消息列表Token上限
   compression_threshold: 0.8    # 约 120K 时压缩；记忆分支超限时改走局部 turn 兜底
-  max_turns: 30                # 单次任务最大循环轮次
+  max_turns: 50                # 单次任务最大循环轮次
 
 # Agent Loop 配置
 agent:
@@ -41,19 +40,8 @@ embedding:
     routine_min_similarity: 0.70
     routine_min_margin: 0.12
 
-# 全局 Agent Bad Case：先按类别积累，再异步生成仅供人工审核的根因与建议。
-bad_case_analysis:
-  enabled: true
-  batch_size: 3
-  max_cases: 12
-
-# 所有 Bash 行为样本（含成功）按命令族聚合，用于提出受监控工具候选。
-bash_case_analysis:
+# Bad Case 与 Bash Case 共用触发和样本窗口配置；模型路由见 llm_config.yaml 的 case_analysis。
+case_analysis:
   enabled: true
   batch_size: 3
   max_cases: 20
-
-# 日志配置
-logging:
-  level: "INFO"                 # DEBUG / INFO / WARNING / ERROR
-  format: "json"                # json / text

@@ -1,4 +1,4 @@
-"""LLM extraction of file-backed Evidence, Memory and Pattern records."""
+"""LLM extraction of file-backed Insight, Memory and Pattern records."""
 import json
 import re
 from pathlib import Path
@@ -7,6 +7,7 @@ from novelagent.core.llm_turn import build_assistant_message
 from novelagent.trace.file_lifecycle import FileLifecycleStore, MAX_RECORD_WEIGHT, PATTERN_PROMOTION_WEIGHT
 from novelagent.trace.store import TraceStore
 from novelagent.trace.agent_run import AgentRunTrace
+from novelagent.trace.normalized_trajectory import build_trajectory_prompt, validate_trajectory_payload
 from novelagent.tools.base import PermissionResult, ToolContext, ToolResult
 from novelagent.tools.get_trace_context import GetTraceContextTool
 from novelagent.tools.read import ReadTool
@@ -80,7 +81,9 @@ class FileTraceAnalyzer:
     async def analyze(self, trace_id: str, project_id: str, branch_messages=None, _tools=None, *,
                       events_override: list[dict] | None = None,
                       source_trace_ids: list[str] | None = None,
-                      require_summary: bool = False) -> dict:
+                      require_summary: bool = False,
+                      normalized_trajectory: dict | None = None,
+                      window_id: str = "") -> dict:
         execution_events: list[dict] = []
         trace = await self.trace_store.get_trace(trace_id)
         if not trace or (trace.get("analysis_status") == "skipped" and not require_summary):
@@ -90,7 +93,9 @@ class FileTraceAnalyzer:
         if self.bad_cases:
             agent_trace = await AgentRunTrace.try_start(
                 self.trace_store, session_id=session_id, project_id=project_id,
-                actor="memory_analyzer", position="auto_memory", source_trace_id=trace_id,
+                actor="memory_analyzer",
+                position="main_loop" if branch_messages else "memory_summary_fallback",
+                source_trace_id=trace_id,
                 title=f"[memory_analyzer] {trace_id}",
             )
         execution_events = agent_trace.events if agent_trace else []
@@ -99,7 +104,8 @@ class FileTraceAnalyzer:
                 trace_id, project_id, branch_messages, _tools,
                 events_override=events_override, source_trace_ids=source_trace_ids,
                 execution_events=execution_events, agent_trace=agent_trace,
-                require_summary=require_summary,
+                require_summary=require_summary, normalized_trajectory=normalized_trajectory,
+                window_id=window_id,
             )
             if agent_trace:
                 await agent_trace.finish("completed", window_summary)
@@ -122,7 +128,9 @@ class FileTraceAnalyzer:
                             source_trace_ids: list[str] | None = None,
                             execution_events: list[dict] | None = None,
                             agent_trace: AgentRunTrace | None = None,
-                            require_summary: bool = False) -> str:
+                            require_summary: bool = False,
+                            normalized_trajectory: dict | None = None,
+                            window_id: str = "") -> str:
         trace = await self.trace_store.get_trace(trace_id)
         if not trace or (trace.get("analysis_status") == "skipped" and not require_summary): return ""
         events = events_override if events_override is not None else await self.trace_store.list_events(trace_id, limit=500)
@@ -137,13 +145,13 @@ class FileTraceAnalyzer:
                 return ""
         files = FileLifecycleStore(self.workspace_dir, project_id)
         valid = {e["event_id"] for e in events}
-        records_by_layer = {layer: files.list(layer) for layer in ("evidence", "memory", "pattern")}
+        records_by_layer = {layer: files.list(layer) for layer in ("insight", "memory", "pattern")}
         all_records = [
-            (layer, record) for layer in ("evidence", "memory", "pattern")
+            (layer, record) for layer in ("insight", "memory", "pattern")
             for record in records_by_layer[layer]
         ]
         context_records = [
-            *(("evidence", record) for record in records_by_layer["evidence"][:120]),
+            *(("insight", record) for record in records_by_layer["insight"][:120]),
             *(("memory", record) for record in records_by_layer["memory"][:80]),
             *(("pattern", record) for record in records_by_layer["pattern"][:40]),
         ]
@@ -160,7 +168,64 @@ class FileTraceAnalyzer:
         } for layer, x in all_records if FileLifecycleStore.is_text_feedback(x)][:80]
 
         event_view = [self._event_summary(event) for event in events if self._keep_event(event)]
-        prompt = f'''[后台 Trace 分支命令]\n你收到的不是完整 Trace，而是每条 Trace 中与本次分析锚点临近的少量 ReAct turn。不要回复用户、不要续写，只分析原始 Trace：{json.dumps(source_trace_ids, ensure_ascii=False)}。每个 Trace event 都携带 trace_id 和 turn；记录必须通过 source_event_ids 保留真实来源，程序会据此把记录精确关联到 trace_id + turn。\n只输出 JSON：{{"items":[{{"event_id":"","type":"error|correction|confirmation|feedback","summary":"","confidence":0.5}}],"records":[{{"layer":"evidence|memory","category":"user|project|reference","domain":"writing|outline|overall","title":"不超过40字的简要标题","content":"具体事实、约束、适用条件和必要背景","claim":"与 title 一致","source_event_ids":[""],"signal":"weak|strong","relation":"new|support|append","related_id":"","confidence":0.5,"kind":"text_feedback 时填写","artifact_path":"可从工具事件推断时填写","artifact_revision_id":"","anchor_excerpt":"用户引用或评价的原文，最多700字","anchor_sha256":"工具事件提供时填写","user_requirements":"综合历次反馈后，用户希望该段达到什么效果以及明确禁止什么","revision_direction":"后续应如何修改，包括措辞、情节、人物表现和节奏等方向","feedback_direction":"兼容字段，填写当前建议的修改方向","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict","explicit_reconfirmation":false}}]}}。\n不记录：普通闲聊、纯工具调用、一次性命令，例如“继续写作”“读取文件”。\nEvidence 是尚不足以长期生效的弱证据，例如用户单次说“这章对话节奏有点慢”；它保留来源，等待后续相似反馈支持。\nMemory 是明确、可复用的长期偏好、修正或约束，例如“以后打斗必须突出空间关系”，或“把林深的初始性格改为恐惧回避型”；这类记录 layer=memory、signal=strong。\n凡是由用户 correction 事件得出的记录，source_event_ids 必须包含对应 user_message 或 user_answer 的 event_id，且 layer=memory、signal=strong；不要用后续 assistant_turn 替代该证据。support 必须引用 Existing 的 memory id。\n\n文本修改反馈的特殊规则：当用户粘贴、引用或明确评价某段小说/大纲原文时，写 category=reference、kind=text_feedback，并从工具事件补足 artifact_path、修订和锚点。程序会根据 source_event_ids 保存用户完整原始输入；不要复述或截断用户原话。user_requirements 必须综合历次反馈，提炼用户希望该段达到的效果和明确禁止项；revision_direction 必须总结后续具体修改方向，而不是生成原文摘要。与同一锚点/同一段原文的重复意见使用 relation=append、feedback_relation=same_anchor：只追加历史并更新这两个字段，绝不加分。仅当是不同但相似的文本，且用户修改方向能相互验证时，relation=support、feedback_relation=cross_text_support，才允许为 Existing text_feedback 加分。相同/相似文本但方向相反时用 append、feedback_relation=cross_text_conflict：记录反例与不确定性，不加分。是否同锚点、是否跨文本可迁移由你根据原文、用户引用和 Existing 自行判断。\nTrace events:{json.dumps(event_view, ensure_ascii=False)}\nExisting:{json.dumps(context, ensure_ascii=False)}\nExisting text feedback (full):{json.dumps(feedback_context, ensure_ascii=False)}'''
+        trajectory_prompt = build_trajectory_prompt(source_trace_ids, event_view)
+        trajectory = validate_trajectory_payload(normalized_trajectory or {}, events)
+        trajectory_was_reused = bool(trajectory)
+        trajectory_uses_fallback = not bool(branch_messages)
+        if not trajectory:
+            trajectory_messages = [
+                *(branch_messages or []),
+                {"role": "user", "content": trajectory_prompt},
+            ]
+            try:
+                trajectory_text = await self._chat_text(
+                    trajectory_messages,
+                    "main_loop" if branch_messages else "memory_summary_fallback",
+                    tag=":trace-fork/trajectory" if branch_messages else ":trace-fork/trajectory/fallback",
+                    execution_events=execution_events,
+                )
+                trajectory = validate_trajectory_payload(self._json(trajectory_text), events)
+                if not trajectory:
+                    raise TraceAnalysisCallError("轨迹整理轮返回了无效 normalized trajectory 或来源绑定")
+            except TraceAnalysisCallError as exc:
+                if not branch_messages:
+                    raise
+                await self._capture_analysis_bad_case(
+                    trace_id=trace_id, project_id=project_id, session_id=str(trace.get("session_id", "")),
+                    error=exc, messages=trajectory_messages, agent_trace=agent_trace,
+                    failure_kind="trajectory_normalization_primary_failure",
+                )
+                print(f"[trace] cached trajectory round failed, retrying locally: {exc}", flush=True)
+                trajectory_uses_fallback = True
+                trajectory_text = await self._chat_text(
+                    [{"role": "user", "content": trajectory_prompt}],
+                    "memory_summary_fallback", tag=":trace-fork/trajectory/fallback",
+                    execution_events=execution_events,
+                )
+                trajectory = validate_trajectory_payload(self._json(trajectory_text), events)
+                if not trajectory:
+                    raise TraceAnalysisCallError("独立轨迹整理轮仍未返回有效 normalized trajectory")
+            if window_id:
+                await self.trace_store.save_trace_window_trajectory(
+                    window_id, trajectory, agent_trace.trace_id if agent_trace else "",
+                )
+        self._execution_event(execution_events, "normalized_trajectory", {
+            "window_id": window_id,
+            "reused": trajectory_was_reused,
+            **trajectory,
+        })
+        trajectory_json = json.dumps(trajectory, ensure_ascii=False)
+        trajectory_context_prompt = trajectory_prompt if not trajectory_was_reused else (
+            "[Memory/Summary Agent：已保存轨迹]\n"
+            "下面的 assistant 消息是当前 Trace window 已验证并持久化的 normalized trajectory。"
+            "直接复用它，不要重新读取或重建原始 Trace。"
+        )
+        trajectory_history = [
+            *([] if trajectory_uses_fallback else (branch_messages or [])),
+            {"role": "user", "content": trajectory_context_prompt},
+            {"role": "assistant", "content": trajectory_json},
+        ]
+        prompt = f'''[后台 Trace 分支命令]\n你收到的不是完整 Trace，而是每条 Trace 中与本次分析锚点临近的少量 ReAct turn。不要回复用户、不要续写，只分析原始 Trace：{json.dumps(source_trace_ids, ensure_ascii=False)}。每个 Trace event 都携带 trace_id 和 turn；记录必须通过 source_event_ids 保留真实来源，程序会据此把记录精确关联到 trace_id + turn。\n只输出 JSON：{{"items":[{{"event_id":"","type":"error|correction|confirmation|feedback","summary":"","confidence":0.5}}],"records":[{{"layer":"insight|memory","category":"user|project|reference","domain":"writing|outline|overall","title":"不超过40字的简要标题","content":"具体事实、约束、适用条件和必要背景","claim":"与 title 一致","source_event_ids":[""],"signal":"weak|strong","relation":"new|support|append","related_id":"","confidence":0.5,"kind":"text_feedback 时填写","artifact_path":"可从工具事件推断时填写","artifact_revision_id":"","anchor_excerpt":"用户引用或评价的原文，最多700字","anchor_sha256":"工具事件提供时填写","user_requirements":"综合历次反馈后，用户希望该段达到什么效果以及明确禁止什么","revision_direction":"后续应如何修改，包括措辞、情节、人物表现和节奏等方向","feedback_direction":"兼容字段，填写当前建议的修改方向","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict","explicit_reconfirmation":false}}]}}。\n不记录：普通闲聊、纯工具调用、一次性命令，例如“继续写作”“读取文件”。\nInsight 是从 Trace 得出的、尚不足以长期生效的低置信观察或假设，例如用户单次说“这章对话节奏有点慢”；它保留来源，等待后续相似反馈支持。\nMemory 是明确、可复用的长期偏好、修正或约束，例如“以后打斗必须突出空间关系”，或“把林深的初始性格改为恐惧回避型”；这类记录 layer=memory、signal=strong。\n凡是由用户 correction 事件得出的记录，source_event_ids 必须包含对应 user_message 或 user_answer 的 event_id，且 layer=memory、signal=strong；不要用后续 assistant_turn 替代该证据。support 必须引用 Existing 的 memory id。\n\n文本修改反馈的特殊规则：当用户粘贴、引用或明确评价某段小说/大纲原文时，写 category=reference、kind=text_feedback，并从工具事件补足 artifact_path、修订和锚点。程序会根据 source_event_ids 保存用户完整原始输入；不要复述或截断用户原话。user_requirements 必须综合历次反馈，提炼用户希望该段达到的效果和明确禁止项；revision_direction 必须总结后续具体修改方向，而不是生成原文摘要。与同一锚点/同一段原文的重复意见使用 relation=append、feedback_relation=same_anchor：只追加历史并更新这两个字段，绝不加分。仅当是不同但相似的文本，且用户修改方向能相互验证时，relation=support、feedback_relation=cross_text_support，才允许为 Existing text_feedback 加分。相同/相似文本但方向相反时用 append、feedback_relation=cross_text_conflict：记录反例与不确定性，不加分。是否同锚点、是否跨文本可迁移由你根据原文、用户引用和 Existing 自行判断。\nTrace events:{json.dumps(event_view, ensure_ascii=False)}\nExisting:{json.dumps(context, ensure_ascii=False)}\nExisting text feedback (full):{json.dumps(feedback_context, ensure_ascii=False)}'''
 
         prompt = prompt.replace(
             '只输出 JSON：{"items":',
@@ -169,37 +234,24 @@ class FileTraceAnalyzer:
         )
         prompt += "\nwindow_summary 必须始终填写，即使 items 和 records 为空；只概括本次 source_trace_ids 对应的当前分析窗口，不得重复概括更早窗口。保留该窗口内的关键决策、人物与设定变更、文件修订、用户偏好、未完成事项，最多 2000 字，不要写分析过程。"
         prompt = prompt.replace("user|project|reference", "user|project|reference|agent")
-        prompt += "\n单次质疑异常工具或 Agent 行为（例如‘为什么调用 AskUserQuestion 工具’）属于 Evidence，category=agent；只有明确要求长期遵循的工具流程才属于 Memory。agent 分类只用于后续 Agent 优化，不能作为项目写作或大纲记忆。"
-        prompt += "\n自动审阅事件（workflow=auto_review、preset=reviewer）的 result 是审阅报告。报告中明确指出、并且未来写作可复用地检查或避免的写作缺陷，使用 category=project、domain=writing、kind=review_issue。单次审阅发现只能新建 layer=evidence、signal=weak；同一种底层错误在不同 Trace 或不同正文修订中再次出现时，必须 relation=support 并引用 Existing 中对应的 review_issue。不要记录一次性错字、仅适用于当前情节的修改项、审阅报告中的肯定项，也不要把 polisher 的修改说明当作新证据。content 应写清错误表现、适用条件、判断方法和改进方向。程序会在重复证据达到阈值后自动晋级为 Memory，再继续积累为 Pattern。"
-        prompt += "\n决定写入前必须先根据 Existing 选择候选：Evidence 只能与 Evidence 合并，低幅加分；Memory 可以与 Memory 或 Evidence 合并，高幅加分。Memory 候选还必须查看 Existing 中的 Pattern：若语义相同，relation=support、related_layer=pattern，直接为该 Pattern 加分，不重复新建 Pattern。records 可额外返回 related_layer=evidence|memory|pattern。被容量挤出的旧 Memory 在 Evidence 中保留 origin_memory_id，新的 Memory 可以将其重新提升。"
+        prompt += "\n单次质疑异常工具或 Agent 行为（例如‘为什么调用 AskUserQuestion 工具’）属于 Insight，category=agent；只有明确要求长期遵循的工具流程才属于 Memory。agent 分类只用于后续 Agent 优化，不能作为项目写作或大纲记忆。"
+        prompt += "\n自动审阅事件（workflow=auto_review、preset=reviewer）的 result 是审阅报告。报告中明确指出、并且未来写作可复用地检查或避免的写作缺陷，使用 category=project、domain=writing、kind=review_issue。单次审阅发现只能新建 layer=insight、signal=weak；同一种底层错误在不同 Trace 或不同正文修订中再次出现时，必须 relation=support 并引用 Existing 中对应的 review_issue。不要记录一次性错字、仅适用于当前情节的修改项、审阅报告中的肯定项，也不要把 polisher 的修改说明当作新洞察。content 应写清错误表现、适用条件、判断方法和改进方向。程序会在重复洞察达到阈值后自动晋级为 Memory，再继续积累为 Pattern。"
+        prompt += "\n决定写入前必须先根据 Existing 选择候选：Insight 只能与 Insight 合并，低幅加分；Memory 可以与 Memory 或 Insight 合并，高幅加分。Memory 候选还必须查看 Existing 中的 Pattern：若语义相同，relation=support、related_layer=pattern，直接为该 Pattern 加分，不重复新建 Pattern。records 可额外返回 related_layer=insight|memory|pattern。被容量挤出的旧 Memory 在 Insight 中保留 origin_memory_id，新的 Memory 可以将其重新提升。"
         prompt += "\npromotion_status=manual_review 表示用户曾手动降级并持有不同意见。后续证据仍可追加，但程序禁止自动晋级。只有用户本轮明确重新确认该记录可作为更高等级规则时，才设置 explicit_reconfirmation=true；不得根据普通支持或相似表述自行解除。"
         prompt += "\n每条 records 还必须提供 title 和 content：title 是不超过 40 字、可用于索引和列表的简要标题；content 是可独立理解的具体事实、约束、适用条件和必要背景。claim 保持与 title 一致，用于兼容旧记录。text_feedback 必须提供 user_requirements 和 revision_direction；程序会保存 source_event_ids 对应的完整用户原始输入并将三部分一起落盘。若局部 turn 不足，可调用一次 GetTraceContext，按 start_turn/end_turn 补查当前 Session 内任意 Trace 的必要区间；若必须核对工件原文或修订号，可调用一次 Read 读取当前项目文件。不要为了保险读取整条 Trace 或无关文件。获得工具结果后必须输出完整 JSON。"
 
         trace_event_block = f"Trace events:{json.dumps(event_view, ensure_ascii=False)}"
-        local_prompt = prompt
-        cached_prompt = prompt.replace(
+        analysis_prompt = prompt.replace(
             trace_event_block,
-            "当前请求已经完整继承主 Agent 上下文，因此没有重复附加 Trace turn。"
-            "items 和 records 都必须额外返回 source_excerpt：从继承上下文中原样摘取能定位该判断来源的短句。"
-            "程序会用该短句匹配不可变 Trace 事件，并生成 trace_id + turn 来源。",
+            "上一轮 assistant 已输出并保存 normalized trajectory 及 provenance。"
+            "必须以该 trajectory 为本轮事实输入，并直接使用 provenance 中的 source_event_ids；"
+            "不要重新复述、改写或猜测原始 Trace。",
         ).replace(
             "若局部 turn 不足，可调用一次 GetTraceContext，按 start_turn/end_turn 补查当前 Session 内任意 Trace 的必要区间；若必须核对工件原文或修订号，可调用一次 Read 读取当前项目文件。不要为了保险读取整条 Trace 或无关文件。获得工具结果后必须输出完整 JSON。",
-            "当前是 KV-cache 分支。只允许调用 GetTraceContext 或 Read：前者按 start_turn/end_turn 补查当前 Session 内的必要区间，后者核对当前项目内的工件原文或修订号；其他继承的主 Agent 工具不得调用。获得工具结果后必须输出完整 JSON。",
+            "只允许调用 GetTraceContext 或 Read：前者按 start_turn/end_turn 补查当前 Session 内未被 normalized trajectory 覆盖的必要区间，后者核对当前项目内的工件原文或修订号；其他工具不得调用。获得工具结果后必须输出完整 JSON。",
         ).replace(
             "你收到的不是完整 Trace，而是每条 Trace 中与本次分析锚点临近的少量 ReAct turn。不要回复用户、不要续写，只分析原始 Trace：",
-            "你已经完整继承主 Agent 当前上下文。不要回复用户、不要续写，只分析其中与以下来源 Trace 对应的对话：",
-        ).replace(
-            "每个 Trace event 都携带 trace_id 和 turn；记录必须通过 source_event_ids 保留真实来源，程序会据此把记录精确关联到 trace_id + turn。",
-            "当前没有附加 Trace event；请通过 source_excerpt 返回来源原文，程序会据此把记录精确关联到 trace_id + turn。",
-        ).replace(
-            "凡是由用户 correction 事件得出的记录，source_event_ids 必须包含对应 user_message 或 user_answer 的 event_id，",
-            "凡是由用户 correction 得出的记录，source_excerpt 必须原样引用对应用户输入，",
-        ).replace(
-            "程序会根据 source_event_ids 保存用户完整原始输入",
-            "程序会根据 source_excerpt 匹配并保存用户完整原始输入",
-        ).replace(
-            "程序会保存 source_event_ids 对应的完整用户原始输入并将三部分一起落盘。",
-            "程序会根据 source_excerpt 匹配完整用户原始输入并将三部分一起落盘。",
+            "上一轮已把当前分析窗口整理成 normalized trajectory。不要回复用户、不要续写，只分析其中与以下来源 Trace 对应的记录：",
         )
 
         preferred_sources: dict[str, list[str]] = {}
@@ -212,16 +264,18 @@ class FileTraceAnalyzer:
         trace_tool = GetTraceContextTool(
             self.trace_store, str(trace.get("session_id", "")), preferred_sources,
         )
-        analysis_branch_messages = branch_messages
-        analysis_prompt = cached_prompt if analysis_branch_messages else local_prompt
+        analysis_branch_messages = trajectory_history
         try:
             data = self._json(await self._extract(
                 analysis_prompt, analysis_branch_messages, trace_tool=trace_tool, project_id=project_id,
                 session_id=str(trace.get("session_id", "")), source_trace_id=trace_id,
                 cached_tools=_tools, execution_events=execution_events,
+                fallback_mode=trajectory_uses_fallback,
             ))
+            if not self._valid_analysis_payload(data, require_summary):
+                raise TraceAnalysisCallError("记忆与摘要分析返回空结果、无效 JSON 或缺少 window_summary")
         except TraceAnalysisCallError as exc:
-            if not analysis_branch_messages:
+            if trajectory_uses_fallback:
                 raise
             await self._capture_analysis_bad_case(
                 trace_id=trace_id, project_id=project_id, session_id=str(trace.get("session_id", "")),
@@ -230,13 +284,18 @@ class FileTraceAnalyzer:
                 failure_kind="memory_analysis_primary_failure",
             )
             print(f"[trace] cached branch failed, retrying with local turns only: {exc}", flush=True)
-            analysis_branch_messages = None
-            analysis_prompt = local_prompt
+            trajectory_uses_fallback = True
+            analysis_branch_messages = [
+                {"role": "user", "content": trajectory_context_prompt},
+                {"role": "assistant", "content": trajectory_json},
+            ]
             data = self._json(await self._extract(
-                local_prompt, None, trace_tool=trace_tool, project_id=project_id,
+                analysis_prompt, analysis_branch_messages, trace_tool=trace_tool, project_id=project_id,
                 session_id=str(trace.get("session_id", "")), source_trace_id=trace_id,
-                execution_events=execution_events,
+                execution_events=execution_events, fallback_mode=True,
             ))
+            if not self._valid_analysis_payload(data, require_summary):
+                raise TraceAnalysisCallError("独立记忆与摘要兜底仍未返回有效结果")
         if trace_tool.last_events:
             by_event_id = {str(event.get("event_id")): event for event in [*events, *trace_tool.last_events]}
             events = TraceStore.annotate_event_turns(list(by_event_id.values()))
@@ -255,17 +314,22 @@ class FileTraceAnalyzer:
         if checkpoint_reasons and not data.get("items") and not data.get("records"):
             raise ValueError("CreateTraceCheckpoint 已触发，但 Trace 判别连续返回空结果")
         window_summary = str(data.get("window_summary") or "").strip()[:8000]
+        post_branch_messages = None if trajectory_uses_fallback else analysis_branch_messages
+        post_analysis_prompt = analysis_prompt if post_branch_messages else (
+            f"{analysis_prompt}\nNormalized trajectory:{trajectory_json}"
+        )
         if self._has_reference_feedback(data):
             try:
                 data = await self._review_reference_feedback(
-                    trace_id, project_id, analysis_prompt, analysis_branch_messages, data,
+                    trace_id, project_id, post_analysis_prompt, post_branch_messages, data,
                     execution_events=execution_events,
                 )
             except TraceAnalysisCallError:
-                if not analysis_branch_messages:
+                if not post_branch_messages:
                     raise
                 data = await self._review_reference_feedback(
-                    trace_id, project_id, local_prompt, None, data,
+                    trace_id, project_id,
+                    f"{analysis_prompt}\nNormalized trajectory:{trajectory_json}", None, data,
                     execution_events=execution_events,
                 )
             if window_summary and not data.get("window_summary"):
@@ -273,15 +337,16 @@ class FileTraceAnalyzer:
         if data.get("records"):
             try:
                 data = await self._reconcile_records(
-                    trace_id, project_id, analysis_prompt, analysis_branch_messages,
+                    trace_id, project_id, post_analysis_prompt, post_branch_messages,
                     data, context, trace_tool, _tools, str(trace.get("session_id", "")),
                     execution_events=execution_events,
                 )
             except TraceAnalysisCallError:
-                if not analysis_branch_messages:
+                if not post_branch_messages:
                     raise
                 data = await self._reconcile_records(
-                    trace_id, project_id, local_prompt, None,
+                    trace_id, project_id,
+                    f"{analysis_prompt}\nNormalized trajectory:{trajectory_json}", None,
                     data, context, trace_tool, None, str(trace.get("session_id", "")),
                     execution_events=execution_events,
                 )
@@ -328,7 +393,7 @@ class FileTraceAnalyzer:
                 ids = [matched_id] if matched_id else self._default_source_event_ids(events, str(item.get("kind") or ""))
             claim = str(item.get("claim", "")).strip()
             layer = item.get("layer")
-            if layer not in {"evidence", "memory"} or not ids or not claim: continue
+            if layer not in {"insight", "memory"} or not ids or not claim: continue
             record_trace_ids = list(dict.fromkeys(event_trace_ids.get(event_id, trace_id) for event_id in ids))
             record_trace_id = record_trace_ids[-1]
             trace_refs = self._trace_refs(events, ids, record_trace_id)
@@ -338,7 +403,7 @@ class FileTraceAnalyzer:
                 item["category"] = "agent"
             # A concrete user correction is durable by definition.  The model
             # still writes the claim and scope, while the lifecycle boundary
-            # prevents it from being stranded as weak one-off evidence.
+            # prevents it from being stranded as a weak one-off insight.
             if correction_ids.intersection(ids):
                 layer = "memory"
                 item["signal"] = "strong"
@@ -349,8 +414,8 @@ class FileTraceAnalyzer:
                 if not user_inputs:
                     continue
                 feedback_relation = str(item.get("feedback_relation") or "same_anchor")
-                related_layer = str(item.get("related_layer") or ("memory" if layer == "memory" else "evidence"))
-                related = files.get(related_layer, str(item.get("related_id", ""))) if related_layer in {"evidence", "memory"} and item.get("related_id") else None
+                related_layer = str(item.get("related_layer") or ("memory" if layer == "memory" else "insight"))
+                related = files.get(related_layer, str(item.get("related_id", ""))) if related_layer in {"insight", "memory"} and item.get("related_id") else None
                 if related and not files.is_text_feedback(related):
                     related = None
                 if related:
@@ -363,7 +428,7 @@ class FileTraceAnalyzer:
                         merged["weight"] = min(MAX_RECORD_WEIGHT, float(merged.get("weight", 0)) + bonus)
                         merged["support_count"] = int(merged.get("support_count", 1)) + 1
                     can_promote = files.can_auto_promote(merged)
-                    saved = files._move(merged, "memory") if layer == "memory" and related_layer == "evidence" and can_promote else files.write(related_layer, merged)
+                    saved = files._move(merged, "memory") if layer == "memory" and related_layer == "insight" and can_promote else files.write(related_layer, merged)
                     if feedback_relation == "cross_text_support" and saved["layer"] == "memory" and files.can_auto_promote(saved) and saved["weight"] >= PATTERN_PROMOTION_WEIGHT and saved["support_count"] >= 3:
                         files.promote_memory_to_pattern(saved, record_trace_ids)
                 else:
@@ -387,9 +452,9 @@ class FileTraceAnalyzer:
                         "confidence": item.get("confidence", .5), "weight": 65 if item.get("signal") == "strong" else 15, "support_count": 1,
                     })
                 continue
-            related_layer = str(item.get("related_layer") or ("memory" if layer == "memory" else "evidence"))
+            related_layer = str(item.get("related_layer") or ("memory" if layer == "memory" else "insight"))
             relation = str(item.get("relation") or "new")
-            related = files.get(related_layer, str(item.get("related_id", ""))) if relation in {"support", "append"} and related_layer in {"evidence", "memory", "pattern"} and (related_layer != "pattern" or layer == "memory") else None
+            related = files.get(related_layer, str(item.get("related_id", ""))) if relation in {"support", "append"} and related_layer in {"insight", "memory", "pattern"} and (related_layer != "pattern" or layer == "memory") else None
             if related:
                 related["trace_id"] = record_trace_id
                 related["source_event_ids"] = list(dict.fromkeys([*related.get("source_event_ids", []), *ids]))
@@ -415,8 +480,8 @@ class FileTraceAnalyzer:
                 if item.get("explicit_reconfirmation") is True:
                     related = files.confirm_auto_promotion(related)
                 can_promote = files.can_auto_promote(related)
-                saved = files._move(related, "memory") if layer == "memory" and related_layer == "evidence" and can_promote else files.write(related_layer, related)
-                if layer == "evidence" and files.can_auto_promote(saved) and saved["weight"] >= 60 and saved["support_count"] >= 3:
+                saved = files._move(related, "memory") if layer == "memory" and related_layer == "insight" and can_promote else files.write(related_layer, related)
+                if layer == "insight" and files.can_auto_promote(saved) and saved["weight"] >= 60 and saved["support_count"] >= 3:
                     saved = files._move(saved, "memory")
                 if saved["layer"] == "memory" and files.can_auto_promote(saved) and saved["weight"] >= PATTERN_PROMOTION_WEIGHT and saved["support_count"] >= 3:
                     files.promote_memory_to_pattern(saved, record_trace_ids)
@@ -427,11 +492,11 @@ class FileTraceAnalyzer:
         for event in agent_feedback_events:
             already_recorded = any(
                 item.get("trace_id") == event_trace_ids.get(event["event_id"], trace_id) and event["event_id"] in item.get("source_event_ids", [])
-                for item in files.list("evidence")
+                for item in files.list("insight")
             )
             if event["event_id"] not in recorded_event_ids and not already_recorded:
                 trace_refs = self._trace_refs(events, [event["event_id"]], event_trace_ids.get(event["event_id"], trace_id))
-                files.write("evidence", {
+                files.write("insight", {
                     "title": "核查 AskUserQuestion 调用时机",
                     "claim": "用户质疑 Agent 对 AskUserQuestion 工具的调用时机，需要在后续调度优化中核查。",
                     "content": "用户质疑 Agent 对 AskUserQuestion 工具的调用时机，需要在后续调度优化中核查。",
@@ -473,6 +538,11 @@ class FileTraceAnalyzer:
                 source_trace_ids[-1], project_id, messages, _tools,
                 events_override=events, source_trace_ids=source_trace_ids,
                 require_summary=True,
+                normalized_trajectory={
+                    "trajectory": window.get("normalized_trajectory", []),
+                    "provenance": window.get("trajectory_provenance", []),
+                },
+                window_id=window_id,
             )
             await self.trace_store.complete_trace_window_summary(
                 window_id, result.get("window_summary", ""), result.get("agent_trace_id", ""),
@@ -484,10 +554,11 @@ class FileTraceAnalyzer:
     async def _extract(self, prompt: str, branch_messages, *, trace_tool=None,
                        project_id: str = "", session_id: str = "", source_trace_id: str = "",
                        cached_tools: list[dict] | None = None,
-                       execution_events: list[dict] | None = None) -> str:
+                       execution_events: list[dict] | None = None,
+                       fallback_mode: bool = False) -> str:
         messages = [*branch_messages, {"role": "user", "content": prompt}] if branch_messages else [{"role": "user", "content": prompt}]
-        position = "main_loop" if branch_messages else "auto_memory"
-        if branch_messages:
+        position = "memory_summary_fallback" if fallback_mode or not branch_messages else "main_loop"
+        if branch_messages and not fallback_mode:
             available_tools = list(cached_tools or [])
             if trace_tool and not any(tool.get("name") == trace_tool.name for tool in available_tools):
                 available_tools.append(trace_tool.get_schema())
@@ -580,7 +651,7 @@ class FileTraceAnalyzer:
             "content": tool_content if result.success else f"Error: {result.error}",
         })
         messages.append({"role": "user", "content": final_instruction or (
-            "根据工具返回的 Trace 局部上下文或项目文件完成 Evidence/Memory 的冲突、支持与合并判断。"
+            "根据工具返回的 Trace 局部上下文或项目文件完成 Insight/Memory 的冲突、支持与合并判断。"
             "现在不得再调用工具；只输出完整最终 JSON。若证据仍不足，在 content 中明确待确认点。"
         )})
         return await self._chat_text(
@@ -593,22 +664,22 @@ class FileTraceAnalyzer:
         cached_tools: list[dict] | None, session_id: str, *,
         execution_events: list[dict] | None = None,
     ) -> dict:
-        """Run a dedicated second-stage Evidence/Memory reconciliation pass."""
+        """Run a dedicated second-stage Insight/Memory reconciliation pass."""
         records = [record for record in candidate.get("records", []) if isinstance(record, dict)]
         if not records:
             return candidate
-        reconcile_prompt = f'''[Evidence/Memory 第二阶段合并判定]
-第一阶段已经完成事实提取。现在只判断每条候选与 Existing Evidence、Memory、Pattern 的关系；不要重新提取事实，不要删除候选，也不要修改 source_event_ids、layer、title、content、claim、category、domain、kind 或 signal。
+        reconcile_prompt = f'''[Insight/Memory 第二阶段合并判定]
+第一阶段已经完成事实提取。现在只判断每条候选与 Existing Insight、Memory、Pattern 的关系；不要重新提取事实，不要删除候选，也不要修改 source_event_ids、layer、title、content、claim、category、domain、kind 或 signal。
 
 对每条候选按 candidate_index 返回一个 decision：
 - new：没有语义相同或同一主题下需要保留的既有记录。
-- support：与既有记录表达同一规则、事实或修改方向；必须填写 related_id 和 related_layer。Evidence 可支持 Evidence；Memory 可支持 Evidence、Memory 或 Pattern。
+- support：与既有记录表达同一规则、事实或修改方向；必须填写 related_id 和 related_layer。Insight 可支持 Insight；Memory 可支持 Insight、Memory 或 Pattern。
 - append：与既有记录属于同一主题，但构成补充、修订、例外或冲突；必须填写 related_id 和 related_layer。程序会合并来源和冲突历史，但不会增加支持权重。
 - text_feedback 还要返回 feedback_relation=same_anchor|cross_text_support|cross_text_conflict。
 - promotion_status=manual_review 的记录只有用户本轮明确重新确认时，explicit_reconfirmation 才能为 true。
 
 若标题不足以判断，可调用一次 Read 读取 Existing 的 file_path；若必须回看来源，可调用一次 GetTraceContext。只能使用这两个只读工具。
-只输出 JSON：{{"decisions":[{{"candidate_index":0,"relation":"new|support|append","related_id":"","related_layer":"evidence|memory|pattern","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict","explicit_reconfirmation":false,"reason":"简要说明"}}]}}。
+只输出 JSON：{{"decisions":[{{"candidate_index":0,"relation":"new|support|append","related_id":"","related_layer":"insight|memory|pattern","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict","explicit_reconfirmation":false,"reason":"简要说明"}}]}}。
 每条候选必须恰好有一个 decision。
 
 Candidates:{json.dumps(records, ensure_ascii=False)}
@@ -619,7 +690,7 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
             {"role": "assistant", "content": json.dumps(candidate, ensure_ascii=False)},
             {"role": "user", "content": reconcile_prompt},
         ]
-        position = "main_loop" if branch_messages else "auto_memory"
+        position = "main_loop" if branch_messages else "memory_summary_fallback"
         available_tools = list(cached_tools or []) if branch_messages else []
         if trace_tool and not any(tool.get("name") == trace_tool.name for tool in available_tools):
             available_tools.append(trace_tool.get_schema())
@@ -647,7 +718,7 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
                 source_trace_id=trace_id, execution_events=execution_events,
                 tag=":trace-fork/reconcile/final",
                 final_instruction=(
-                    "根据工具结果完成 Evidence/Memory 合并判定。现在不得再调用工具；"
+                    "根据工具结果完成 Insight/Memory 合并判定。现在不得再调用工具；"
                     "只输出包含 decisions 的 JSON，每条候选恰好一个 decision。"
                 ),
             )
@@ -667,9 +738,9 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
             related_id = str(decision.get("related_id") or "")
             if relation not in {"new", "support", "append"}:
                 relation = "new"
-            if relation != "new" and (related_layer not in {"evidence", "memory", "pattern"} or not related_id):
+            if relation != "new" and (related_layer not in {"insight", "memory", "pattern"} or not related_id):
                 relation, related_layer, related_id = "new", "", ""
-            if relation != "new" and item.get("layer") == "evidence" and related_layer != "evidence":
+            if relation != "new" and item.get("layer") == "insight" and related_layer != "insight":
                 relation, related_layer, related_id = "new", "", ""
             item["relation"] = relation
             item["related_layer"] = related_layer
@@ -703,7 +774,7 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
                 "只保留用户反馈所归纳出的修改方向、观察、推测与待确认点。"
             )},
         ]
-        position = "main_loop" if branch_messages else "auto_memory"
+        position = "main_loop" if branch_messages else "memory_summary_fallback"
         first_text, calls = await self._chat_with_tools(messages, position, execution_events=execution_events)
         if not calls:
             return self._json(first_text) or candidate
@@ -748,7 +819,7 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
         async for chunk in self.llm.chat(
             position=position,
             messages=messages, tools=[self.rag_tool.get_schema()], stream=False,
-            tag=":trace-fork/rag-review", max_tokens=4096,
+            tag=":trace-fork/rag-review",
         ):
             if chunk.type == "text_delta":
                 text += chunk.content
@@ -780,7 +851,7 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
         })
         async for chunk in self.llm.chat(
             position=position, messages=messages, tools=tools, stream=False,
-            tag=tag, max_tokens=4096,
+            tag=tag,
         ):
             if chunk.type == "text_delta":
                 text += chunk.content
@@ -807,7 +878,7 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
         async for chunk in self.llm.chat(
             position=position,
             messages=messages, tools=None, stream=False,
-            tag=tag, max_tokens=4096,
+            tag=tag,
         ):
             if chunk.type == "text_delta":
                 text += chunk.content
@@ -974,7 +1045,14 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
     @staticmethod
     def _event_summary(event: dict) -> dict:
         payload = event.get("payload", {}) or {}
-        result = {"event_id": event["event_id"], "trace_id": event.get("trace_id", ""), "turn": event.get("trace_turn", 1), "type": event.get("event_type", "")}
+        result = {
+            "event_id": event["event_id"], "trace_id": event.get("trace_id", ""),
+            "turn": event.get("trace_turn", 1), "type": event.get("event_type", ""),
+            "actor": event.get("actor", ""),
+            "timestamp": event.get("created_at") or "1970-01-01T00:00:00Z",
+        }
+        if event.get("parent_event_id"):
+            result["parent_event_id"] = event["parent_event_id"]
         content = payload.get("content") or payload.get("message")
         if content:
             result["content"] = str(content)[:1200]
@@ -987,6 +1065,12 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
                 result["legacy_summary"] = True
         if payload.get("tool"):
             result["tool"] = payload["tool"]
+        if payload.get("reasoning_content"):
+            result["reasoning_content"] = str(payload["reasoning_content"])[:2400]
+        if "success" in payload:
+            result["success"] = bool(payload["success"])
+        if payload.get("error"):
+            result["error"] = str(payload["error"])[:1400]
         if isinstance(payload.get("params"), dict):
             params = payload["params"]
             result["params"] = {key: (str(value)[:1200] if key in {"path", "old_string", "new_string", "expected_revision_id"} else value)
@@ -1028,6 +1112,14 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
         clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I)
         try: return json.loads(clean[clean.find("{"):clean.rfind("}") + 1])
         except (ValueError, json.JSONDecodeError): return {}
+
+    @staticmethod
+    def _valid_analysis_payload(data: dict, require_summary: bool) -> bool:
+        if not isinstance(data, dict):
+            return False
+        if not isinstance(data.get("items"), list) or not isinstance(data.get("records"), list):
+            return False
+        return not require_summary or bool(str(data.get("window_summary") or "").strip())
 
     @staticmethod
     def _has_reference_feedback(data: dict) -> bool:

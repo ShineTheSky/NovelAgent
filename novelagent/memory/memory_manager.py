@@ -6,7 +6,6 @@ import yaml
 from novelagent.memory.file_store import FileStore
 from novelagent.memory.index_manager import IndexManager
 from novelagent.memory.prefetcher import Prefetcher
-from novelagent.memory.auto_memory import AutoMemory
 
 
 class MemoryManager:
@@ -24,9 +23,16 @@ class MemoryManager:
             "bad_case_recorder": bad_case_recorder, "session_id": session_id,
             "project_id": project_id, "source_trace_id": source_trace_id,
         }
-        self.prefetcher = Prefetcher(self.index_manager, self.file_store, llm_client, **agent_context)
-        self.auto_memory = AutoMemory(self.index_manager, self.file_store, llm_client, **agent_context)
-        self.auto_interval = 5
+        prefetch_timeout = 1.5
+        if llm_client is not None:
+            try:
+                prefetch_timeout = llm_client.loader.get_config("memory_prefetch").timeout
+            except (AttributeError, KeyError, TypeError, ValueError):
+                pass
+        self.prefetcher = Prefetcher(
+            self.index_manager, self.file_store, llm_client,
+            timeout=prefetch_timeout, **agent_context,
+        )
         project_dir = Path(working_dir)
         self.global_memory_dir = Path(global_memory_dir) if global_memory_dir else project_dir.parent.parent / "global_memory"
 
@@ -98,10 +104,6 @@ class MemoryManager:
             memory_index,
             {"global_memory/user.md": global_user} if global_user else {},
         )
-
-    # async def on_round_complete(self, round_num: int, recent_messages: list):
-    #     if self.auto_memory.should_trigger(round_num):
-    #         self.auto_memory.run_background(recent_messages)  # 不阻塞主流程
 
     def rebuild_index(self) -> str:
         return self.index_manager.rebuild(self.PROJECT_INDEX_EXCLUDES, self._global_user_entries())

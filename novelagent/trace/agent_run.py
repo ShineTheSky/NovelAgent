@@ -2,7 +2,41 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from novelagent.trace.recorder import sanitize_payload
+
+
+class AgentTraceTaskManager:
+    """Keep background Trace writes alive and drain them during shutdown."""
+
+    def __init__(self):
+        self._tasks: set[asyncio.Task] = set()
+
+    def submit(self, awaitable, *, label: str = "agent trace") -> asyncio.Task:
+        task = asyncio.create_task(awaitable, name=label)
+        self._tasks.add(task)
+
+        def completed(done: asyncio.Task) -> None:
+            self._tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                done.result()
+            except Exception as exc:
+                print(f"[agent_trace] background persistence failed: {exc}", flush=True)
+
+        task.add_done_callback(completed)
+        return task
+
+    async def drain(self) -> None:
+        tasks = list(self._tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._tasks)
 
 
 class AgentRunTrace:
@@ -42,7 +76,7 @@ class AgentRunTrace:
     def add(self, event_type: str, payload: dict, actor: str | None = None,
             duration_ms: float | None = None) -> None:
         event_actor = actor or self.actor
-        if event_type in {"thinking", "text_delta"} and self.events:
+        if event_type in {"thinking", "text_delta"} and len(self.events) > self.persisted:
             previous = self.events[-1]
             previous_content = str((previous.get("payload") or {}).get("content", ""))
             incoming_content = str(payload.get("content", ""))
@@ -83,12 +117,27 @@ class AgentRunTrace:
             self.add("agent_tool_schema", {"tool_index": tool_index, "schema": tool}, actor="system")
 
     async def flush(self) -> None:
-        for event in self.events[self.persisted:]:
-            self.sequence += 1
-            await self.store.append_event(
-                self.trace_id, self.sequence, event["event_type"], event["actor"],
-                sanitize_payload(event["payload"]), duration_ms=event.get("duration_ms"),
-            )
+        pending = self.events[self.persisted:]
+        if not pending:
+            return
+        records = []
+        for offset, event in enumerate(pending, start=1):
+            records.append({
+                "sequence_no": self.sequence + offset,
+                "event_type": event["event_type"],
+                "actor": event["actor"],
+                "payload": sanitize_payload(event["payload"]),
+                "duration_ms": event.get("duration_ms"),
+            })
+        if hasattr(self.store, "append_events"):
+            await self.store.append_events(self.trace_id, records)
+        else:
+            for event in records:
+                await self.store.append_event(
+                    self.trace_id, event["sequence_no"], event["event_type"], event["actor"],
+                    event["payload"], duration_ms=event["duration_ms"],
+                )
+        self.sequence += len(records)
         self.persisted = len(self.events)
 
     async def finish(self, status: str, final_answer: str = "", error: str = "") -> None:

@@ -4,23 +4,23 @@
 
 | 层级 | 位置 | 用途 |
 |---|---|---|
-| Evidence | `.evidence/{user,project,reference,agent}/` | Trace 的弱证据；仅后台提炼流程使用。 |
+| Insight | `.insight/{user,project,reference,agent}/` | 从 Trace 推导出的低置信观察或假设；仅后台提炼流程使用。 |
 | Memory | `.memory/{user,project,reference}/` | 当前项目可用的长期记忆。`memory.md` 只保留最多 200 条活跃索引。 |
 | Pattern | `.pattern/{user,project,reference}/` | 多次验证后形成的稳定模式。 |
-| Agent 洞察 | `.evidence/agent/`、`.memory/agent/`、`.pattern/agent/` | 独立、无上限，只用于后续优化 Agent 调度；绝不注入小说写作、审阅或大纲任务。 |
+| Agent 洞察 | `.insight/agent/`、`.memory/agent/`、`.pattern/agent/` | 独立、无上限，只用于后续优化 Agent 调度；绝不注入小说写作、审阅或大纲任务。 |
 
 ### 使用规则
 
-- `memory.md`、`evidence.md`、`pattern.md` 均为系统生成索引，不能手工修改；索引和主 System Prompt 仅展示每条记录的简要标题。
+- `memory.md`、`insight.md`、`pattern.md` 均为系统生成索引，不能手工修改；索引和主 System Prompt 仅展示每条记录的简要标题。
 - 预取命中的 Memory 会在后续 `[相关记忆附件]` 消息中提供完整正文；不要把未命中的标题当作完整事实。
 - Pattern 已是稳定模式，直接在 System Prompt 中注入完整正文，优先遵守。
-- Evidence 相似时只与 Evidence 合并，作为弱信号低幅加分；达到门槛后提升为 Memory。
-- Memory 候选可同时检索 Memory 与 Evidence；与被容量挤出的旧 Memory 相似时可重新提升，合并后再判断是否成为 Pattern。
+- Insight 相似时只与 Insight 合并，作为弱信号低幅加分；达到门槛后提升为 Memory。
+- Memory 候选可同时检索 Memory 与 Insight；与被容量挤出的旧 Memory 相似时可重新提升，合并后再判断是否成为 Pattern。
 - Memory 在至少 3 条支持且权重达到 200 时晋升为 Pattern；记录权重最高为 300。后续相似的 Memory 可继续为已有 Pattern 加分，不重复创建。
 - `reference` 中的 `kind: text_feedback` 也是普通记忆：用户引用原文后的修改意见会带文本锚点保存，并像其他 Memory 一样由索引预取。对同一锚点的重复意见只补充“修改方向、观察、推测和待确认点”，不加分；只有不同但相似的文本出现同方向反馈时，才可作为跨文本支持加分或形成 Pattern。
-- 超出 200 条活跃容量的 Memory 会降回 Evidence，保留来源、权重和 `origin_memory_id`，不是删除。
+- 超出 200 条活跃容量的 Memory 会降回 Insight，保留来源、权重和 `origin_memory_id`，不是删除。
 - 用户手动降低 Memory 或 Pattern 层级时，记录正文会写明降级来源与用户保留意见。后续 Trace 只能将其作为低幅证据支持；除非用户明确重新确认，不能直接恢复高优先级。
-- 主 Agent 发现重要错误、明确修正、稳定偏好或关键约束时，调用 `CreateTraceCheckpoint`。Trace 是不可变证据，由后台流程决定 Evidence、Memory 或 Pattern；主 Agent 不得直接改写这些索引。
+- 主 Agent 发现重要错误、明确修正、稳定偏好或关键约束时，调用 `CreateTraceCheckpoint`。Trace 是不可变证据，由后台流程决定 Insight、Memory 或 Pattern；主 Agent 不得直接改写这些索引。
 
 ## 项目记忆索引
 

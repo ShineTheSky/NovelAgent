@@ -30,9 +30,9 @@ async def analyze_pending_traces(project_id: str, request: Request):
     return {"scheduled": len(pending)}
 
 
-@router.get("/projects/{project_id}/evidence")
-async def list_evidence(project_id: str, request: Request):
-    return _files(request, project_id).list("evidence")
+@router.get("/projects/{project_id}/insights")
+async def list_insights(project_id: str, request: Request):
+    return _files(request, project_id).list("insight")
 
 
 @router.get("/projects/{project_id}/memories")
@@ -57,8 +57,8 @@ async def downgrade_file_record(project_id: str, layer: str, record_id: str, req
 
 @router.post("/projects/{project_id}/{layer}/{record_id}/cancel-manual-review")
 async def cancel_file_record_manual_review(project_id: str, layer: str, record_id: str, request: Request):
-    if layer not in {"evidence", "memory"}:
-        raise HTTPException(status_code=422, detail="只能取消 Evidence 或 Memory 的手动降级标注")
+    if layer not in {"insight", "memory"}:
+        raise HTTPException(status_code=422, detail="只能取消 Insight 或 Memory 的手动降级标注")
     result = _files(request, project_id).cancel_manual_review(layer, record_id)
     if not result:
         raise HTTPException(status_code=404, detail="记录不存在")

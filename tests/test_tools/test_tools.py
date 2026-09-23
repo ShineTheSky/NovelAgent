@@ -7,6 +7,8 @@ from novelagent.tools.write import WriteTool
 from novelagent.tools.edit import EditTool
 from novelagent.tools.glob import GlobTool
 from novelagent.tools.grep import GrepTool
+from novelagent.tools.text_stats import TextStatsTool
+from novelagent.tools.check_content import CheckContentTool
 from novelagent.tools.bash import BashTool
 from novelagent.tools.subagent_tool import SubAgentTool
 
@@ -64,6 +66,21 @@ class TestRead:
         r = await ReadTool().execute({'path': 'chapters/ch01.md', 'offset': 1, 'limit': 1}, make_ctx(working_dir))
         assert r.success
         assert '# Chapter 1' in r.data
+
+    @pytest.mark.asyncio
+    async def test_read_tail_lines(self, working_dir):
+        r = await ReadTool().execute({'path': 'chapters/ch01.md', 'tail_lines': 2}, make_ctx(working_dir))
+        assert r.success
+        assert 'Hello world' in r.data
+        assert '# Chapter 1' not in r.data
+        assert '末尾2行' in r.data
+
+    @pytest.mark.asyncio
+    async def test_read_tail_lines_conflicts_with_range(self, working_dir):
+        r = await ReadTool().execute(
+            {'path': 'chapters/ch01.md', 'tail_lines': 2, 'offset': 1}, make_ctx(working_dir),
+        )
+        assert not r.success
 
     @pytest.mark.asyncio
     async def test_file_not_found(self, working_dir):
@@ -144,6 +161,15 @@ class TestGlob:
         assert r.success
         assert '无匹配' in r.data
 
+    @pytest.mark.asyncio
+    async def test_glob_with_metadata(self, working_dir):
+        r = await GlobTool().execute(
+            {'pattern': 'chapters/*.md', 'include_metadata': True}, make_ctx(working_dir),
+        )
+        assert r.success
+        assert 'size=' in r.data
+        assert 'modified_at=' in r.data
+
     def test_permission(self, working_dir):
         assert GlobTool().checkPermissions({'pattern': '*'}, make_ctx(working_dir)) == PermissionResult.ALLOW
 
@@ -159,8 +185,66 @@ class TestGrep:
         r = await GrepTool().execute({'pattern': '王五', 'path': 'chapters'}, make_ctx(working_dir))
         assert r.success
 
+    @pytest.mark.asyncio
+    async def test_grep_multiple_paths_and_excludes(self, working_dir):
+        r = await GrepTool().execute({
+            'pattern': '张三',
+            'paths': ['chapters/ch01.md', 'chapters/ch02.md'],
+            'exclude_globs': ['chapters/ch02.md'],
+        }, make_ctx(working_dir))
+        assert r.success
+        assert 'ch01.md' in r.data
+        assert 'ch02.md' not in r.data
+
+    @pytest.mark.asyncio
+    async def test_grep_fixed_mode(self, working_dir):
+        target = Path(working_dir) / 'chapters' / 'literal.txt'
+        target.write_text('a.b\naxb\n', encoding='utf-8')
+        r = await GrepTool().execute({
+            'pattern': 'a.b', 'path': 'chapters/literal.txt', 'regex_mode': 'fixed',
+        }, make_ctx(working_dir))
+        assert r.success
+        assert 'a.b' in r.data
+        assert 'axb' not in r.data
+
     def test_permission(self, working_dir):
         assert GrepTool().checkPermissions({'pattern': 'x'}, make_ctx(working_dir)) == PermissionResult.ALLOW
+
+
+class TestTextStats:
+    @pytest.mark.asyncio
+    async def test_counts_body_without_frontmatter(self, working_dir):
+        target = Path(working_dir) / 'chapters' / 'stats.md'
+        target.write_text('---\ntitle: test\n---\n你好 world\n第二行', encoding='utf-8')
+        r = await TextStatsTool().execute({'path': 'chapters/stats.md'}, make_ctx(working_dir))
+        assert r.success
+        assert r.data['han_characters'] == 5
+        assert r.data['word_count'] == 6
+        assert r.data['lines'] == 2
+
+
+class TestCheckContent:
+    @pytest.mark.asyncio
+    async def test_runs_structured_checks(self, working_dir):
+        r = await CheckContentTool().execute({'checks': [
+            {'path': 'chapters/ch01.md', 'type': 'contains', 'pattern': '张三'},
+            {'path': 'chapters/ch01.md', 'type': 'not_contains', 'pattern': '王五'},
+            {'path': 'chapters/ch02.md', 'type': 'regex', 'pattern': r'李四.*观察'},
+            {'path': 'chapters/ch01.md', 'type': 'excerpt', 'offset': 2, 'limit': 1},
+        ]}, make_ctx(working_dir))
+        assert r.success
+        assert r.data['passed']
+        assert r.data['results'][0]['line_numbers'] == [3]
+        assert r.data['results'][3]['content'] == 'Hello world\n'
+
+    @pytest.mark.asyncio
+    async def test_failed_assertion_is_structured_result(self, working_dir):
+        r = await CheckContentTool().execute({'checks': [
+            {'path': 'chapters/ch01.md', 'type': 'not_contains', 'pattern': '张三'},
+        ]}, make_ctx(working_dir))
+        assert r.success
+        assert not r.data['passed']
+        assert r.data['results'][0]['match_count'] == 1
 
 
 class TestBash:
@@ -191,6 +275,16 @@ class TestSubAgent:
         assert 'description' in preset
         assert 'tools' in preset
         assert 'system_prompt' in preset
+
+    def test_tool_visibility(self):
+        st = SubAgentTool()
+        for preset_name in (
+            'chapter_writer', 'chapter_polisher', 'reviewer',
+            'character_designer', 'outliner',
+        ):
+            tools = st.get_preset(preset_name)['tools']
+            assert 'TextStats' in tools
+            assert 'CheckContent' not in tools
 
     def test_get_nonexistent_preset(self):
         st = SubAgentTool()

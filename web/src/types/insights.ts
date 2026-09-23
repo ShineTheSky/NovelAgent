@@ -1,6 +1,6 @@
 export interface LifecycleRecord {
   id: string;
-  layer: 'evidence' | 'memory' | 'pattern';
+  layer: 'insight' | 'memory' | 'pattern';
   title?: string;
   claim: string;
   category: 'user' | 'project' | 'reference' | 'agent';

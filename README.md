@@ -2,7 +2,7 @@
 
 面向小说创作的 7 层 AI Agent 系统。用户通过自然语言描述创作意图，Agent 自主规划、调用工具、管理上下文和长期记忆，完成从章节大纲到正文撰写的全流程创作任务。
 
-当前版本还提供：全局共享资料库、BM25 + 本地 Embedding 混合检索、主/子 Agent 过程回放、Trace → Evidence → Memory → Pattern 的可追溯记忆生命周期，以及独立的 Agent 失败案例归档。
+当前版本还提供：全局共享资料库、BM25 + 本地 Embedding 混合检索、主/子 Agent 过程回放、Trace → Insight → Memory → Pattern 的可追溯记忆生命周期，以及独立的 Agent 失败案例归档。
 
 ## 架构总览
 
@@ -11,7 +11,7 @@ Web UI (React) ← SSE → FastAPI Server → Agent Loop (ReAct)
                                             │
               ┌─────────────────────────────┼──────────────────────────┐
               │                │            │              │           │
-         工具层 (10 tools)  安全层 (3层)   上下文层      证据/记忆层  LLM客户端
+         工具层 (10 tools)  安全层 (3层)   上下文层      洞察/记忆层  LLM客户端
          Read/Write/Edit   1a静态规则     Prompt模板    FileStore    多Provider
          Glob/Grep/Bash    1b风险评估     Token计算     IndexManager  Anthropic
          SubAgent/SearchRag 1c自主判断    消息管理      Trace分析    DeepSeek
@@ -26,7 +26,7 @@ Web UI (React) ← SSE → FastAPI Server → Agent Loop (ReAct)
 | 第4层 工具层 | Read / Write / Edit / Glob / Grep / Bash / SubAgent / AskUserQuestion / CreateTraceCheckpoint / SearchRag |
 | 第5层 安全层 | 三层权限检查、Bash命令两级分类、路径沙箱、审计 |
 | 第6层 上下文层 | System Prompt 管理、消息列表、Token 计算、压缩、Pattern 和相关记忆注入 |
-| 第7层 证据/记忆层 | SQLite 不可变 Trace、文件化 Evidence/Memory/Pattern、异步分析与索引 |
+| 第7层 洞察/记忆层 | SQLite 不可变 Trace、文件化 Insight/Memory/Pattern、异步分析与索引 |
 | 参考资料层 | 全局共享文章导入、段落/句子分块、BM25 + 本地向量混合检索、按工具调用 |
 
 ## 快速开始
@@ -162,7 +162,7 @@ Write/Edit 默认弹窗确认。以下情况自动放行：
 | `/api/rag/embeddings/rebuild` | POST | 后台补齐尚未生成的本地向量 |
 | `/api/rag/embeddings/rebuild/{job_id}` | GET | 查询向量构建进度 |
 | `/api/rag/search?q=...` | GET | 手动检索参考片段 |
-| `/api/projects/{id}/evidence` | GET | 项目的 Trace 弱证据 |
+| `/api/projects/{id}/insights` | GET | 项目的低置信洞察 |
 | `/api/projects/{id}/memories` | GET | 项目的原子记忆 |
 | `/api/projects/{id}/patterns` | GET | 项目的稳定模式 |
 | `/api/projects/{id}/{layer}/{record_id}/downgrade` | POST | 用户确认后降低 Memory / Pattern 层级 |
@@ -185,13 +185,13 @@ Trace 本身是 SQLite 中不可变的证据；分析结果以 Markdown + YAML f
 
 | 层级 | 路径 | 含义 |
 |------|------|------|
-| Evidence | `.evidence/{user,project,reference,agent}/` | 单次、较弱或尚待验证的反馈证据 |
+| Insight | `.insight/{user,project,reference,agent}/` | 从 Trace 推导出的单次、较弱或尚待验证的观察与假设 |
 | Memory | `.memory/{user,project,reference,agent}/` | 明确、可复用的原子偏好、修正或约束 |
 | Pattern | `.pattern/{user,project,reference,agent}/` | 多条 Memory 支持后形成的稳定模式 |
 
 - 每条派生记录保留 `trace_id`、`source_event_ids`、权重、更新时间和关联关系，便于回溯。
-- 相似 Evidence 低幅加分；满足门槛后可升为 Memory。Memory 可以同时与旧 Evidence 合并，并在至少 3 条支持、权重达到 200 时升为 Pattern；权重上限为 300。
-- 活跃 Memory 索引最多 200 条。容量淘汰只会将旧记录退回 Evidence，不会删除其证据；Pattern 不会因时间自然降级。
+- 相似 Insight 低幅加分；满足门槛后可升为 Memory。Memory 可以同时与旧 Insight 合并，并在至少 3 条支持、权重达到 200 时升为 Pattern；权重上限为 300。
+- 活跃 Memory 索引最多 200 条。容量淘汰只会将旧记录退回 Insight，不会删除对应 Trace 证据；Pattern 不会因时间自然降级。
 - Pattern 全文会注入 System Prompt；Memory 标题进入 `memory.md` 滑动索引，命中后再将正文作为附件注入。
 - 用户可在“项目洞察”中将 Memory 或 Pattern 降级。降级备注会留在正文，后续相似反馈只能低幅恢复，除非用户明确再次确认。
 - `agent` 分类只用于优化工具和 Agent 调度，不进入小说写作上下文或项目洞察名额。工具/Agent 执行失败会额外写入全局 `data/agent_bad_cases/`，并保留脱敏参数与近期上下文，便于复现。
@@ -263,7 +263,7 @@ NovelAgent2/
 │   │   ├── index_manager.py   # memory.md索引
 │   │   ├── prefetcher.py      # 异步预取
 │   │   └── auto_memory.py     # 旧的自动记忆实现（当前由 Trace 分析替代）
-│   ├── trace/                 # 不可变 Trace、后台分析、Evidence/Memory/Pattern 生命周期
+│   ├── trace/                 # 不可变 Trace、后台分析、Insight/Memory/Pattern 生命周期
 │   ├── rag/                   # 全局资料库、分块、BM25 + Embedding 混合检索
 │   ├── embeddings/            # 本地 SentenceTransformer 模型封装
 │   ├── llm/                   # LLM 客户端
@@ -283,7 +283,7 @@ NovelAgent2/
 │       │   ├── ToolCard.tsx / ToolResultCard.tsx
 │       │   ├── PermissionDialog.tsx  # 权限确认弹窗
 │       │   ├── QuestionDialog.tsx    # 用户问答弹窗
-│       │   ├── FileInsightsPanel.tsx # Evidence / Memory / Pattern 面板
+│       │   ├── FileInsightsPanel.tsx # Insight / Memory / Pattern 面板
 │       │   └── TokenBar.tsx
 │       └── api/
 │           └── client.ts      # API 客户端

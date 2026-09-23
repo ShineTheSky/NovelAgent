@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 from novelagent.storage import database
 from novelagent.trace.file_analyzer import FileTraceAnalyzer
@@ -47,23 +48,53 @@ def test_raw_traces_keep_request_chain_and_window_references(tmp_path, monkeypat
 
             async def chat(self, **kwargs):
                 self.calls.append(kwargs)
+                if kwargs["tag"] == ":trace-fork/trajectory":
+                    prompt = kwargs["messages"][-1]["content"]
+                    event = json.loads(prompt.split("Raw trace events:", 1)[1])[0]
+                    trace_id = event["trace_id"]
+                    turn_no = int(event["turn"])
+                    payload = {
+                        "trajectory": [{
+                            "role": "observation",
+                            "content": json.dumps(event, ensure_ascii=False),
+                            "timestamp": event["timestamp"],
+                        }],
+                        "provenance": [{
+                            "record_index": 0, "trace_id": trace_id,
+                            "turn_id": f"{trace_id}:{turn_no}", "turn_no": turn_no,
+                            "source_event_ids": [event["event_id"]],
+                        }],
+                    }
+                    yield type("Chunk", (), {"type": "text_delta", "content": json.dumps(payload, ensure_ascii=False)})()
+                    return
                 yield type("Chunk", (), {"type": "text_delta", "content": '{"window_summary":"当前窗口摘要","items":[],"records":[]}'})()
 
         analyzer = FileTraceAnalyzer(_LLM(), str(tmp_path / "workspace"), store)
         main_tools = [{"name": "Read", "description": "读取文件", "parameters": {"type": "object", "properties": {}}}]
         await analyzer.analyze_window(window["window_id"], "project-a", _tools=main_tools)
         saved_window = await store.get_trace_window(window["window_id"])
-        assert len(analyzer.llm.calls) == 1
+        assert len(analyzer.llm.calls) == 2
         assert analyzer.llm.calls[0]["position"] == "main_loop"
         assert analyzer.llm.calls[0]["messages"][0]["content"] == "上下文"
-        assert "Trace events:" not in analyzer.llm.calls[0]["messages"][-1]["content"]
-        assert "完整继承主 Agent 上下文" in analyzer.llm.calls[0]["messages"][-1]["content"]
-        assert '"window_summary"' in analyzer.llm.calls[0]["messages"][-1]["content"]
-        assert [tool["name"] for tool in analyzer.llm.calls[0]["tools"]] == ["Read", "GetTraceContext"]
+        assert "Raw trace events:" in analyzer.llm.calls[0]["messages"][-1]["content"]
+        assert analyzer.llm.calls[0]["tools"] is None
+        assert '"window_summary"' in analyzer.llm.calls[1]["messages"][-1]["content"]
+        assert [tool["name"] for tool in analyzer.llm.calls[1]["tools"]] == ["Read", "GetTraceContext"]
         assert saved_window["status"] == "complete"
         assert saved_window["summary"] == "当前窗口摘要"
+        assert saved_window["normalized_trajectory"]
+        assert saved_window["trajectory_provenance"][0]["trace_id"] == first
         assert saved_window["summary_start_turn_no"] == 1
         assert saved_window["summary_end_turn_no"] == 2
+
+        analyzer.llm.calls.clear()
+        await analyzer.analyze_window(window["window_id"], "project-a", _tools=main_tools)
+        assert len(analyzer.llm.calls) == 1
+        assert analyzer.llm.calls[0]["tag"] == ":trace-fork/cached"
+        assert not any(
+            "Raw trace events:" in str(message.get("content", ""))
+            for message in analyzer.llm.calls[0]["messages"]
+        )
 
     asyncio.run(scenario())
 

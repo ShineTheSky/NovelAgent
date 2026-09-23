@@ -92,34 +92,27 @@ positions:
   memory_prefetch:
     provider: minimax
     model: MiniMax-M2.7
-    max_tokens: 512
+    max_tokens: 300000
     temperature: 0
     timeout: 1.5
 
-  context_compression:
+  memory_summary_fallback:
     provider: minimax
     model: MiniMax-M2.7
-    max_tokens: 4096
-    temperature: 0.3
-    timeout: 120
+    max_tokens: 300000
+    temperature: 0.2
+    timeout: 600
 
-  auto_memory:
+  session_title:
     provider: minimax
     model: MiniMax-M2.7
-    max_tokens: 2048
-    temperature: 0.3
+    max_tokens: 300000
+    temperature: 0.2
     timeout: 30
 
-  bad_case_analysis:
+  case_analysis:
     provider: minimax
     model: MiniMax-M2.7
-    max_tokens: 2048
+    max_tokens: 300000
     temperature: 0.2
-    timeout: 60
-
-  bash_case_analysis:
-    provider: minimax
-    model: MiniMax-M2.7
-    max_tokens: 2048
-    temperature: 0.2
-    timeout: 60
+    timeout: 600

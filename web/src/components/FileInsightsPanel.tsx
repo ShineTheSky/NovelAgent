@@ -1,18 +1,18 @@
 import { useCallback, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
-import { cancelLifecycleManualReview, downgradeLifecycleRecord, fetchEvidence, fetchMemories, fetchPatterns, fetchTrace } from '../api/client';
+import { cancelLifecycleManualReview, downgradeLifecycleRecord, fetchInsights, fetchMemories, fetchPatterns, fetchTrace } from '../api/client';
 import type { LifecycleRecord, TraceEvidence } from '../types/insights';
 import { LifecycleRecordDetailDialog } from './LifecycleRecordDetailDialog';
 import { TraceDetailDialog } from './TraceDetailDialog';
 
-type Layer = 'evidence' | 'memory' | 'pattern';
-const label: Record<Layer, string> = { evidence: 'Evidence', memory: 'Memory', pattern: 'Pattern' };
+type Layer = 'insight' | 'memory' | 'pattern';
+const label: Record<Layer, string> = { insight: 'Insight', memory: 'Memory', pattern: 'Pattern' };
 const errorText = (error: unknown) => error instanceof Error ? error.message : '加载详情失败';
 
 export function FileInsightsPanel({ projectId }: { projectId: string | null }) {
   const [open, setOpen] = useState(false);
-  const [tab, setTab] = useState<Layer>('evidence');
-  const [data, setData] = useState<Record<Layer, LifecycleRecord[]>>({ evidence: [], memory: [], pattern: [] });
+  const [tab, setTab] = useState<Layer>('insight');
+  const [data, setData] = useState<Record<Layer, LifecycleRecord[]>>({ insight: [], memory: [], pattern: [] });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedRecord, setSelectedRecord] = useState<LifecycleRecord | null>(null);
@@ -28,11 +28,11 @@ export function FileInsightsPanel({ projectId }: { projectId: string | null }) {
     setBusy(true);
     setError(null);
     try {
-      const [evidence, memory, pattern] = await Promise.all([
-        fetchEvidence(projectId), fetchMemories(projectId), fetchPatterns(projectId),
+      const [insight, memory, pattern] = await Promise.all([
+        fetchInsights(projectId), fetchMemories(projectId), fetchPatterns(projectId),
       ]);
       setData({
-        evidence: evidence.filter(item => item.category !== 'agent'),
+        insight: insight.filter(item => item.category !== 'agent'),
         memory: memory.filter(item => item.category !== 'agent'),
         pattern: pattern.filter(item => item.category !== 'agent'),
       });
@@ -68,7 +68,7 @@ export function FileInsightsPanel({ projectId }: { projectId: string | null }) {
   };
 
   const downgrade = async (record: LifecycleRecord) => {
-    if (!projectId || record.layer === 'evidence' || !confirm(`降低“${record.title || record.claim}”的层级？`)) return;
+    if (!projectId || record.layer === 'insight' || !confirm(`降低“${record.title || record.claim}”的层级？`)) return;
     await downgradeLifecycleRecord(projectId, record.layer, record.id);
     await load();
   };
@@ -145,7 +145,7 @@ function RecordCard({ record, tab, onOpen, onOpenTrace, onDowngrade, onCancelMan
       {record.support_count && <span>支持 {record.support_count}</span>}
       <span className="ml-auto flex gap-3">
         {record.promotion_status === 'manual_review' && <button type="button" onClick={onCancelManualReview} className="text-purple-600 hover:text-purple-800">取消锁定</button>}
-        {tab !== 'evidence' && <button type="button" onClick={onDowngrade} className="text-amber-700 hover:text-amber-900">降低层级</button>}
+        {tab !== 'insight' && <button type="button" onClick={onDowngrade} className="text-amber-700 hover:text-amber-900">降低层级</button>}
       </span>
     </div>
   </article>;

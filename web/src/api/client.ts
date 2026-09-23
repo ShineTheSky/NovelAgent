@@ -365,8 +365,8 @@ export function saveProviderSettings(providers: Record<string, ProviderSettingsU
   });
 }
 
-export function fetchEvidence(projectId: string) {
-  return requestJson<LifecycleRecord[]>(`/projects/${resourceId(projectId)}/evidence`);
+export function fetchInsights(projectId: string) {
+  return requestJson<LifecycleRecord[]>(`/projects/${resourceId(projectId)}/insights`);
 }
 
 export function fetchMemories(projectId: string) {
@@ -381,7 +381,7 @@ export function downgradeLifecycleRecord(projectId: string, layer: 'memory' | 'p
   return requestJson<LifecycleRecord>(`/projects/${resourceId(projectId)}/${layer}/${resourceId(recordId)}/downgrade`, { method: 'POST' });
 }
 
-export function cancelLifecycleManualReview(projectId: string, layer: 'evidence' | 'memory', recordId: string) {
+export function cancelLifecycleManualReview(projectId: string, layer: 'insight' | 'memory', recordId: string) {
   return requestJson<LifecycleRecord>(`/projects/${resourceId(projectId)}/${layer}/${resourceId(recordId)}/cancel-manual-review`, { method: 'POST' });
 }
 

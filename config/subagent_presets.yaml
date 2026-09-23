@@ -288,9 +288,9 @@ presets:
       ## 输出格式
       直接输出章节正文，使用Markdown格式。
       附简要说明写入了哪些文件。
-    tools: [Read, Write, Edit, Glob, Grep, Bash]
+    tools: [Read, Write, Edit, Glob, Grep, TextStats, Bash]
     inherit_history: false
-    max_turns: 15
+    max_turns: 30
     memory_enabled: false
     show_result: true
 
@@ -388,9 +388,9 @@ presets:
       【矛盾检查】（如无矛盾写"未发现矛盾"）
       【写回摘要】
       [列出已修改的要点与最终修订号；正文已经写入文件，禁止在回复中重复整章内容]
-    tools: [Read, Write, Edit, Glob, Grep, SearchRag]
+    tools: [Read, Write, Edit, Glob, Grep, TextStats, SearchRag]
     inherit_history: false
-    max_turns: 12
+    max_turns: 24
     memory_enabled: false
     show_result: true
 
@@ -434,9 +434,9 @@ presets:
       **涉及内容：** …
       **需要确认：** …
       **影响：** …
-    tools: [Read, Glob, Grep,AskUserQuestion]
+    tools: [Read, Glob, Grep, TextStats, AskUserQuestion]
     inherit_history: false
-    max_turns: 10
+    max_turns: 20
     memory_enabled: false
     show_result: true
 
@@ -458,9 +458,9 @@ presets:
 
       ## 输出格式
       以结构化的人物卡形式输出，包含性格、外貌、背景、关系等。
-    tools: [Read, Write, Edit, Glob, Grep]
+    tools: [Read, Write, Edit, Glob, Grep, TextStats]
     inherit_history: false
-    max_turns: 12
+    max_turns: 24
     memory_enabled: false
     show_result: true
 
@@ -629,50 +629,9 @@ presets:
       - 预计字数：[字数]
       ...
 
-    tools: [Read, Write, Glob, Grep, Bash, AskUserQuestion, Edit]
+    tools: [Read, Write, Glob, Grep, TextStats, Bash, AskUserQuestion, Edit]
     inherit_history: false
-    max_turns: 12
+    max_turns: 30
     memory_enabled: false
     show_result: true
-
-  memory_extractor:
-    description: "从对话中提取需要长期记忆的信息"
-    system_prompt: |
-      你是记忆提取助手。回顾对话，只提取值得长期记住的信息。
-
-      ## 核心规则（最高优先级）
-      写入记忆文件后，必须同步更新 memory.md 索引。写记忆但不更新索引 = 任务未完成。
-      索引格式：在 memory.md 表格末尾追加一行 `| {序号} | {type} | {tags} | {summary} | {文件路径} |`
-      如果新记忆与已有索引冲突，删除旧行，新增当前行。
-
-      ## 需要存储的情况
-      - 用户表达了写作偏好("我喜欢第一人称") → .memory/user/
-      - 用户纠正了错误("上次太严肃了") → .memory/feedback/
-      - 用户做出了项目决策("之后所有的大纲都改为三幕") → .memory/project/
-      - 用户提供了参考资料（"参考这段文字调整战斗描写"） → .memory/reference/
-
-      ## 不需要存储
-      - 普通闲聊、问候
-      - 已有记忆中的重复信息（对照 memory.md 索引检查）
-      - 工具调用细节
-      - 局部修改不影响后续（如"大纲改为三幕"只改当前大纲）→ 不记忆
-
-      ## 存储格式
-      ---
-      type: <user|feedback|reference|project>
-      tags: [标签]
-      summary: 一句话摘要
-      ---
-      正文
-
-      ## 执行步骤
-      1. 判断是否有值得记忆的新信息，没有则回复"无"
-      2. 用 Write 写入 .memory/{type}/ 目录
-      3. 用 Edit 在 memory.md 表格末尾追加索引行，或修改冲突的旧行
-      4. 确认索引已更新，否则回到步骤3
-    tools: [Read, Write, Grep, Glob]
-    inherit_history: true
-    max_turns: 6
-    memory_enabled: true
-    show_result: false
 

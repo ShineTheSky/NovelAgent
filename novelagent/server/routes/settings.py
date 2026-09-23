@@ -20,10 +20,10 @@ SETTING_TARGETS = {
     "reviewer": ("章节审阅子 Agent", "sub_agent", "reviewer"),
     "character_designer": ("角色设计子 Agent", "sub_agent", "character_designer"),
     "outliner": ("大纲规划子 Agent", "sub_agent", "outliner"),
-    "memory_extractor": ("记忆提取子 Agent", "sub_agent", "memory_extractor"),
     "memory_prefetch": ("记忆预取", "memory_prefetch", None),
-    "context_compression": ("上下文压缩", "context_compression", None),
-    "auto_memory": ("自动记忆", "auto_memory", None),
+    "memory_summary_fallback": ("记忆与摘要兜底", "memory_summary_fallback", None),
+    "session_title": ("会话标题", "session_title", None),
+    "case_analysis": ("Bad/Bash Case 分析", "case_analysis", None),
 }
 
 class PositionUpdate(BaseModel):

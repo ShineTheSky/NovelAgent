@@ -123,6 +123,10 @@ async def init():
                 status TEXT NOT NULL DEFAULT 'pending',
                 token_count INTEGER NOT NULL DEFAULT 0,
                 messages_json TEXT NOT NULL DEFAULT '[]',
+                normalized_trajectory_json TEXT NOT NULL DEFAULT '[]',
+                trajectory_provenance_json TEXT NOT NULL DEFAULT '[]',
+                trajectory_trace_id TEXT NOT NULL DEFAULT '',
+                normalized_at TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 finished_at TEXT,
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
@@ -132,6 +136,10 @@ async def init():
         await _ensure_column(db, "trace_analysis_windows", "summary_trace_id", "TEXT NOT NULL DEFAULT ''")
         await _ensure_column(db, "trace_analysis_windows", "summary_start_turn_no", "INTEGER")
         await _ensure_column(db, "trace_analysis_windows", "summary_end_turn_no", "INTEGER")
+        await _ensure_column(db, "trace_analysis_windows", "normalized_trajectory_json", "TEXT NOT NULL DEFAULT '[]'")
+        await _ensure_column(db, "trace_analysis_windows", "trajectory_provenance_json", "TEXT NOT NULL DEFAULT '[]'")
+        await _ensure_column(db, "trace_analysis_windows", "trajectory_trace_id", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "trace_analysis_windows", "normalized_at", "TEXT")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS session_compression_state (
                 session_id TEXT PRIMARY KEY,

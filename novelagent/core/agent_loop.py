@@ -44,7 +44,7 @@ class AgentLoop:
         self.memory = memory_manager
         self.subagent_runner = subagent_runner
         self._config = config or {}
-        self.max_turns = self._config.get("max_turns", 20)
+        self.max_turns = self._config.get("max_turns", 40)
         self.token_limit = self._config.get("token_limit", 150_000)
         self.compression_threshold = float(self._config.get("compression_threshold", 0.8))
         self.loop_threshold = self._config.get("loop_detection_threshold", 3)
@@ -134,7 +134,7 @@ class AgentLoop:
         trace_checkpoint_requested = False
         compression_trace_requested = False
 
-        # 项目记忆预取仍与项目工作区绑定；自动 Trace 记忆则持久化到 SQLite。
+        # 项目记忆保存在工作区文件中，来源 Trace 与窗口摘要保存在 SQLite。
         import os as _os
         project_memory = MemoryManager(
             _os.path.join(self.working_dir, session.project_id),
@@ -370,13 +370,6 @@ class AgentLoop:
             session.active_trace_id = trace_id
             tool_ctx.operation_id = f"op_{session.session_id}_{trace_id}"
             tool_ctx.source_trace_id = trace_id
-            try:
-                project_memory.rebuild_index()
-            except OSError as exc:
-                # The compression result is still valid if a project folder is
-                # temporarily locked; the next successful rebuild will refresh
-                # the sliding-window snapshot.
-                print(f"[memory] rebuild after compression failed: {exc}", flush=True)
             print(f"[compress] 完成: {pre_check_tokens} → {session.token_count} tokens ({time.time()-t0:.2f}s)", flush=True)
 
         # 确保用户消息已持久化，防止ReAct循环异常退出时丢失

@@ -398,6 +398,31 @@ class TraceStore:
         await conn.close()
         return event_id
 
+    async def append_events(self, trace_id: str, events: list[dict]) -> list[str]:
+        """Persist an ordered event batch in one SQLite transaction."""
+        if not events:
+            return []
+        event_ids = [f"evt_{uuid.uuid4().hex}" for _ in events]
+        created_at = _now()
+        conn = await get_connection()
+        await conn.executemany(
+            """INSERT INTO trace_events
+               (event_id, trace_id, parent_event_id, sequence_no, event_type, actor, payload_json, duration_ms, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    event_id, trace_id, event.get("parent_event_id"), event["sequence_no"],
+                    event["event_type"], event["actor"],
+                    json.dumps(event.get("payload") or {}, ensure_ascii=False, default=str),
+                    event.get("duration_ms"), created_at,
+                )
+                for event_id, event in zip(event_ids, events)
+            ],
+        )
+        await conn.commit()
+        await conn.close()
+        return event_ids
+
     async def finish_trace(self, trace_id: str, status: str, final_answer: str = "", token_count: int = 0) -> None:
         conn = await get_connection()
         await conn.execute(
@@ -568,12 +593,38 @@ class TraceStore:
             return None
         result = dict(row)
         result["messages"] = json.loads(result.pop("messages_json") or "[]")
+        result["normalized_trajectory"] = json.loads(
+            result.pop("normalized_trajectory_json", "[]") or "[]"
+        )
+        result["trajectory_provenance"] = json.loads(
+            result.pop("trajectory_provenance_json", "[]") or "[]"
+        )
         cursor = await conn.execute(
             "SELECT trace_id FROM trace_window_members WHERE window_id = ? ORDER BY member_no ASC", (window_id,)
         )
         result["source_trace_ids"] = [str(member[0]) for member in await cursor.fetchall()]
         await conn.close()
         return result
+
+    async def save_trace_window_trajectory(self, window_id: str, payload: dict,
+                                           trajectory_trace_id: str = "") -> None:
+        """Persist the validated Memory/Summary first-pass trajectory for reuse."""
+        conn = await get_connection()
+        await conn.execute(
+            """UPDATE trace_analysis_windows
+               SET normalized_trajectory_json = ?, trajectory_provenance_json = ?,
+                   trajectory_trace_id = ?, normalized_at = ?
+               WHERE window_id = ?""",
+            (
+                json.dumps(payload.get("trajectory", []), ensure_ascii=False),
+                json.dumps(payload.get("provenance", []), ensure_ascii=False),
+                trajectory_trace_id,
+                _now(),
+                window_id,
+            ),
+        )
+        await conn.commit()
+        await conn.close()
 
     async def get_latest_trace_window_summary(self, session_id: str) -> dict | None:
         """Return the newest completed per-window summary for one Session."""

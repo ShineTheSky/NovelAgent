@@ -6,10 +6,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 import yaml
 
-LAYERS = {"evidence": ".evidence", "memory": ".memory", "pattern": ".pattern"}
+LAYERS = {"insight": ".insight", "memory": ".memory", "pattern": ".pattern"}
 CATEGORIES = {"user", "project", "reference", "agent"}
 DOMAINS = {"writing", "outline", "overall"}
-EVIDENCE_INDEX_LIMIT = 1000
+INSIGHT_INDEX_LIMIT = 1000
 MEMORY_INDEX_LIMIT = 200
 PATTERN_PROMOTION_WEIGHT = 200
 MAX_RECORD_WEIGHT = 300
@@ -36,6 +36,25 @@ class FileLifecycleStore:
     def __init__(self, workspace_dir: str, project_id: str):
         self.project = Path(workspace_dir) / project_id
 
+    def _migrate_legacy_evidence(self) -> None:
+        """Move the former derived Evidence layer to Insight without changing record IDs."""
+        legacy = self.project / ".evidence"
+        current = self.project / ".insight"
+        if not legacy.exists():
+            return
+        if not current.exists():
+            legacy.rename(current)
+        else:
+            for source in legacy.rglob("*.md"):
+                if source.name == "evidence.md":
+                    continue
+                target = current / source.relative_to(legacy)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    source.replace(target)
+        stale_index = current / "evidence.md"
+        stale_index.unlink(missing_ok=True)
+
     def _root(self, layer: str, category: str = "project") -> Path:
         root = self.project / LAYERS[layer]
         return root / category
@@ -44,6 +63,7 @@ class FileLifecycleStore:
         return self.project / LAYERS[layer]
 
     def ensure(self):
+        self._migrate_legacy_evidence()
         for layer in LAYERS:
             for category in CATEGORIES:
                 self._root(layer, category).mkdir(parents=True, exist_ok=True)
@@ -51,7 +71,7 @@ class FileLifecycleStore:
     def list(self, layer: str) -> list[dict]:
         self.ensure(); records = []
         for path in self._base(layer).rglob("*.md"):
-            if path.name in {"memory.md", "memory_archive.md", "project_rules.md", "evidence.md", "pattern.md"}: continue
+            if path.name in {"insight.md", "memory.md", "memory_archive.md", "project_rules.md", "pattern.md"}: continue
             try:
                 text = path.read_text(encoding="utf-8")
                 _, header, body = text.split("---", 2)
@@ -92,13 +112,13 @@ class FileLifecycleStore:
         path = self.project / item["file_path"]
         path.unlink(missing_ok=True)
         source_layer = item.get("layer")
-        if source_layer == "memory" and target_layer == "evidence":
+        if source_layer == "memory" and target_layer == "insight":
             item["origin_memory_id"] = item["id"]
             if reason:
                 item["demotion_reason"] = reason
-            item["id"] = f"evi_{uuid.uuid4().hex}"
-        elif source_layer == "evidence" and target_layer == "memory":
-            item["origin_evidence_id"] = item["id"]
+            item["id"] = f"ins_{uuid.uuid4().hex}"
+        elif source_layer == "insight" and target_layer == "memory":
+            item["origin_insight_id"] = item["id"]
             item["id"] = f"mem_{uuid.uuid4().hex}"
         return self.write(target_layer, item)
 
@@ -108,19 +128,19 @@ class FileLifecycleStore:
         records = self.list("memory")
         active = [item for item in records if item.get("category") != "agent"]
         for item in sorted(active, key=self._rank, reverse=True)[MEMORY_INDEX_LIMIT:]:
-            demoted.append(self._move(item, "evidence", reason="capacity"))
+            demoted.append(self._move(item, "insight", reason="capacity"))
         return demoted
 
     def rebuild_indexes(self) -> None:
         self.enforce_memory_capacity()
-        evidence = self.list("evidence")
+        insights = self.list("insight")
         memory = self.list("memory")
         patterns = self.list("pattern")
-        self._write_index("evidence", "证据索引", EVIDENCE_INDEX_LIMIT,
-                          [item for item in evidence if item.get("category") != "agent"])
+        self._write_index("insight", "洞察索引", INSIGHT_INDEX_LIMIT,
+                          [item for item in insights if item.get("category") != "agent"])
         self._write_index("memory", "记忆索引", MEMORY_INDEX_LIMIT,
                           [item for item in memory if item.get("category") != "agent"])
-        self._write_index("pattern", "模式索引", EVIDENCE_INDEX_LIMIT,
+        self._write_index("pattern", "模式索引", INSIGHT_INDEX_LIMIT,
                           [item for item in patterns if item.get("category") != "agent"])
 
     def get(self, layer: str, record_id: str) -> dict | None:
@@ -370,6 +390,6 @@ class FileLifecycleStore:
         )
         content = str(item.get("content") or item.get("claim") or "").strip()
         item["content"] = content if note in content else f"{content}\n\n## 用户降级备注\n{note}"
-        result = self._move(item, "memory" if layer == "pattern" else "evidence", reason="manual")
+        result = self._move(item, "memory" if layer == "pattern" else "insight", reason="manual")
         self.rebuild_indexes()
         return result

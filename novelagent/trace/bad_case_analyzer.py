@@ -101,16 +101,16 @@ class BadCaseAnalyzer:
             if self.trace_store:
                 agent_trace = await AgentRunTrace.try_start(
                     self.trace_store, session_id="bad-case-analysis", project_id="__agent_bad_cases__",
-                    actor="bad_case_analyzer", position="bad_case_analysis",
+                    actor="bad_case_analyzer", position="case_analysis",
                     title=f"[bad_case_analyzer] {category}",
                 )
                 agent_trace.add_request(
-                    position="bad_case_analysis", tag=":bad-case-analysis",
+                    position="case_analysis", tag=":bad-case-analysis",
                     messages=[{"role": "user", "content": prompt}], tools=None,
                 )
             async for chunk in self.llm.chat(
-                position="bad_case_analysis", messages=[{"role": "user", "content": prompt}],
-                tools=None, stream=False, tag=":bad-case-analysis", max_tokens=2048,
+                position="case_analysis", messages=[{"role": "user", "content": prompt}],
+                tools=None, stream=False, tag=":bad-case-analysis",
             ):
                 if chunk.type == "text_delta":
                     text += chunk.content

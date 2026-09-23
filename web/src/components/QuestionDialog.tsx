@@ -9,21 +9,20 @@ export function QuestionDialog({ qa }: { qa: PendingQuestion }) {
     setAnswers(previous => ({ ...previous, [index]: value }));
   };
 
-  const answerFor = (index: number, multiSelect: boolean): QuestionAnswer => {
+  const answerFor = (index: number): QuestionAnswer => {
     const custom = customAnswers[index]?.trim() ?? '';
     const selected = answers[index];
     if (!custom) return selected ?? '';
-    if (!multiSelect) return custom;
     const choices = Array.isArray(selected) ? selected : selected ? [selected] : [];
-    return [...choices, custom];
+    return choices.length > 0 ? [...choices, custom] : custom;
   };
 
   const handleSubmit = () => {
-    qa.onSubmit(qa.questions.map((question, index) => answerFor(index, question.multiSelect)));
+    qa.onSubmit(qa.questions.map((_, index) => answerFor(index)));
   };
 
   const allAnswered = qa.questions.every((_, index) => {
-    const answer = answerFor(index, qa.questions[index].multiSelect);
+    const answer = answerFor(index);
     return answer !== undefined && answer !== '' && (!Array.isArray(answer) || answer.length > 0);
   });
 
@@ -54,14 +53,13 @@ export function QuestionDialog({ qa }: { qa: PendingQuestion }) {
                 return (
                   <label key={option.label} className={`flex items-start gap-2 p-2 rounded-lg border cursor-pointer transition-colors ${isSelected ? 'border-purple-400 bg-purple-50' : 'border-gray-200 hover:bg-gray-50'}`}>
                     <input
-                      type={question.multiSelect ? 'checkbox' : 'radio'}
+                      type="checkbox"
                       name={`question-${index}`}
                       className="mt-0.5 accent-purple-600"
                       checked={isSelected}
                       onChange={() => {
                         if (!question.multiSelect) {
-                          setAnswer(index, option.label);
-                          setCustomAnswers(previous => ({ ...previous, [index]: '' }));
+                          setAnswer(index, isSelected ? '' : option.label);
                           return;
                         }
                         const selected = Array.isArray(current) ? [...current] : [];
@@ -82,7 +80,7 @@ export function QuestionDialog({ qa }: { qa: PendingQuestion }) {
                 value={customAnswers[index] ?? ''}
                 onChange={event => setCustomAnswers(previous => ({ ...previous, [index]: event.target.value }))}
                 rows={2}
-                placeholder="可不选以上选项，直接输入你的想法…"
+                placeholder="可单独填写，也可补充说明已选项…"
                 className="w-full resize-y rounded-lg border border-gray-200 bg-white px-2.5 py-2 text-sm leading-5 text-gray-700 outline-none placeholder:text-gray-400 focus:border-purple-400"
               />
             </label>
