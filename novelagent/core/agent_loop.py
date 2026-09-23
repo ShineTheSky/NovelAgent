@@ -131,9 +131,33 @@ class AgentLoop:
             if getattr(session, "active_trace_id", "") == trace_id:
                 session.active_trace_id = ""
 
+        async def capture_embedded_user_answer(chunk: ResponseChunk, source: str,
+                                                parent_event_id: str) -> None:
+            """Promote a sub-agent AskUserQuestion response to first-class Trace evidence."""
+            nonlocal feedback_trace_requested
+            data = chunk.data
+            if (
+                chunk.type != "tool_result"
+                or data.get("tool") != "AskUserQuestion"
+                or not data.get("success")
+            ):
+                return
+            answers = data.get("data", [])
+            if isinstance(answers, str):
+                try:
+                    answers = json.loads(answers)
+                except json.JSONDecodeError:
+                    pass
+            await record("user_answer", "user", {
+                "answers": answers,
+                "source": source,
+            }, parent_event_id)
+            feedback_trace_requested = True
+
         pi = project_info or {}
         trace_checkpoint_requested = False
         compression_trace_requested = False
+        feedback_trace_requested = False
 
         # 项目记忆保存在工作区文件中，来源 Trace 与窗口摘要保存在 SQLite。
         import os as _os
@@ -260,9 +284,11 @@ class AgentLoop:
                 snapshot,
                 event_snapshot,
                 token_count if token_count is not None else self.context_builder.token_counter.count_messages(snapshot),
-                trace_checkpoint_requested or compression_trace_requested or force_capture,
+                trace_checkpoint_requested or compression_trace_requested or feedback_trace_requested or force_capture,
                 "agent_request" if trace_checkpoint_requested else (
-                    "compression" if compression_trace_requested else reason
+                    "compression" if compression_trace_requested else (
+                        "user_feedback" if feedback_trace_requested else reason
+                    )
                 ),
                 append_turn,
             )
@@ -536,6 +562,7 @@ class AgentLoop:
                     })
                     await record("user_answer", "user", {"answers": answers}, tool_event_id)
                     await record("tool_result", "tool", {"tool": tool_name, "success": True, "data": answers}, tool_event_id)
+                    feedback_trace_requested = True
                     continue
 
                 # Execute tool — SubAgent gets special streaming treatment
@@ -602,6 +629,9 @@ class AgentLoop:
                         await subagent_trace_stream.add(
                             f"subagent_{sub_chunk.type}", f"subagent:{preset}", sub_chunk.data, tool_event_id,
                         )
+                        await capture_embedded_user_answer(
+                            sub_chunk, f"subagent:{preset}", tool_event_id,
+                        )
                         if sub_chunk.type == "error":
                             subagent_failed = True
                             subagent_result_text = f"Error: {sub_chunk.data.get('message', '子 Agent 执行失败')}"
@@ -644,6 +674,11 @@ class AgentLoop:
                                     f"workflow_{workflow_chunk.type}",
                                     f"workflow:{workflow_chunk.data.get('workflow', 'review_polish')}",
                                     workflow_chunk.data, tool_event_id,
+                                )
+                                await capture_embedded_user_answer(
+                                    workflow_chunk,
+                                    f"workflow:{workflow_chunk.data.get('workflow', 'review_polish')}",
+                                    tool_event_id,
                                 )
                                 yield workflow_chunk
                             await workflow_trace_stream.flush()
