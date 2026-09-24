@@ -10,6 +10,11 @@ from novelagent.trace.file_lifecycle import FileLifecycleStore, PATTERN_PROMOTIO
 from novelagent.trace.store import TraceStore
 from novelagent.trace.agent_run import AgentRunTrace
 from novelagent.trace.normalized_trajectory import build_trajectory_prompt, validate_trajectory_payload
+from novelagent.trace.semantic_extraction import (
+    build_semantic_extraction_section,
+    normalize_analysis_semantics,
+    select_extraction_profiles,
+)
 from novelagent.tools.base import PermissionResult, ToolContext, ToolResult
 from novelagent.tools.get_trace_context import GetTraceContextTool
 from novelagent.tools.read import ReadTool
@@ -172,6 +177,12 @@ class FileTraceAnalyzer:
         } for layer, x in all_records if FileLifecycleStore.is_text_feedback(x)][:80]
 
         event_view = [self._event_summary(event) for event in events if self._keep_event(event)]
+        checkpoint_reasons = self._checkpoint_reasons(events)
+        extraction_profiles = select_extraction_profiles(event_view, checkpoint_reasons)
+        semantic_extraction_section = build_semantic_extraction_section(extraction_profiles)
+        self._execution_event(execution_events, "semantic_extraction_profiles", {
+            "profiles": [profile.name for profile in extraction_profiles],
+        })
         trajectory_prompt = build_trajectory_prompt(source_trace_ids, event_view)
         trajectory = validate_trajectory_payload(normalized_trajectory or {}, events)
         trajectory_was_reused = bool(trajectory)
@@ -243,6 +254,7 @@ class FileTraceAnalyzer:
         prompt += "\n决定写入前必须先根据 Existing 选择候选：Insight 只能与 Insight 合并，低幅加分；Memory 可以与 Memory 或 Insight 合并，高幅加分。Memory 候选还必须查看 Existing 中的 Pattern：若语义相同，relation=support、related_layer=pattern，直接为该 Pattern 加分，不重复新建 Pattern。records 可额外返回 related_layer=insight|memory|pattern。被容量挤出的旧 Memory 在 Insight 中保留 origin_memory_id，新的 Memory 可以将其重新提升。"
         prompt += "\npromotion_status=manual_review 表示用户曾手动降级并持有不同意见。后续证据仍可追加，但程序禁止自动晋级。只有用户本轮明确重新确认该记录可作为更高等级规则时，才设置 explicit_reconfirmation=true；不得根据普通支持或相似表述自行解除。"
         prompt += "\n每条 records 还必须提供 title 和 content：title 是不超过 40 字、可用于索引和列表的简要标题；content 是可独立理解的具体事实、约束、适用条件和必要背景。claim 保持与 title 一致，用于兼容旧记录。text_feedback 必须提供 user_requirements 和 revision_direction；程序会保存 source_event_ids 对应的完整用户原始输入并将三部分一起落盘。若局部 turn 不足，可调用一次 GetTraceContext，按 start_turn/end_turn 补查当前 Session 内任意 Trace 的必要区间；若必须核对工件原文或修订号，可调用一次 Read 读取当前项目文件。不要为了保险读取整条 Trace 或无关文件。获得工具结果后必须输出完整 JSON。"
+        prompt += f"\n\n{semantic_extraction_section}"
 
         trace_event_block = f"Trace events:{json.dumps(event_view, ensure_ascii=False)}"
         analysis_prompt = prompt.replace(
@@ -300,6 +312,7 @@ class FileTraceAnalyzer:
             ))
             if not self._valid_analysis_payload(data, require_summary):
                 raise TraceAnalysisCallError("独立记忆与摘要兜底仍未返回有效结果")
+        data = normalize_analysis_semantics(data, extraction_profiles)
         if trace_tool.last_events:
             by_event_id = {str(event.get("event_id")): event for event in [*events, *trace_tool.last_events]}
             events = TraceStore.annotate_event_turns(list(by_event_id.values()))
@@ -315,7 +328,6 @@ class FileTraceAnalyzer:
             ],
             *[str(event.get("event_id")) for event in trace_tool.last_events if event.get("event_id")],
         ]))
-        checkpoint_reasons = self._checkpoint_reasons(events)
         if checkpoint_reasons and not data.get("items") and not data.get("records"):
             retry_prompt = f'''[Trace 记忆提取重试]\n上一轮返回了空结果，但当前 Trace 明确调用了 CreateTraceCheckpoint。必须重新判断，不能返回空对象。\n只输出与主 schema 相同的 JSON：{{"window_summary":"仅概括当前分析窗口的摘要","items":[],"records":[]}}。\n用户明确指出具体文本问题时，items 至少包含 correction 或 feedback；records 必须生成 category=reference、domain=writing、kind=text_feedback、layer=memory、signal=strong 的记录，并让 source_event_ids 指向 user_message。\n若 checkpoint 并非写作反馈，也必须给出对应分类；只有确认不应长期记录时 records 才可为空。\nCheckpoint reasons:{json.dumps(checkpoint_reasons, ensure_ascii=False)}\nTrace events:{json.dumps(event_view, ensure_ascii=False)}\nExisting:{json.dumps(context, ensure_ascii=False)}'''
             data = self._json(await self._extract(
@@ -323,6 +335,7 @@ class FileTraceAnalyzer:
                 session_id=str(trace.get("session_id", "")), source_trace_id=trace_id,
                 execution_events=execution_events,
             ))
+            data = normalize_analysis_semantics(data, extraction_profiles)
         if checkpoint_reasons and not data.get("items") and not data.get("records"):
             raise ValueError("CreateTraceCheckpoint 已触发，但 Trace 判别连续返回空结果")
         window_summary = str(data.get("window_summary") or "").strip()[:8000]
@@ -346,6 +359,7 @@ class FileTraceAnalyzer:
                 )
             if window_summary and not data.get("window_summary"):
                 data["window_summary"] = window_summary
+            data = normalize_analysis_semantics(data, extraction_profiles)
         if data.get("records"):
             try:
                 data = await self._reconcile_records(
@@ -499,6 +513,7 @@ class FileTraceAnalyzer:
                             "confidence": item.get("confidence", .5), "weight": 15, "support_count": 1,
                             "promotion_status": "conflict_review", "conflict_reason": reason,
                             "conflict_ids": [existing_conflict["id"]] if existing_conflict else [],
+                            **self._semantic_metadata(item),
                         })
                         continue
                     supported = related
@@ -506,6 +521,7 @@ class FileTraceAnalyzer:
                         bonus = 35 if item.get("signal") == "strong" else 15
                         supported, _ = files.add_support(related, record_trace_ids, ids, bonus, item)
                     merged = files.merge_text_feedback(supported, item, record_trace_id, ids, user_inputs)
+                    merged.update(self._semantic_metadata(item))
                     merged["trace_ids"] = list(dict.fromkeys([*merged.get("trace_ids", []), *record_trace_ids]))
                     if item.get("explicit_reconfirmation") is True:
                         merged = files.confirm_auto_promotion(merged)
@@ -532,6 +548,7 @@ class FileTraceAnalyzer:
                         "feedback_count": 1, "feedback_history": [{"trace_id": record_trace_id, "trace_refs": trace_refs, "source_event_ids": ids, "feedback_direction": str(item.get("feedback_direction") or ""), "relation": feedback_relation}], "user_inputs": user_inputs,
                         "trace_id": record_trace_id, "trace_ids": record_trace_ids, "trace_refs": trace_refs, "source_event_ids": ids,
                         "confidence": item.get("confidence", .5), "weight": 65 if item.get("signal") == "strong" else 15, "support_count": 1,
+                        **self._semantic_metadata(item),
                     })
                 continue
             related_layer = str(item.get("related_layer") or ("memory" if layer == "memory" else "insight"))
@@ -551,6 +568,7 @@ class FileTraceAnalyzer:
                         "confidence": item.get("confidence", .5), "weight": 15, "support_count": 1,
                         "promotion_status": "conflict_review", "conflict_reason": reason,
                         "conflict_ids": [existing_conflict["id"]],
+                        **self._semantic_metadata(item),
                     }
                     files.write("insight", candidate)
                     continue
@@ -564,6 +582,8 @@ class FileTraceAnalyzer:
                 related["source_event_ids"] = list(dict.fromkeys([*related.get("source_event_ids", []), *ids]))
                 related["trace_ids"] = list(dict.fromkeys([*related.get("trace_ids", []), *record_trace_ids]))
                 related["trace_refs"] = self._merge_trace_refs(related.get("trace_refs", []), trace_refs)
+                for key, value in self._semantic_metadata(item).items():
+                    related.setdefault(key, value)
                 if relation == "append":
                     history = list(related.get("relation_history") or [])
                     history.append({
@@ -574,6 +594,7 @@ class FileTraceAnalyzer:
                         "trace_ids": record_trace_ids,
                         "trace_refs": trace_refs,
                         "source_event_ids": ids,
+                        **self._semantic_metadata(item),
                     })
                     related["relation_history"] = history
                     files.write(related_layer, related)
@@ -588,7 +609,7 @@ class FileTraceAnalyzer:
                     files.promote_memory_to_pattern(saved, record_trace_ids)
             else:
 
-                files.write(layer, {"id": item.get("id"), "title": item.get("title", claim), "claim": claim, "content": item.get("content", claim), "category": item.get("category", "project"), "domain": item.get("domain", "overall"), "kind": item.get("kind", ""), "trace_id": record_trace_id, "trace_ids": record_trace_ids, "trace_refs": trace_refs, "source_event_ids": ids, "confidence": item.get("confidence", .5), "weight": 65 if item.get("signal") == "strong" else 15, "support_count": 1})
+                files.write(layer, {"id": item.get("id"), "title": item.get("title", claim), "claim": claim, "content": item.get("content", claim), "category": item.get("category", "project"), "domain": item.get("domain", "overall"), "kind": item.get("kind", ""), "trace_id": record_trace_id, "trace_ids": record_trace_ids, "trace_refs": trace_refs, "source_event_ids": ids, "confidence": item.get("confidence", .5), "weight": 65 if item.get("signal") == "strong" else 15, "support_count": 1, **self._semantic_metadata(item)})
 
         for event in agent_feedback_events:
             already_recorded = any(
@@ -610,6 +631,15 @@ class FileTraceAnalyzer:
         files.rebuild_indexes()
         for source_trace_id in source_trace_ids:
             await self.trace_store.set_trace_analysis_status(source_trace_id, "complete")
+
+    @staticmethod
+    def _semantic_metadata(item: dict) -> dict:
+        result = {}
+        if isinstance(item.get("semantic"), dict):
+            result["semantic"] = item["semantic"]
+        if item.get("extraction_profile"):
+            result["extraction_profile"] = str(item["extraction_profile"])
+        return result
 
     async def analyze_window(self, window_id: str, project_id: str, branch_messages=None, _tools=None) -> None:
         """Analyze bounded local ReAct turns without inventing an aggregate Trace.

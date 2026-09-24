@@ -649,3 +649,62 @@ def test_second_stage_reconciles_new_candidate_into_existing_insight(tmp_path):
     assert [call["tag"] for call in llm.calls] == [
         ":trace-fork/trajectory/fallback", ":trace-fork", ":trace-fork/reconcile",
     ]
+
+
+class _SemanticExtractionLLM:
+    def __init__(self):
+        self.calls = []
+
+    async def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs["tag"] == ":trace-fork/trajectory/fallback":
+            yield SimpleNamespace(type="text_delta", content=_trajectory_response(kwargs))
+            return
+        if kwargs["tag"] == ":trace-fork/reconcile":
+            yield SimpleNamespace(type="text_delta", content=json.dumps({"decisions": [{
+                "candidate_index": 0, "relation": "new", "reason": "新的明确规则",
+            }]}, ensure_ascii=False))
+            return
+        yield SimpleNamespace(type="text_delta", content=json.dumps({
+            "window_summary": "用户确认动作场景规则。",
+            "items": [{
+                "event_id": "event-user", "type": "correction",
+                "summary": "动作场景必须写清人物距离", "confidence": 0.95,
+            }],
+            "records": [{
+                "layer": "memory", "category": "user", "domain": "writing",
+                "title": "动作场景写清人物距离", "claim": "动作场景写清人物距离",
+                "content": "动作场景必须写清人物距离。",
+                "source_event_ids": ["event-user"], "signal": "strong",
+                "relation": "new", "confidence": 0.95,
+                "semantic": {
+                    "scenario": "user_directive",
+                    "what": "用户要求动作场景必须写清人物距离。",
+                    "who": ["用户"], "when": "", "where": "动作场景", "why": "",
+                    "entities": [{"name": "动作场景", "type": "concept", "role": "适用对象"}],
+                    "relations": [{"type": "applies_to", "target": "动作场景", "description": "明确限定"}],
+                    "attributes": {"target": "动作场景", "desired": "人物距离清楚"},
+                },
+            }],
+        }, ensure_ascii=False))
+
+
+def test_trace_analysis_routes_scenarios_and_persists_semantic_metadata(tmp_path):
+    llm = _SemanticExtractionLLM()
+    store = _FallbackTraceStore()
+    analyzer = FileTraceAnalyzer(llm, str(tmp_path), store)
+
+    asyncio.run(analyzer.analyze("trace-a", "project-a"))
+
+    extraction_call = next(call for call in llm.calls if call["tag"] == ":trace-fork")
+    extraction_prompt = extraction_call["messages"][-1]["content"]
+    assert 'scenario="user_directive"' in extraction_prompt
+    assert 'scenario="story_knowledge"' in extraction_prompt
+
+    memories = FileLifecycleStore(str(tmp_path), "project-a").list("memory")
+    assert len(memories) == 1
+    assert memories[0]["extraction_profile"] == "user_directive"
+    assert memories[0]["semantic"]["attributes"] == {
+        "target": "动作场景", "desired": "人物距离清楚",
+    }
+    assert memories[0]["semantic"]["relations"][0]["type"] == "applies_to"
