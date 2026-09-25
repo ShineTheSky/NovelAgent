@@ -1,6 +1,7 @@
 """File-backed derived records for immutable SQLite traces."""
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from datetime import datetime, timezone
@@ -178,6 +179,53 @@ class FileLifecycleStore:
         return item.get("category") == "reference" and item.get("kind") == "text_feedback"
 
     @staticmethod
+    def _normalize_source_text(value: object) -> str:
+        """Normalize layout-only differences while preserving the stored original text."""
+        return " ".join(str(value or "").split())
+
+    @classmethod
+    def _source_text_sha256(cls, value: object) -> str:
+        normalized = cls._normalize_source_text(value)
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
+
+    @classmethod
+    def _feedback_source_text(cls, item: dict) -> str:
+        return str(item.get("source_text") or item.get("anchor_excerpt") or "").strip()
+
+    @classmethod
+    def _feedback_source_entry(cls, item: dict, trace_id: str,
+                               source_event_ids: list[str]) -> dict | None:
+        source_text = cls._feedback_source_text(item)
+        if not source_text:
+            return None
+        return {
+            "trace_id": trace_id,
+            "source_event_ids": list(dict.fromkeys(source_event_ids)),
+            "artifact_path": str(item.get("artifact_path") or "").replace("\\", "/").lstrip("./"),
+            "artifact_revision_id": str(item.get("artifact_revision_id") or ""),
+            "text": source_text,
+            "sha256": cls._source_text_sha256(source_text),
+        }
+
+    def find_text_feedback_by_source_text(self, source_text: str) -> tuple[str, dict] | tuple[None, None]:
+        """Find feedback for the exact user-supplied passage, including older passage versions."""
+        wanted = self._source_text_sha256(source_text)
+        if not wanted:
+            return None, None
+        for layer in ("memory", "insight"):
+            for item in self.list(layer):
+                if not self.is_text_feedback(item):
+                    continue
+                candidates = [
+                    self._feedback_source_text(item),
+                    *(str(row.get("text") or "") for row in (item.get("source_texts") or []) if isinstance(row, dict)),
+                    *(str(row.get("anchor_excerpt") or "") for row in (item.get("anchor_examples") or []) if isinstance(row, dict)),
+                ]
+                if any(self._source_text_sha256(candidate) == wanted for candidate in candidates if candidate):
+                    return layer, item
+        return None, None
+
+    @staticmethod
     def is_review_issue(item: dict) -> bool:
         return item.get("domain") == "writing" and item.get("kind") == "review_issue"
 
@@ -320,10 +368,33 @@ class FileLifecycleStore:
         known_input_ids = {str(row.get("event_id") or "") for row in inputs if isinstance(row, dict)}
         inputs.extend(row for row in user_inputs if str(row.get("event_id") or "") not in known_input_ids)
         merged["user_inputs"] = inputs
+        existing_trace_id = str(merged.get("trace_id") or "")
+        existing_source_event_ids = [
+            str(value) for value in merged.get("source_event_ids", []) if value
+        ]
         merged["trace_id"] = trace_id
         merged["trace_ids"] = list(dict.fromkeys([*merged.get("trace_ids", []), trace_id]))
         merged["trace_refs"] = _merge_trace_refs(merged.get("trace_refs", []), incoming.get("trace_refs", []))
         merged["source_event_ids"] = list(dict.fromkeys([*merged.get("source_event_ids", []), *source_event_ids]))
+        source_texts = list(merged.get("source_texts") or [])
+        if not source_texts:
+            existing_source = self._feedback_source_entry(
+                merged,
+                existing_trace_id,
+                existing_source_event_ids,
+            )
+            if existing_source:
+                source_texts.append(existing_source)
+        incoming_source = self._feedback_source_entry(incoming, trace_id, source_event_ids)
+        known_source_hashes = {
+            str(row.get("sha256") or self._source_text_sha256(row.get("text")))
+            for row in source_texts if isinstance(row, dict)
+        }
+        if incoming_source and incoming_source["sha256"] not in known_source_hashes:
+            source_texts.append(incoming_source)
+        merged["source_texts"] = source_texts
+        if incoming_source:
+            merged["source_text"] = incoming_source["text"]
         anchors = list(merged.get("anchor_examples") or [])
         if not anchors and merged.get("anchor_excerpt"):
             anchors.append({
@@ -348,6 +419,10 @@ class FileLifecycleStore:
             value = incoming.get(key)
             if value:
                 merged[key] = value
+        if incoming_source and not merged.get("anchor_excerpt"):
+            merged["anchor_excerpt"] = incoming_source["text"][:700]
+        if incoming_source and not merged.get("anchor_sha256"):
+            merged["anchor_sha256"] = incoming_source["sha256"]
         # Trace remains the immutable full evidence source.  Repeated feedback
         # refreshes the user's requirements and revision direction without
         # treating the same text anchor as another promotion vote.
@@ -370,7 +445,9 @@ class FileLifecycleStore:
         merged["user_requirements"] = user_requirements
         merged["revision_direction"] = revision_direction
         merged.pop("feedback_analysis", None)
-        merged["content"] = self.render_text_feedback_content(user_requirements, revision_direction, inputs)
+        merged["content"] = self.render_text_feedback_content(
+            user_requirements, revision_direction, inputs, source_texts,
+        )
         if incoming.get("title"):
             merged["title"] = str(incoming["title"])
             merged["claim"] = str(incoming.get("claim") or incoming["title"])
@@ -378,7 +455,7 @@ class FileLifecycleStore:
 
     @staticmethod
     def render_text_feedback_content(user_requirements: str, revision_direction: str,
-                                     user_inputs: list[dict]) -> str:
+                                     user_inputs: list[dict], source_texts: list[dict] | None = None) -> str:
         lines = [
             "## 用户要求",
             user_requirements or "（尚待进一步提炼）",
@@ -386,8 +463,23 @@ class FileLifecycleStore:
             "## 修改方向",
             revision_direction or "（尚待进一步判断）",
             "",
-            "## 用户原始反馈",
+            "## 用户提供的原文",
         ]
+        if not source_texts:
+            lines.append("（用户未提供可独立识别的原文。）")
+        for row in source_texts or []:
+            if not isinstance(row, dict) or not str(row.get("text") or "").strip():
+                continue
+            trace_id = row.get("trace_id", "")
+            event_ids = ", ".join(str(value) for value in row.get("source_event_ids", []) if value)
+            lines.extend([
+                f"### Trace {trace_id} / Events {event_ids}",
+                str(row["text"]),
+            ])
+        lines.extend([
+            "",
+            "## 用户原始反馈",
+        ])
         if not user_inputs:
             lines.append("（未能定位原始用户输入；可按 trace_id 回查。）")
         for row in user_inputs:
@@ -408,6 +500,10 @@ class FileLifecycleStore:
                 continue
             anchors = [item, *[row for row in item.get("anchor_examples", []) if isinstance(row, dict)]]
             quoted = [str(anchor.get("anchor_excerpt") or "").strip() for anchor in anchors]
+            quoted.extend(
+                str(row.get("text") or "").strip()
+                for row in (item.get("source_texts") or []) if isinstance(row, dict)
+            )
             same_path = str(item.get("artifact_path") or "").replace("\\", "/").lstrip("./") == normalized
             same_path = same_path or any(
                 str(anchor.get("artifact_path") or "").replace("\\", "/").lstrip("./") == normalized

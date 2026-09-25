@@ -5,6 +5,7 @@ import uuid
 from novelagent.tools.subagent_tool import SubAgentTool
 from novelagent.core.session import Session, ResponseChunk
 from novelagent.tools.base import ToolContext, ToolResult
+from novelagent.tools.ask_user_question import resolve_question_answers
 from novelagent.core.llm_turn import query
 from novelagent.trace.agent_run import AgentRunTrace, AgentTraceTaskManager
 
@@ -164,7 +165,8 @@ class SubAgentRunner:
                 parent_session.question_answers = None
                 await parent_session.question_event.wait()
                 answers = parent_session.question_answers or []
-                return True, json.dumps(answers, ensure_ascii=False), ""
+                resolved_answers = resolve_question_answers(params.get("questions", []), answers)
+                return True, json.dumps(resolved_answers, ensure_ascii=False), ""
             try:
                 tool = self.tools.get(tool_name)
                 sub_ctx = ToolContext(

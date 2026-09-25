@@ -54,6 +54,9 @@ def test_prompt_exposes_common_fact_shape_and_only_selected_attributes():
     assert "共指" in prompt
     assert "Trace timestamp" in prompt
     assert "时间先后不等于因果" in prompt
+    assert "previous_logic" in prompt
+    assert "只有 direction_change" in prompt
+    assert "这不是方向变更" in prompt
     assert "diagnostic_rule" not in prompt
 
 
@@ -109,6 +112,36 @@ def test_semantic_normalization_keeps_only_profile_fields_and_known_relations():
     }]
     assert record["semantic"]["attributes"] == {
         "target": "动作场景", "desired": "人物距离清楚",
+    }
+
+
+def test_user_directive_keeps_reason_and_old_vs_user_logic():
+    record = normalize_record_semantic({
+        "category": "user",
+        "content": "不是让全书都加快，我只是不满意追逐段拖沓。",
+        "semantic": {
+            "scenario": "user_directive",
+            "why": "追逐段阅读节奏拖沓",
+            "attributes": {
+                "trigger": "用户审阅追逐段",
+                "change_type": "correction",
+                "previous_logic": "全书整体加快",
+                "user_logic": "只加快追逐段，日常段保持慢节奏",
+                "logic_difference": "适用范围从全书缩小为追逐段",
+                "dissatisfaction": "追逐段拖沓",
+                "diagnostic_rule": "不属于 user_directive",
+            },
+        },
+    }, [PROFILES["user_directive"]])
+
+    assert record["semantic"]["why"] == "追逐段阅读节奏拖沓"
+    assert record["semantic"]["attributes"] == {
+        "trigger": "用户审阅追逐段",
+        "change_type": "correction",
+        "previous_logic": "全书整体加快",
+        "user_logic": "只加快追逐段，日常段保持慢节奏",
+        "logic_difference": "适用范围从全书缩小为追逐段",
+        "dissatisfaction": "追逐段拖沓",
     }
 
 

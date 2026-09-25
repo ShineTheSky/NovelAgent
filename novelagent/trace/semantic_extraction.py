@@ -23,12 +23,21 @@ PROFILES = {
     "user_directive": ExtractionProfile(
         name="user_directive",
         mission="提取用户明确表达、纠正或确认的长期偏好、约束、目标和工作方式。",
-        fields=("directive_type", "target", "desired", "prohibited", "conditions", "priority", "duration"),
+        fields=(
+            "directive_type", "target", "desired", "prohibited", "conditions", "priority", "duration",
+            "trigger", "change_type", "previous_logic", "user_logic", "logic_difference", "dissatisfaction",
+        ),
         prompt="""应提取：用户明确说出的偏好、禁忌、质量标准、纠正、目标、持续有效的工作流程；一句话里有多个可独立变化的要求时拆成多条。
 不得提取：礼貌确认、一次性命令、仅为当前调用提供的参数、Agent 自己推测出的偏好、没有被用户确认的建议。
 模态：把“必须/以后都要”标为 confirmed；“可以试试/也许”标为 proposed；问题句和待用户选择项标为 open，绝不能改写为既定偏好。
+WHY：必须判断用户为什么发出指令。why 写来源明确表达的原因、触发事件或希望解决的问题；没有证据时留空，不能把否定句自动推断成愤怒或长期不满。attributes.trigger 保存直接触发点，attributes.dissatisfaction 保存用户具体不满意之处。
+逻辑对比：来源中存在旧方案、Agent 当前做法或用户先前规则时，分别填写 previous_logic 和 user_logic，并用 logic_difference 精确说明目标、范围、条件、优先级或方法上的差异。不得只写“用户改变了想法”。
+change_type 只能取 initial|clarification|refinement|correction|rejection|direction_change：initial=首次提出；clarification=消除歧义但目标不变；refinement=增加条件或边界；correction=Agent/系统误解了事实、范围或约束；rejection=用户不满意当前实现，但原目标没有改变；direction_change=用户明确替换此前已经确认的目标或偏好。
+关系：只有 direction_change 才对被替代的旧指令建立 supersedes。correction/rejection 通常是否定错误理解或实现，不得因此覆盖原有用户目标；能定位错误记录时使用 contradicts，并保留原目标。
 实体：事实关于用户时包含 user 实体；target 指向写作维度、工具、Agent 或工件，而不是把“喜欢”“不要”等动词当实体。
 正确例：输入“以后打斗必须写清距离，不要只堆招式”→ what="用户要求打斗场景明确人物距离并避免只罗列招式"，attributes.target="打斗场景"。
+纠正例：输入“不是让全书都加快，我只是不满意追逐段拖沓；日常段落保持慢节奏”→ change_type="correction"，previous_logic="全书整体加快"，user_logic="只加快追逐段，日常段保持慢节奏"，logic_difference="适用范围不同"，dissatisfaction="追逐段拖沓"；这不是方向变更。
+改向例：输入“之前说全程慢节奏，现在改成追逐段快节奏”→ change_type="direction_change"，并对旧的“全程慢节奏”指令建立 supersedes。
 错误例：输入“继续写下一章”→ 不生成长期记录。""",
     ),
     "story_knowledge": ExtractionProfile(
@@ -49,7 +58,8 @@ Canon：正文或用户明确确认的设定用 confirmed/canon；大纲计划�
         fields=("problem", "desired_effect", "forbidden_expression", "revision_strategy", "transfer_scope"),
         prompt="""应提取：被评价的文本锚点、用户指出的问题、希望达到的阅读效果、明确禁止项、可执行修改方向及适用范围。
 不得提取：被引用正文中的虚构内容本身（除非用户同时确认它是设定）、RAG 参考片段、模型自行补出的写法、只适用于一个错字的意见。
-原文保护：anchor_excerpt 和用户原始反馈由程序保存；semantic.what 只写用户要求，不复述或改写整段正文。
+原文保护：用户提供被评价原文时，source_text 必须逐字完整保留，程序会把它及其历史版本附在记忆中；anchor_excerpt 用于短锚点，用户原始反馈另行保存。semantic.what 只写用户要求，不复述或改写整段正文。
+连续反馈：判断是否命中既有记录时要比较全部 source_texts。同一段原文及其后续改写版本都应追加到同一条记忆，保留每版原文和每次意见，不得仅因措辞变化另建记录。
 迁移性：只对当前锚点的意见写 attributes.transfer_scope="anchor_only"；用户明确概括为通用写法时才写 scene/chapter/project。
 正确例：输入“这句太直白，用握杯子的动作表现压力”→ problem="情绪解释过直"，desired_effect="克制地表现压力"，revision_strategy="以动作替代解释"。
 错误例：看到参考资料采用短句，就把“用户偏好短句”写入记忆。""",
@@ -306,9 +316,14 @@ def normalize_record_semantic(
 
     attributes = raw.get("attributes") if isinstance(raw.get("attributes"), dict) else {}
     allowed_fields = set(PROFILES[scenario].fields) if scenario in PROFILES else set()
-    semantic["attributes"] = {
+    normalized_attributes = {
         str(key): value for key, value in attributes.items() if str(key) in allowed_fields
     }
+    if scenario == "user_directive" and normalized_attributes.get("change_type") not in {
+        "initial", "clarification", "refinement", "correction", "rejection", "direction_change",
+    }:
+        normalized_attributes.pop("change_type", None)
+    semantic["attributes"] = normalized_attributes
     item["semantic"] = semantic
     item["extraction_profile"] = scenario
     return item

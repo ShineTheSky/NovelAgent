@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -7,7 +8,7 @@ from novelagent.core.agent_loop import AgentLoop, MainTurnResult
 from novelagent.context.builder import Context
 from novelagent.core.session import Session
 from novelagent.llm.client import LLMResponse
-from novelagent.tools.ask_user_question import AskUserQuestionTool
+from novelagent.tools.ask_user_question import AskUserQuestionTool, resolve_question_answers
 from novelagent.tools.base import PermissionResult
 from novelagent.tools.registry import ToolRegistry
 
@@ -21,6 +22,45 @@ class FakeLLM:
         self.calls.append(kwargs)
         for chunk in self.chunks:
             yield chunk
+
+
+def test_question_answer_resolves_selected_option_description_and_custom_input():
+    resolved = resolve_question_answers([{
+        "header": "记忆策略",
+        "question": "旧记忆应该如何处理？",
+        "multiSelect": True,
+        "options": [
+            {"label": "合并更新", "description": "保留旧证据，并更新当前观察。"},
+            {"label": "建立冲突", "description": "同时保留两个方向，等待进一步确认。"},
+        ],
+    }], [["合并更新", "冲突时不要自动覆盖"]])
+
+    assert resolved == [{
+        "question_index": 0,
+        "header": "记忆策略",
+        "question": "旧记忆应该如何处理？",
+        "multi_select": True,
+        "selected_options": [{
+            "label": "合并更新",
+            "description": "保留旧证据，并更新当前观察。",
+        }],
+        "custom_input": "冲突时不要自动覆盖",
+    }]
+
+
+def test_question_answer_keeps_custom_only_answer_self_contained():
+    resolved = resolve_question_answers([{
+        "header": "方向",
+        "question": "选择下一步？",
+        "multiSelect": False,
+        "options": [
+            {"label": "继续", "description": "按当前方案继续。"},
+            {"label": "暂停", "description": "停止当前工作。"},
+        ],
+    }], ["先补充人物设定"])
+
+    assert resolved[0]["selected_options"] == []
+    assert resolved[0]["custom_input"] == "先补充人物设定"
 
 
 @pytest.mark.asyncio
@@ -155,13 +195,23 @@ async def test_ask_user_answer_forces_feedback_trace_capture(monkeypatch, tmp_pa
     class FakeLLM:
         def __init__(self):
             self.calls = 0
+            self.requests = []
 
-        async def chat(self, **_kwargs):
+        async def chat(self, **kwargs):
             self.calls += 1
+            self.requests.append(kwargs)
             if self.calls == 1:
                 yield LLMResponse(
                     type="tool_use", tool_name="AskUserQuestion", tool_call_id="ask-1",
-                    tool_input={"questions": [{"question": "保留设定吗？"}]},
+                    tool_input={"questions": [{
+                        "header": "设定处理",
+                        "question": "保留设定吗？",
+                        "multiSelect": False,
+                        "options": [
+                            {"label": "保留", "description": "保留现有设定，并作为后续写作约束。"},
+                            {"label": "删除", "description": "删除现有设定，不再用于后续写作。"},
+                        ],
+                    }]},
                 )
             else:
                 yield LLMResponse(type="text_delta", content="已按反馈继续。")
@@ -188,11 +238,13 @@ async def test_ask_user_answer_forces_feedback_trace_capture(monkeypatch, tmp_pa
         def __init__(self):
             self.store = FakeTraceStore()
             self.sequence = 0
+            self.records = []
 
         async def start(self, *_args):
             return "trace-1"
 
-        async def record(self, *_args):
+        async def record(self, *args):
+            self.records.append(args)
             self.sequence += 1
             return f"event-{self.sequence}"
 
@@ -225,8 +277,9 @@ async def test_ask_user_answer_forces_feedback_trace_capture(monkeypatch, tmp_pa
     registry.register(AskUserQuestionTool())
     trace = FakeTrace()
     background = BackgroundTasks()
+    llm = FakeLLM()
     loop = AgentLoop(
-        FakeLLM(), registry, FakeSecurity(), FakeContextBuilder(), object(),
+        llm, registry, FakeSecurity(), FakeContextBuilder(), object(),
         {"working_dir": str(tmp_path), "trace_interval": 5},
         trace_recorder=trace, background_tasks=background,
     )
@@ -235,7 +288,7 @@ async def test_ask_user_answer_forces_feedback_trace_capture(monkeypatch, tmp_pa
     async def answer_question():
         while not getattr(session, "question_event", None):
             await asyncio.sleep(0)
-        session.question_answers = ["保留，以后都这样写"]
+        session.question_answers = ["保留"]
         session.question_event.set()
 
     answer_task = None
@@ -252,3 +305,13 @@ async def test_ask_user_answer_forces_feedback_trace_capture(monkeypatch, tmp_pa
     await background.drain()
 
     assert trace.store.captures[0]["reason"] == "user_feedback"
+    tool_result = next(
+        message for message in llm.requests[1]["messages"] if message["role"] == "tool_result"
+    )
+    assert json.loads(tool_result["content"])[0]["selected_options"] == [{
+        "label": "保留",
+        "description": "保留现有设定，并作为后续写作约束。",
+    }]
+    user_answer_payload = next(args[3] for args in trace.records if args[1] == "user_answer")
+    assert user_answer_payload["raw_answers"] == ["保留"]
+    assert user_answer_payload["answers"][0]["question"] == "保留设定吗？"

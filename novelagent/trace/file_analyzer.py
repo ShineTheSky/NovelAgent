@@ -165,9 +165,35 @@ class FileTraceAnalyzer:
             *(("pattern", record) for record in records_by_layer["pattern"][:40]),
         ]
         context = [{"id": x["id"], "title": x.get("title", x.get("claim", "")), "layer": layer, "category": x.get("category", "project"), "domain": x.get("domain", "overall"), "kind": x.get("kind", ""), "file_path": x.get("file_path", ""), "weight": x.get("weight", 0), "support_count": x.get("support_count", 1), "promotion_status": x.get("promotion_status", "auto"), "downgraded_from": x.get("downgraded_from", "")} for layer, x in context_records]
+        def feedback_source_context(record: dict) -> list[dict]:
+            rows = [row for row in (record.get("source_texts") or []) if isinstance(row, dict)]
+            if not rows:
+                rows = [{
+                    "artifact_path": row.get("artifact_path", record.get("artifact_path", "")),
+                    "artifact_revision_id": row.get("artifact_revision_id", ""),
+                    "sha256": row.get("anchor_sha256", ""),
+                    "text": row.get("anchor_excerpt", ""),
+                } for row in (record.get("anchor_examples") or []) if isinstance(row, dict)]
+            if not rows and record.get("anchor_excerpt"):
+                rows = [{
+                    "artifact_path": record.get("artifact_path", ""),
+                    "artifact_revision_id": record.get("artifact_revision_id", ""),
+                    "sha256": record.get("anchor_sha256", ""),
+                    "text": record.get("anchor_excerpt", ""),
+                }]
+            return [{
+                "artifact_path": row.get("artifact_path", ""),
+                "artifact_revision_id": row.get("artifact_revision_id", ""),
+                "sha256": row.get("sha256", ""),
+                "text": str(row.get("text", ""))[:3000],
+            } for row in rows[-8:]]
+
         feedback_context = [{
             "id": x["id"], "layer": layer, "title": x.get("title", ""),
+            "file_path": x.get("file_path", ""),
             "artifact_path": x.get("artifact_path", ""), "anchor_excerpt": str(x.get("anchor_excerpt", ""))[:700],
+            "source_text": str(x.get("source_text", ""))[:3000],
+            "source_texts": feedback_source_context(x),
             "user_requirements": x.get("user_requirements", ""),
             "revision_direction": x.get("revision_direction", x.get("feedback_direction", "")),
             "content": str(x.get("content", ""))[:1600],
@@ -175,6 +201,15 @@ class FileTraceAnalyzer:
             "weight": x.get("weight", 0), "support_count": x.get("support_count", 1),
             "promotion_status": x.get("promotion_status", "auto"),
         } for layer, x in all_records if FileLifecycleStore.is_text_feedback(x)][:80]
+        feedback_by_id = {item["id"]: item for item in feedback_context}
+        reconcile_context = [
+            {**item, **feedback_by_id.get(item["id"], {})}
+            for item in context
+        ]
+        context_ids = {item["id"] for item in reconcile_context}
+        reconcile_context.extend(
+            item for item in feedback_context if item["id"] not in context_ids
+        )
 
         event_view = [self._event_summary(event) for event in events if self._keep_event(event)]
         checkpoint_reasons = self._checkpoint_reasons(events)
@@ -240,7 +275,7 @@ class FileTraceAnalyzer:
             {"role": "user", "content": trajectory_context_prompt},
             {"role": "assistant", "content": trajectory_json},
         ]
-        prompt = f'''[后台 Trace 分支命令]\n你收到的不是完整 Trace，而是每条 Trace 中与本次分析锚点临近的少量 ReAct turn。不要回复用户、不要续写，只分析原始 Trace：{json.dumps(source_trace_ids, ensure_ascii=False)}。每个 Trace event 都携带 trace_id 和 turn；记录必须通过 source_event_ids 保留真实来源，程序会据此把记录精确关联到 trace_id + turn。\n只输出 JSON：{{"items":[{{"event_id":"","type":"error|correction|confirmation|feedback","summary":"","confidence":0.5}}],"records":[{{"layer":"insight|memory","category":"user|project|reference","domain":"writing|outline|overall","title":"不超过40字的简要标题","content":"具体事实、约束、适用条件和必要背景","claim":"与 title 一致","source_event_ids":[""],"signal":"weak|strong","relation":"new|support|append","related_id":"","confidence":0.5,"kind":"text_feedback 时填写","artifact_path":"可从工具事件推断时填写","artifact_revision_id":"","anchor_excerpt":"用户引用或评价的原文，最多700字","anchor_sha256":"工具事件提供时填写","user_requirements":"综合历次反馈后，用户希望该段达到什么效果以及明确禁止什么","revision_direction":"后续应如何修改，包括措辞、情节、人物表现和节奏等方向","feedback_direction":"兼容字段，填写当前建议的修改方向","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict","explicit_reconfirmation":false}}]}}。\n不记录：普通闲聊、纯工具调用、一次性命令，例如“继续写作”“读取文件”。\nInsight 是从 Trace 得出的、尚不足以长期生效的低置信观察或假设，例如用户单次说“这章对话节奏有点慢”；它保留来源，等待后续相似反馈支持。\nMemory 是明确、可复用的长期偏好、修正或约束，例如“以后打斗必须突出空间关系”，或“把林深的初始性格改为恐惧回避型”；这类记录 layer=memory、signal=strong。\n凡是由用户 correction 事件得出的记录，source_event_ids 必须包含对应 user_message 或 user_answer 的 event_id，且 layer=memory、signal=strong；不要用后续 assistant_turn 替代该证据。support 必须引用 Existing 的 memory id。\n\n文本修改反馈的特殊规则：当用户粘贴、引用或明确评价某段小说/大纲原文时，写 category=reference、kind=text_feedback，并从工具事件补足 artifact_path、修订和锚点。程序会根据 source_event_ids 保存用户完整原始输入；不要复述或截断用户原话。user_requirements 必须综合历次反馈，提炼用户希望该段达到的效果和明确禁止项；revision_direction 必须总结后续具体修改方向，而不是生成原文摘要。与同一锚点/同一段原文的重复意见使用 relation=append、feedback_relation=same_anchor：只追加历史并更新这两个字段，绝不加分。仅当是不同但相似的文本，且用户修改方向能相互验证时，relation=support、feedback_relation=cross_text_support，才允许为 Existing text_feedback 加分。相同/相似文本但方向相反时用 append、feedback_relation=cross_text_conflict：记录反例与不确定性，不加分。是否同锚点、是否跨文本可迁移由你根据原文、用户引用和 Existing 自行判断。\nTrace events:{json.dumps(event_view, ensure_ascii=False)}\nExisting:{json.dumps(context, ensure_ascii=False)}\nExisting text feedback (full):{json.dumps(feedback_context, ensure_ascii=False)}'''
+        prompt = f'''[后台 Trace 分支命令]\n你收到的不是完整 Trace，而是每条 Trace 中与本次分析锚点临近的少量 ReAct turn。不要回复用户、不要续写，只分析原始 Trace：{json.dumps(source_trace_ids, ensure_ascii=False)}。每个 Trace event 都携带 trace_id 和 turn；记录必须通过 source_event_ids 保留真实来源，程序会据此把记录精确关联到 trace_id + turn。\n只输出 JSON：{{"items":[{{"event_id":"","type":"error|correction|confirmation|feedback","summary":"","confidence":0.5}}],"records":[{{"layer":"insight|memory","category":"user|project|reference","domain":"writing|outline|overall","title":"不超过40字的简要标题","content":"具体事实、约束、适用条件和必要背景","claim":"与 title 一致","source_event_ids":[""],"signal":"weak|strong","relation":"new|support|append","related_id":"","confidence":0.5,"kind":"text_feedback 时填写","artifact_path":"可从工具事件推断时填写","artifact_revision_id":"","source_text":"用户本轮提供并要求评价或修改的原文，逐字完整复制；未提供则为空字符串","anchor_excerpt":"source_text 的前700字或工具事件提供的锚点","anchor_sha256":"工具事件提供时填写","user_requirements":"综合历次反馈后，用户希望该段达到什么效果以及明确禁止什么","revision_direction":"后续应如何修改，包括措辞、情节、人物表现和节奏等方向","feedback_direction":"兼容字段，填写当前建议的修改方向","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict","explicit_reconfirmation":false}}]}}。\n不记录：普通闲聊、纯工具调用、一次性命令，例如“继续写作”“读取文件”。\nInsight 是从 Trace 得出的、尚不足以长期生效的低置信观察或假设，例如用户单次说“这章对话节奏有点慢”；它保留来源，等待后续相似反馈支持。\nMemory 是明确、可复用的长期偏好、修正或约束，例如“以后打斗必须突出空间关系”，或“把林深的初始性格改为恐惧回避型”；这类记录 layer=memory、signal=strong。\n凡是由用户 correction 事件得出的记录，source_event_ids 必须包含对应 user_message 或 user_answer 的 event_id，且 layer=memory、signal=strong；不要用后续 assistant_turn 替代该证据。support 必须引用 Existing 的 memory id。\n\n文本修改反馈的特殊规则：当用户粘贴、引用或明确评价某段小说/大纲原文时，写 category=reference、kind=text_feedback，并从工具事件补足 artifact_path、修订和锚点。source_text 必须把用户提供的被评价原文逐字完整复制，不包含其后的修改意见；不能概括、改写或只保留开头。用户没有提供原文时 source_text 留空。程序会把 source_text 的每个版本和完整用户输入一起落盘。判断是否命中既有反馈时，必须比较 Existing text feedback 中全部 source_texts；同一原文或其后续改写版本使用 relation=append、feedback_relation=same_anchor，累计到同一条记忆。user_requirements 必须综合历次反馈，提炼用户希望该段达到的效果和明确禁止项；revision_direction 必须总结后续具体修改方向，而不是生成原文摘要。与同一锚点/同一段原文的重复意见只追加历史并更新这两个字段，绝不加分。仅当是不同但相似的文本，且用户修改方向能相互验证时，relation=support、feedback_relation=cross_text_support，才允许为 Existing text_feedback 加分。不同文本的相似方向存在冲突时用 append、feedback_relation=cross_text_conflict。是否同锚点、是否跨文本可迁移由你根据原文、用户引用和 Existing 自行判断。\nTrace events:{json.dumps(event_view, ensure_ascii=False)}\nExisting:{json.dumps(context, ensure_ascii=False)}\nExisting text feedback (full):{json.dumps(feedback_context, ensure_ascii=False)}'''
 
         prompt = prompt.replace(
             '只输出 JSON：{"items":',
@@ -364,7 +399,7 @@ class FileTraceAnalyzer:
             try:
                 data = await self._reconcile_records(
                     trace_id, project_id, post_analysis_prompt, post_branch_messages,
-                    data, context, trace_tool, _tools, str(trace.get("session_id", "")),
+                    data, reconcile_context, trace_tool, _tools, str(trace.get("session_id", "")),
                     execution_events=execution_events,
                 )
             except TraceAnalysisCallError:
@@ -373,7 +408,7 @@ class FileTraceAnalyzer:
                 data = await self._reconcile_records(
                     trace_id, project_id,
                     f"{analysis_prompt}\nNormalized trajectory:{trajectory_json}", None,
-                    data, context, trace_tool, None, str(trace.get("session_id", "")),
+                    data, reconcile_context, trace_tool, None, str(trace.get("session_id", "")),
                     execution_events=execution_events,
                 )
             if window_summary and not data.get("window_summary"):
@@ -482,11 +517,23 @@ class FileTraceAnalyzer:
                 user_inputs = self._user_inputs(events, ids, record_trace_id)
                 if not user_inputs:
                     continue
+                source_text = files._feedback_source_text(item)
+                if source_text:
+                    item["source_text"] = source_text
+                    item["anchor_excerpt"] = str(item.get("anchor_excerpt") or source_text[:700])[:700]
+                    item["anchor_sha256"] = str(
+                        item.get("anchor_sha256") or files._source_text_sha256(source_text)
+                    )
                 feedback_relation = str(item.get("feedback_relation") or "same_anchor")
                 related_layer = str(item.get("related_layer") or ("memory" if layer == "memory" else "insight"))
                 resolved_layer, related = files.resolve(related_layer, str(item.get("related_id", ""))) if related_layer in {"insight", "memory"} and item.get("related_id") else (None, None)
                 if related and not files.is_text_feedback(related):
                     related = None
+                exact_layer, exact_related = files.find_text_feedback_by_source_text(source_text)
+                if exact_related:
+                    resolved_layer, related = exact_layer, exact_related
+                    feedback_relation = "same_anchor"
+                item["feedback_relation"] = feedback_relation
                 if related:
                     related_layer = str(resolved_layer)
                     if feedback_relation == "cross_text_conflict" and related_layer == "memory":
@@ -497,11 +544,14 @@ class FileTraceAnalyzer:
                         )
                         user_requirements = str(item.get("user_requirements") or "").strip()
                         revision_direction = str(item.get("revision_direction") or item.get("feedback_direction") or item.get("content") or claim).strip()
+                        source_entry = files._feedback_source_entry(item, record_trace_id, ids)
+                        source_texts = [source_entry] if source_entry else []
                         files.write("insight", {
                             "id": candidate_id, "title": item.get("title", claim), "claim": claim,
-                            "content": files.render_text_feedback_content(user_requirements, revision_direction, user_inputs),
+                            "content": files.render_text_feedback_content(user_requirements, revision_direction, user_inputs, source_texts),
                             "user_requirements": user_requirements, "revision_direction": revision_direction,
                             "category": "reference", "domain": item.get("domain", "overall"), "kind": "text_feedback",
+                            "source_text": source_text, "source_texts": source_texts,
                             "artifact_path": str(item.get("artifact_path") or "").replace("\\", "/").lstrip("./"),
                             "artifact_revision_id": str(item.get("artifact_revision_id") or ""),
                             "anchor_excerpt": str(item.get("anchor_excerpt") or "")[:700],
@@ -533,11 +583,14 @@ class FileTraceAnalyzer:
 
                     user_requirements = str(item.get("user_requirements") or "").strip()
                     revision_direction = str(item.get("revision_direction") or item.get("feedback_direction") or item.get("content") or claim).strip()
+                    source_entry = files._feedback_source_entry(item, record_trace_id, ids)
+                    source_texts = [source_entry] if source_entry else []
                     files.write(layer, {
                         "title": item.get("title", claim), "claim": claim,
-                        "content": files.render_text_feedback_content(user_requirements, revision_direction, user_inputs),
+                        "content": files.render_text_feedback_content(user_requirements, revision_direction, user_inputs, source_texts),
                         "user_requirements": user_requirements, "revision_direction": revision_direction,
                         "category": "reference", "domain": item.get("domain", "overall"), "kind": "text_feedback",
+                        "source_text": source_text, "source_texts": source_texts,
 
                         "artifact_path": str(item.get("artifact_path") or "").replace("\\", "/").lstrip("./"),
                         "artifact_revision_id": str(item.get("artifact_revision_id") or ""),
@@ -1107,6 +1160,27 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
         payload = event.get("payload") or {}
         if event.get("event_type") == "user_answer":
             answers = payload.get("answers")
+            if isinstance(answers, list) and any(isinstance(answer, dict) for answer in answers):
+                lines = []
+                for answer in answers:
+                    if not isinstance(answer, dict):
+                        if str(answer).strip():
+                            lines.append(str(answer).strip())
+                        continue
+                    question = str(answer.get("question") or answer.get("header") or "").strip()
+                    if question:
+                        lines.append(f"问题：{question}")
+                    for option in answer.get("selected_options") or []:
+                        if not isinstance(option, dict):
+                            continue
+                        label = str(option.get("label") or "").strip()
+                        description = str(option.get("description") or "").strip()
+                        if label:
+                            lines.append(f"选择：{label}" + (f" — {description}" if description else ""))
+                    custom_input = str(answer.get("custom_input") or "").strip()
+                    if custom_input:
+                        lines.append(f"补充：{custom_input}")
+                return "\n".join(lines).strip()
             if isinstance(answers, dict):
                 return "\n".join(f"{key}: {value}" for key, value in answers.items()).strip()
             return str(answers or "").strip()
@@ -1190,9 +1264,10 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
     @staticmethod
     def _event_summary(event: dict) -> dict:
         payload = event.get("payload", {}) or {}
+        event_type = str(event.get("event_type", ""))
         result = {
             "event_id": event["event_id"], "trace_id": event.get("trace_id", ""),
-            "turn": event.get("trace_turn", 1), "type": event.get("event_type", ""),
+            "turn": event.get("trace_turn", 1), "type": event_type,
             "actor": event.get("actor", ""),
             "timestamp": event.get("created_at") or "1970-01-01T00:00:00Z",
         }
@@ -1200,7 +1275,10 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
             result["parent_event_id"] = event["parent_event_id"]
         content = payload.get("content") or payload.get("message")
         if content:
-            result["content"] = str(content)[:1200]
+            result["content"] = (
+                str(content) if event_type in {"user_message", "user_answer"}
+                else str(content)[:1200]
+            )
             # Historical imports may only retain the main agent's explicit
             # reviewer summary instead of the original reviewer sub-agent
             # event.  Preserve the same extraction semantics for that shape.

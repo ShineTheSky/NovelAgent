@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from novelagent.core.session import InternalRequest, ResponseChunk, Session
 from novelagent.tools.base import ToolContext, ToolResult, PermissionResult
+from novelagent.tools.ask_user_question import resolve_question_answers
 
 from novelagent.context.message_manager import Message, MessageManager
 from novelagent.context.compression import build_cumulative_compression
@@ -550,18 +551,24 @@ class AgentLoop:
                     session.question_answers = None
                     await session.question_event.wait()
                     answers = session.question_answers or []
+                    resolved_answers = resolve_question_answers(params.get("questions", []), answers)
                     ctx.messages.append(Message(
                         role="tool_result",
-                        content=json.dumps(answers, ensure_ascii=False),
+                        content=json.dumps(resolved_answers, ensure_ascii=False),
                         tool_call_id=getattr(tc, 'tool_call_id', '') or f"call_{turn}",
                     ))
                     yield ResponseChunk(type="tool_result", data={
                         "tool": tool_name,
                         "success": True,
-                        "data": json.dumps(answers, ensure_ascii=False),
+                        "data": json.dumps(resolved_answers, ensure_ascii=False),
                     })
-                    await record("user_answer", "user", {"answers": answers}, tool_event_id)
-                    await record("tool_result", "tool", {"tool": tool_name, "success": True, "data": answers}, tool_event_id)
+                    await record("user_answer", "user", {
+                        "answers": resolved_answers,
+                        "raw_answers": answers,
+                    }, tool_event_id)
+                    await record("tool_result", "tool", {
+                        "tool": tool_name, "success": True, "data": resolved_answers,
+                    }, tool_event_id)
                     feedback_trace_requested = True
                     continue
 

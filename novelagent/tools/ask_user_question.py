@@ -3,6 +3,49 @@
 from novelagent.tools.base import ToolProtocol, ToolResult, ToolContext, PermissionResult
 
 
+def resolve_question_answers(questions: list, answers: list) -> list[dict]:
+    """Join UI answer labels back to their full option descriptions.
+
+    The browser intentionally posts a compact ``string | string[]`` value for
+    each question.  Agent tool results and Trace evidence must be self-contained,
+    so resolve those values while the original tool arguments are still present.
+    """
+    resolved = []
+    for index, raw_question in enumerate(questions or []):
+        question = raw_question if isinstance(raw_question, dict) else {}
+        raw_answer = answers[index] if index < len(answers or []) else ""
+        values = raw_answer if isinstance(raw_answer, list) else [raw_answer]
+        values = [str(value).strip() for value in values if str(value).strip()]
+
+        options = [option for option in question.get("options", []) if isinstance(option, dict)]
+        options_by_label = {
+            str(option.get("label") or "").strip(): option
+            for option in options
+            if str(option.get("label") or "").strip()
+        }
+        selected_options = []
+        custom_inputs = []
+        for value in values:
+            option = options_by_label.get(value)
+            if option is None:
+                custom_inputs.append(value)
+                continue
+            selected_options.append({
+                "label": value,
+                "description": str(option.get("description") or "").strip(),
+            })
+
+        resolved.append({
+            "question_index": index,
+            "header": str(question.get("header") or "").strip(),
+            "question": str(question.get("question") or "").strip(),
+            "multi_select": bool(question.get("multiSelect", False)),
+            "selected_options": selected_options,
+            "custom_input": "\n".join(custom_inputs),
+        })
+    return resolved
+
+
 class AskUserQuestionTool(ToolProtocol):
     name = "AskUserQuestion"
     description = (

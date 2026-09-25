@@ -93,8 +93,41 @@ def test_same_anchor_feedback_refreshes_without_weight(tmp_path):
     assert saved["revision_direction"] == "压缩解释，通过更长的动作停顿表现压力。"
     assert "## 用户要求" in saved["content"]
     assert "## 修改方向" in saved["content"]
+    assert "## 用户提供的原文" in saved["content"]
+    assert "林深没有回答，只是握紧了杯子。" in saved["content"]
     assert "这句话太直白，压着一点写。" in saved["content"]
     assert "这句还是太直白，压着一点写。" in saved["content"]
+
+
+def test_feedback_keeps_full_source_text_versions_and_matches_each_version(tmp_path):
+    store = FileLifecycleStore(str(tmp_path), "project-a")
+    first_text = "林深没有回答。\n\n他只是握紧杯子，指节一点点泛白。"
+    revised_text = "林深把话咽了回去。\n\n杯壁凉得扎手，他仍没有松开。"
+    original = store.write("memory", _feedback(
+        source_text=first_text,
+        anchor_excerpt=first_text,
+        anchor_sha256="",
+    ))
+
+    merged = store.merge_text_feedback(original, _feedback(
+        source_text=revised_text,
+        anchor_excerpt=revised_text,
+        anchor_sha256="",
+        artifact_revision_id="rev_b",
+        user_requirements="保持克制，并让动作和体感连贯。",
+        revision_direction="减少解释，用连续动作承接情绪。",
+    ), "trace_b", ["event_b"], [{
+        "trace_id": "trace_b", "event_id": "event_b",
+        "content": f"{revised_text}这里还是不够流畅。",
+    }])
+    saved = store.write("memory", merged)
+
+    assert [row["text"] for row in saved["source_texts"]] == [first_text, revised_text]
+    assert first_text in saved["content"]
+    assert revised_text in saved["content"]
+    assert store.find_text_feedback_by_source_text(first_text)[1]["id"] == saved["id"]
+    assert store.find_text_feedback_by_source_text("林深没有回答。 他只是握紧杯子，指节一点点泛白。")[1]["id"] == saved["id"]
+    assert store.find_text_feedback_by_source_text(revised_text)[1]["id"] == saved["id"]
 
 
 def test_manual_downgrade_blocks_auto_promotion_until_reconfirmed(tmp_path):
@@ -229,6 +262,25 @@ def test_checkpoint_reason_is_visible_to_trace_memory_extraction():
 
     assert summary["params"]["reason"] == "用户指出具体正文描写不够生动。"
     assert reasons == [{"event_id": "event-checkpoint", "reason": "用户指出具体正文描写不够生动。"}]
+
+
+def test_resolved_question_answer_exposes_option_description_to_trace_extraction():
+    content = FileTraceAnalyzer._event_user_content({
+        "event_type": "user_answer",
+        "payload": {"answers": [{
+            "header": "设定处理",
+            "question": "保留设定吗？",
+            "selected_options": [{
+                "label": "保留",
+                "description": "保留现有设定，并作为后续写作约束。",
+            }],
+            "custom_input": "冲突时先询问",
+        }]},
+    })
+
+    assert "问题：保留设定吗？" in content
+    assert "选择：保留 — 保留现有设定，并作为后续写作约束。" in content
+    assert "补充：冲突时先询问" in content
 
 
 def test_feedback_keeps_multiple_text_anchors_for_targeted_reading(tmp_path):
@@ -626,6 +678,66 @@ class _TwoStageMergeLLM:
         }, ensure_ascii=False))
 
 
+class _ExactSourceTextLLM:
+    source_text = "林深没有回答，只是握紧了杯子。"
+
+    async def chat(self, **kwargs):
+        if kwargs["tag"] == ":trace-fork/trajectory/fallback":
+            yield SimpleNamespace(type="text_delta", content=_trajectory_response(kwargs))
+            return
+        if kwargs["tag"] == ":trace-fork/reconcile":
+            yield SimpleNamespace(type="text_delta", content=json.dumps({"decisions": [{
+                "candidate_index": 0, "relation": "new", "reason": "模型未识别为旧记录",
+            }]}, ensure_ascii=False))
+            return
+        yield SimpleNamespace(type="text_delta", content=json.dumps({
+            "window_summary": "用户继续修改同一段文字。",
+            "items": [{
+                "event_id": "event-user", "type": "feedback",
+                "summary": "继续减少直白解释", "confidence": 0.95,
+            }],
+            "records": [{
+                "layer": "memory", "category": "reference", "domain": "writing",
+                "kind": "text_feedback", "title": "继续减少直白解释", "claim": "继续减少直白解释",
+                "content": "继续减少直白解释。", "source_event_ids": ["event-user"],
+                "signal": "strong", "relation": "new", "confidence": 0.95,
+                "source_text": self.source_text,
+                "anchor_excerpt": self.source_text,
+                "user_requirements": "保持克制，避免直接解释人物情绪。",
+                "revision_direction": "继续用动作表现压力。",
+                "feedback_direction": "继续用动作表现压力。",
+                "feedback_relation": "same_anchor",
+            }],
+        }, ensure_ascii=False))
+
+
+class _ExactSourceTextTraceStore(_FallbackTraceStore):
+    async def list_events(self, trace_id, limit):
+        return [{
+            "event_id": "event-user", "trace_id": trace_id, "sequence_no": 1,
+            "event_type": "user_message", "payload": {
+                "turn": 1,
+                "content": "林深没有回答，只是握紧了杯子。这里还是太直白。",
+            },
+        }]
+
+
+def test_exact_user_source_text_forces_feedback_into_existing_memory(tmp_path):
+    files = FileLifecycleStore(str(tmp_path), "project-a")
+    existing = files.write("memory", _feedback())
+    analyzer = FileTraceAnalyzer(
+        _ExactSourceTextLLM(), str(tmp_path), _ExactSourceTextTraceStore(),
+    )
+
+    asyncio.run(analyzer.analyze("trace-b", "project-a"))
+
+    memories = files.list("memory")
+    assert len(memories) == 1
+    assert memories[0]["id"] == existing["id"]
+    assert memories[0]["feedback_count"] == 2
+    assert len(memories[0]["user_inputs"]) == 2
+
+
 def test_second_stage_reconciles_new_candidate_into_existing_insight(tmp_path):
     files = FileLifecycleStore(str(tmp_path), "project-a")
     existing = files.write("insight", {
@@ -700,6 +812,8 @@ def test_trace_analysis_routes_scenarios_and_persists_semantic_metadata(tmp_path
     extraction_prompt = extraction_call["messages"][-1]["content"]
     assert 'scenario="user_directive"' in extraction_prompt
     assert 'scenario="story_knowledge"' in extraction_prompt
+    assert '"source_text":"用户本轮提供并要求评价或修改的原文' in extraction_prompt
+    assert "必须比较 Existing text feedback 中全部 source_texts" in extraction_prompt
 
     memories = FileLifecycleStore(str(tmp_path), "project-a").list("memory")
     assert len(memories) == 1
