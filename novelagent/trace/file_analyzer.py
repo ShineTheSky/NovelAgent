@@ -9,6 +9,7 @@ from novelagent.core.llm_turn import build_assistant_message
 from novelagent.trace.file_lifecycle import FileLifecycleStore, PATTERN_PROMOTION_WEIGHT
 from novelagent.trace.store import TraceStore
 from novelagent.trace.agent_run import AgentRunTrace
+from novelagent.trace.memory_bank import MemoryBankStore
 from novelagent.trace.normalized_trajectory import build_trajectory_prompt, validate_trajectory_payload
 from novelagent.trace.semantic_extraction import (
     build_semantic_extraction_section,
@@ -146,6 +147,10 @@ class FileTraceAnalyzer:
         events = TraceStore.annotate_event_turns(events)
         source_trace_ids = list(dict.fromkeys(source_trace_ids or [trace_id]))
         event_trace_ids = {str(event.get("event_id")): str(event.get("trace_id") or trace_id) for event in events}
+        bank = MemoryBankStore(self.workspace_dir, project_id)
+        bank.retain_artifact_revisions(events)
+        related_bank_items = bank.related(events)
+        bank_context = bank.prompt_view(related_bank_items)
         if self.embedding_gate:
             inputs = [self._event_user_content(e) for e in events if e["event_type"] in {"user_message", "user_answer"}]
             if (await self.embedding_gate.evaluate(inputs)).skip and not require_summary:
@@ -275,7 +280,7 @@ class FileTraceAnalyzer:
             {"role": "user", "content": trajectory_context_prompt},
             {"role": "assistant", "content": trajectory_json},
         ]
-        prompt = f'''[后台 Trace 分支命令]\n你收到的不是完整 Trace，而是每条 Trace 中与本次分析锚点临近的少量 ReAct turn。不要回复用户、不要续写，只分析原始 Trace：{json.dumps(source_trace_ids, ensure_ascii=False)}。每个 Trace event 都携带 trace_id 和 turn；记录必须通过 source_event_ids 保留真实来源，程序会据此把记录精确关联到 trace_id + turn。\n只输出 JSON：{{"items":[{{"event_id":"","type":"error|correction|confirmation|feedback","summary":"","confidence":0.5}}],"records":[{{"layer":"insight|memory","category":"user|project|reference","domain":"writing|outline|overall","title":"不超过40字的简要标题","content":"具体事实、约束、适用条件和必要背景","claim":"与 title 一致","source_event_ids":[""],"signal":"weak|strong","relation":"new|support|append","related_id":"","confidence":0.5,"kind":"text_feedback 时填写","artifact_path":"可从工具事件推断时填写","artifact_revision_id":"","source_text":"用户本轮提供并要求评价或修改的原文，逐字完整复制；未提供则为空字符串","anchor_excerpt":"source_text 的前700字或工具事件提供的锚点","anchor_sha256":"工具事件提供时填写","user_requirements":"综合历次反馈后，用户希望该段达到什么效果以及明确禁止什么","revision_direction":"后续应如何修改，包括措辞、情节、人物表现和节奏等方向","feedback_direction":"兼容字段，填写当前建议的修改方向","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict","explicit_reconfirmation":false}}]}}。\n不记录：普通闲聊、纯工具调用、一次性命令，例如“继续写作”“读取文件”。\nInsight 是从 Trace 得出的、尚不足以长期生效的低置信观察或假设，例如用户单次说“这章对话节奏有点慢”；它保留来源，等待后续相似反馈支持。\nMemory 是明确、可复用的长期偏好、修正或约束，例如“以后打斗必须突出空间关系”，或“把林深的初始性格改为恐惧回避型”；这类记录 layer=memory、signal=strong。\n凡是由用户 correction 事件得出的记录，source_event_ids 必须包含对应 user_message 或 user_answer 的 event_id，且 layer=memory、signal=strong；不要用后续 assistant_turn 替代该证据。support 必须引用 Existing 的 memory id。\n\n文本修改反馈的特殊规则：当用户粘贴、引用或明确评价某段小说/大纲原文时，写 category=reference、kind=text_feedback，并从工具事件补足 artifact_path、修订和锚点。source_text 必须把用户提供的被评价原文逐字完整复制，不包含其后的修改意见；不能概括、改写或只保留开头。用户没有提供原文时 source_text 留空。程序会把 source_text 的每个版本和完整用户输入一起落盘。判断是否命中既有反馈时，必须比较 Existing text feedback 中全部 source_texts；同一原文或其后续改写版本使用 relation=append、feedback_relation=same_anchor，累计到同一条记忆。user_requirements 必须综合历次反馈，提炼用户希望该段达到的效果和明确禁止项；revision_direction 必须总结后续具体修改方向，而不是生成原文摘要。与同一锚点/同一段原文的重复意见只追加历史并更新这两个字段，绝不加分。仅当是不同但相似的文本，且用户修改方向能相互验证时，relation=support、feedback_relation=cross_text_support，才允许为 Existing text_feedback 加分。不同文本的相似方向存在冲突时用 append、feedback_relation=cross_text_conflict。是否同锚点、是否跨文本可迁移由你根据原文、用户引用和 Existing 自行判断。\nTrace events:{json.dumps(event_view, ensure_ascii=False)}\nExisting:{json.dumps(context, ensure_ascii=False)}\nExisting text feedback (full):{json.dumps(feedback_context, ensure_ascii=False)}'''
+        prompt = f'''[后台 Trace 分支命令]\n你收到的不是完整 Trace，而是每条 Trace 中与本次分析锚点临近的少量 ReAct turn。不要回复用户、不要续写，只分析原始 Trace：{json.dumps(source_trace_ids, ensure_ascii=False)}。每个 Trace event 都携带 trace_id 和 turn；记录必须通过 source_event_ids 保留真实来源，程序会据此把记录精确关联到 trace_id + turn。\n只输出 JSON：{{"items":[{{"event_id":"","type":"error|correction|confirmation|feedback","summary":"","confidence":0.5}}],"records":[{{"layer":"insight|memory","category":"user|project|reference","domain":"writing|outline|overall","title":"不超过40字的简要标题","content":"具体事实、约束、适用条件和必要背景","claim":"与 title 一致","source_event_ids":[""],"source_bank_item_ids":["命中的 Bank 节点 id"],"signal":"weak|strong","relation":"new|support|append","related_id":"","confidence":0.5,"kind":"text_feedback 时填写","artifact_path":"可从工具事件或 Bank 推断时填写","artifact_revision_id":"","source_text":"用户本轮提供并要求评价或修改的原文，逐字完整复制；未提供则为空字符串","anchor_excerpt":"source_text 的前700字或工具事件提供的锚点","anchor_sha256":"工具事件提供时填写","user_requirements":"综合历次反馈后，用户希望该段达到什么效果以及明确禁止什么","revision_direction":"后续应如何修改，包括措辞、情节、人物表现和节奏等方向","feedback_direction":"兼容字段，填写当前建议的修改方向","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict","explicit_reconfirmation":false}}]}}。\n不记录：普通闲聊、纯工具调用、一次性命令，例如“继续写作”“读取文件”。\nInsight 是从 Trace 得出的、尚不足以长期生效的低置信观察或假设，例如用户单次说“这章对话节奏有点慢”；它保留来源，等待后续相似反馈支持。\nMemory 是明确、可复用的长期偏好、修正或约束，例如“以后打斗必须突出空间关系”，或“把林深的初始性格改为恐惧回避型”；这类记录 layer=memory、signal=strong。\n凡是由用户 correction 事件得出的记录，source_event_ids 必须包含对应 user_message 或 user_answer 的 event_id，且 layer=memory、signal=strong；不要用后续 assistant_turn 替代该证据。support 必须引用 Existing 的 memory id。\n\nBank evidence 是其他 Trace 中选择性保留的证据节点，不是已经确认的 Memory。artifact_revision 节点可用于把当前用户反馈关联到先前书写 Agent 的任务、工件版本和修改片段；只有文件、修订、原文锚点或明确的“刚才那段”等上下文足以支持时才建立联系。命中时把对应 bank_item_id 写入 source_bank_item_ids；不得把 Bank 中的 Agent 输出当成用户已接受的偏好或设定。\n\n文本修改反馈的特殊规则：当用户粘贴、引用或明确评价某段小说/大纲原文时，写 category=reference、kind=text_feedback，并从工具事件或 Bank evidence 补足 artifact_path、修订和锚点。source_text 必须把用户提供的被评价原文逐字完整复制，不包含其后的修改意见；不能概括、改写或只保留开头。用户没有提供原文时 source_text 留空。程序会把 source_text 的每个版本和完整用户输入一起落盘。判断是否命中既有反馈时，必须比较 Existing text feedback 中全部 source_texts；同一原文或其后续改写版本使用 relation=append、feedback_relation=same_anchor，累计到同一条记忆。user_requirements 必须综合历次反馈，提炼用户希望该段达到的效果和明确禁止项；revision_direction 必须总结后续具体修改方向，而不是生成原文摘要。与同一锚点/同一段原文的重复意见只追加历史并更新这两个字段，绝不加分。仅当是不同但相似的文本，且用户修改方向能相互验证时，relation=support、feedback_relation=cross_text_support，才允许为 Existing text_feedback 加分。不同文本的相似方向存在冲突时用 append、feedback_relation=cross_text_conflict。是否同锚点、是否跨文本可迁移由你根据原文、用户引用、Bank evidence 和 Existing 自行判断。\nTrace events:{json.dumps(event_view, ensure_ascii=False)}\nBank evidence (cross-Trace, selected):{json.dumps(bank_context, ensure_ascii=False)}\nExisting:{json.dumps(context, ensure_ascii=False)}\nExisting text feedback (full):{json.dumps(feedback_context, ensure_ascii=False)}'''
 
         prompt = prompt.replace(
             '只输出 JSON：{"items":',
@@ -288,7 +293,7 @@ class FileTraceAnalyzer:
         prompt += "\n自动审阅事件（workflow=auto_review、preset=reviewer）的 result 是审阅报告。报告中明确指出、并且未来写作可复用地检查或避免的写作缺陷，使用 category=project、domain=writing、kind=review_issue。单次审阅发现只能新建 layer=insight、signal=weak；同一种底层错误在不同 Trace 或不同正文修订中再次出现时，必须 relation=support 并引用 Existing 中对应的 review_issue。不要记录一次性错字、仅适用于当前情节的修改项、审阅报告中的肯定项，也不要把 polisher 的修改说明当作新洞察。content 应写清错误表现、适用条件、判断方法和改进方向。程序会在重复洞察达到阈值后自动晋级为 Memory，再继续积累为 Pattern。"
         prompt += "\n决定写入前必须先根据 Existing 选择候选：Insight 只能与 Insight 合并，低幅加分；Memory 可以与 Memory 或 Insight 合并，高幅加分。Memory 候选还必须查看 Existing 中的 Pattern：若语义相同，relation=support、related_layer=pattern，直接为该 Pattern 加分，不重复新建 Pattern。records 可额外返回 related_layer=insight|memory|pattern。被容量挤出的旧 Memory 在 Insight 中保留 origin_memory_id，新的 Memory 可以将其重新提升。"
         prompt += "\npromotion_status=manual_review 表示用户曾手动降级并持有不同意见。后续证据仍可追加，但程序禁止自动晋级。只有用户本轮明确重新确认该记录可作为更高等级规则时，才设置 explicit_reconfirmation=true；不得根据普通支持或相似表述自行解除。"
-        prompt += "\n每条 records 还必须提供 title 和 content：title 是不超过 40 字、可用于索引和列表的简要标题；content 是可独立理解的具体事实、约束、适用条件和必要背景。claim 保持与 title 一致，用于兼容旧记录。text_feedback 必须提供 user_requirements 和 revision_direction；程序会保存 source_event_ids 对应的完整用户原始输入并将三部分一起落盘。若局部 turn 不足，可调用一次 GetTraceContext，按 start_turn/end_turn 补查当前 Session 内任意 Trace 的必要区间；若必须核对工件原文或修订号，可调用一次 Read 读取当前项目文件。不要为了保险读取整条 Trace 或无关文件。获得工具结果后必须输出完整 JSON。"
+        prompt += "\n每条 records 还必须提供 title 和 content：title 是不超过 40 字、可用于索引和列表的简要标题；content 是可独立理解的具体事实、约束、适用条件和必要背景。claim 保持与 title 一致，用于兼容旧记录。text_feedback 必须提供 user_requirements 和 revision_direction；程序会保存 source_event_ids 对应的完整用户原始输入并将三部分一起落盘。source_bank_item_ids 只能从给出的 Bank evidence 复制；后续核查与合并阶段必须原样保留。若局部 turn 不足，可调用一次 GetTraceContext，按 start_turn/end_turn 补查当前 Session 内任意 Trace 的必要区间；若必须核对工件原文或修订号，可调用一次 Read 读取当前项目文件。不要为了保险读取整条 Trace 或无关文件。获得工具结果后必须输出完整 JSON。"
         prompt += f"\n\n{semantic_extraction_section}"
 
         trace_event_block = f"Trace events:{json.dumps(event_view, ensure_ascii=False)}"
@@ -458,6 +463,10 @@ class FileTraceAnalyzer:
         }
         evidence_events = [event for event in events if str(event.get("event_id")) in valid]
         files = FileLifecycleStore(self.workspace_dir, project_id)
+        bank = MemoryBankStore(self.workspace_dir, project_id)
+        bank.retain_semantic_records(
+            data.get("records", []), evidence_events, trace_id, related_bank_items=bank.list(),
+        )
         classifications = []
         for raw_item in data.get("items", []):
             if not isinstance(raw_item, dict) or raw_item.get("type") not in {"error", "correction", "confirmation", "feedback"}:
@@ -571,7 +580,12 @@ class FileTraceAnalyzer:
                         bonus = 35 if item.get("signal") == "strong" else 15
                         supported, _ = files.add_support(related, record_trace_ids, ids, bonus, item)
                     merged = files.merge_text_feedback(supported, item, record_trace_id, ids, user_inputs)
-                    merged.update(self._semantic_metadata(item))
+                    semantic_metadata = self._semantic_metadata(item)
+                    if semantic_metadata.get("bank_item_ids"):
+                        semantic_metadata["bank_item_ids"] = list(dict.fromkeys([
+                            *merged.get("bank_item_ids", []), *semantic_metadata["bank_item_ids"],
+                        ]))
+                    merged.update(semantic_metadata)
                     merged["trace_ids"] = list(dict.fromkeys([*merged.get("trace_ids", []), *record_trace_ids]))
                     if item.get("explicit_reconfirmation") is True:
                         merged = files.confirm_auto_promotion(merged)
@@ -636,7 +650,10 @@ class FileTraceAnalyzer:
                 related["trace_ids"] = list(dict.fromkeys([*related.get("trace_ids", []), *record_trace_ids]))
                 related["trace_refs"] = self._merge_trace_refs(related.get("trace_refs", []), trace_refs)
                 for key, value in self._semantic_metadata(item).items():
-                    related.setdefault(key, value)
+                    if key == "bank_item_ids":
+                        related[key] = list(dict.fromkeys([*related.get(key, []), *value]))
+                    else:
+                        related.setdefault(key, value)
                 if relation == "append":
                     history = list(related.get("relation_history") or [])
                     history.append({
@@ -692,6 +709,10 @@ class FileTraceAnalyzer:
             result["semantic"] = item["semantic"]
         if item.get("extraction_profile"):
             result["extraction_profile"] = str(item["extraction_profile"])
+        if isinstance(item.get("bank_item_ids"), list):
+            result["bank_item_ids"] = list(dict.fromkeys(
+                str(value) for value in item["bank_item_ids"] if value
+            ))
         return result
 
     async def analyze_window(self, window_id: str, project_id: str, branch_messages=None, _tools=None) -> None:
@@ -727,7 +748,15 @@ class FileTraceAnalyzer:
                         allowed_source_event_ids=prepared.get("allowed_source_event_ids", []),
                     )
                 else:
-                    events = self._select_analysis_events(await self.trace_store.list_trace_window_events(window_id))
+                    window_events = await self.trace_store.list_trace_window_events(window_id)
+                    # Artifact revisions may sit outside the bounded turns sent to
+                    # the analyzer.  Retain them first so later user feedback can
+                    # reconnect to the responsible writing run across Trace/session
+                    # boundaries.
+                    MemoryBankStore(self.workspace_dir, project_id).retain_artifact_revisions(
+                        TraceStore.annotate_event_turns(window_events)
+                    )
+                    events = self._select_analysis_events(window_events)
                     messages = branch_messages if branch_messages is not None else window.get("messages", [])
                     result = await self.analyze(
                         source_trace_ids[-1], project_id, messages, _tools,

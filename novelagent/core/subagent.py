@@ -262,4 +262,5 @@ class SubAgentRunner:
         yield ResponseChunk(type="subagent_done", data={
             **src, "result": result_text, "empty_result": empty_result,
             "revision_events": revision_events,
+            "agent_trace_id": agent_trace.trace_id if agent_trace else "",
         })

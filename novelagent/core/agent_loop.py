@@ -20,6 +20,7 @@ from novelagent.trace.recorder import TraceRecorder, sanitize_payload
 from novelagent.trace.store import TraceStore
 from novelagent.trace.agent_bad_cases import AgentBadCaseRecorder
 from novelagent.trace.stream_compaction import TraceStreamBuffer
+from novelagent.trace.memory_bank import MemoryBankStore
 from novelagent.memory.memory_manager import MemoryManager
 from novelagent.core.review_workflow import ReviewPolishWorkflow
 
@@ -620,6 +621,7 @@ class AgentLoop:
                     subagent_result_text = ""
                     subagent_failed = False
                     writer_revision_events = []
+                    subagent_agent_trace_id = ""
                     subagent_run_id = uuid.uuid4().hex
                     subagent_trace_stream = TraceStreamBuffer(record)
                     async for sub_chunk in self.subagent_runner.spawn_and_run(
@@ -645,6 +647,7 @@ class AgentLoop:
                         if sub_chunk.type == "subagent_done":
                             subagent_result_text = sub_chunk.data.get("result", "")
                             writer_revision_events = sub_chunk.data.get("revision_events", [])
+                            subagent_agent_trace_id = str(sub_chunk.data.get("agent_trace_id") or "")
                             if sub_chunk.data.get("empty_result"):
                                 subagent_failed = True
                                 subagent_result_text = "Error: 子 Agent 未返回有效内容"
@@ -658,6 +661,35 @@ class AgentLoop:
                         else:
                             yield sub_chunk  # 转发子Agent的所有事件到前端
                     await subagent_trace_stream.flush()
+                    if writer_revision_events:
+                        # Retain the artifact evidence immediately.  Waiting for
+                        # the periodic Trace window would leave a gap when the
+                        # user criticizes this writing in the very next turn.
+                        try:
+                            MemoryBankStore(self.working_dir, session.project_id).retain_artifact_revisions([
+                                {
+                                    "event_id": tool_event_id, "trace_id": trace_id,
+                                    "event_type": "subagent_subagent_start",
+                                    "actor": f"subagent:{preset}", "trace_turn": turn,
+                                    "payload": {
+                                        "run_id": subagent_run_id, "preset": preset,
+                                        "task_prompt": task,
+                                    },
+                                },
+                                {
+                                    "event_id": tool_event_id, "trace_id": trace_id,
+                                    "event_type": "subagent_subagent_done",
+                                    "actor": f"subagent:{preset}", "trace_turn": turn,
+                                    "payload": {
+                                        "run_id": subagent_run_id, "preset": preset,
+                                        "result": subagent_result_text,
+                                        "revision_events": writer_revision_events,
+                                        "agent_trace_id": subagent_agent_trace_id,
+                                    },
+                                },
+                            ])
+                        except (OSError, ValueError) as exc:
+                            print(f"[memory-bank] retain artifact revision failed: {exc}", flush=True)
 
                     # Writer commits are the only automatic trigger.  Polisher commits do not recurse.
                     workflow_summaries = []
