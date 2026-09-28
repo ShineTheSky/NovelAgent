@@ -99,11 +99,14 @@ class RevisionManager:
 
     async def commit(
         self, path: Path, content: str, expected_revision_id: str | None,
-        *, actor: str, operation_id: str,
+        *, actor: str, operation_id: str, history_store=None,
+        history_evidence: dict | None = None, dependencies: dict[str, str] | None = None,
     ) -> RevisionInfo:
         key = str(path.resolve()).lower()
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
+            if history_store is not None:
+                history_store.recover_file(path)
             existing = path.read_text(encoding="utf-8") if path.exists() else None
             current = self.parse(existing) if existing is not None else None
             expected = (expected_revision_id or "").strip()
@@ -112,7 +115,14 @@ class RevisionManager:
             if current is None and expected not in {"", "new"}:
                 raise RevisionConflict(RevisionInfo("new", "", {}, legacy=False))
 
+            if current is not None and history_store is not None:
+                history_store.ensure_baseline(path)
+
             supplied_metadata, body = self._body_from_candidate(content)
+            if current and body == current.body and all(
+                current.metadata.get(key) == value for key, value in supplied_metadata.items()
+            ):
+                return current
             metadata = dict(current.metadata) if current and not current.legacy else {}
             metadata.update(supplied_metadata)
             revision_id = self._new_revision_id(actor)
@@ -130,6 +140,15 @@ class RevisionManager:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
                     handle.write(rendered)
+                if history_store is not None:
+                    history_store.record_revision(
+                        path, revision_id, current.revision_id if current else None,
+                        body, rendered,
+                        previous_body=current.body if current else "",
+                        previous_rendered=existing or "", actor=actor,
+                        operation_id=operation_id,
+                        evidence=history_evidence, dependencies=dependencies,
+                    )
                 os.replace(temporary, path)
             finally:
                 if os.path.exists(temporary):

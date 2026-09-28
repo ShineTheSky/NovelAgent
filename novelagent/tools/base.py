@@ -36,6 +36,7 @@ class ToolContext:
     revision_events: list[dict] = field(default_factory=list)
     permission_decision: str = ""
     source_trace_id: str = ""
+    history_evidence: dict = field(default_factory=dict)
 
     def is_previously_allowed(self, key: str) -> bool:
         return key in self.previously_allowed

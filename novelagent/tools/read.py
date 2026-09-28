@@ -19,12 +19,25 @@ class ReadTool(ToolProtocol):
 
     async def execute(self, params: dict, context: ToolContext) -> ToolResult:
         from pathlib import Path
+        from novelagent.history import DocumentHistoryStore
         from novelagent.versioning import revision_manager
         file_path = Path(context.working_dir) / params["path"]
+        managed = revision_manager.is_managed(file_path, context.working_dir)
+        history = DocumentHistoryStore(context.working_dir) if managed else None
+        if history:
+            try:
+                history.recover_file(file_path)
+            except Exception as exc:
+                return ToolResult(success=False, error=str(exc))
         if not file_path.exists():
             return ToolResult(success=False, error=f"文件不存在: {params['path']}")
         if not file_path.is_file():
             return ToolResult(success=False, error=f"不是文件: {params['path']}")
+        if history:
+            try:
+                history.ensure_baseline(file_path)
+            except Exception as exc:
+                return ToolResult(success=False, error=str(exc))
 
         tail_lines = params.get("tail_lines")
         if tail_lines is not None and ("offset" in params or "limit" in params):
@@ -38,6 +51,11 @@ class ReadTool(ToolProtocol):
         try:
             with open(file_path, encoding="utf-8") as f:
                 lines = f.readlines()
+            if managed:
+                info = revision_manager.parse("".join(lines))
+                context.history_evidence.setdefault("dependencies", {})[
+                    params["path"].replace("\\", "/")
+                ] = info.revision_id
             total_lines = len(lines)
             if tail_lines is not None:
                 start = max(0, total_lines - tail_lines)
@@ -48,8 +66,7 @@ class ReadTool(ToolProtocol):
                 return ToolResult(success=True, data=f"[文件共{total_lines}行，offset={offset}超出范围]")
             selected = lines[offset - 1 : offset - 1 + limit]
             result = "".join(selected)
-            if offset == 1 and revision_manager.is_managed(file_path, context.working_dir):
-                info = revision_manager.parse("".join(lines))
+            if offset == 1 and managed:
                 result = f"[当前修订: {info.revision_id}]\n" + result
             if offset + limit <= total_lines:
                 result += f"\n[已显示第{offset}-{offset + len(selected) - 1}行，共{total_lines}行]"

@@ -9,7 +9,7 @@ from novelagent.core.llm_turn import build_assistant_message
 from novelagent.trace.file_lifecycle import FileLifecycleStore, PATTERN_PROMOTION_WEIGHT
 from novelagent.trace.store import TraceStore
 from novelagent.trace.agent_run import AgentRunTrace
-from novelagent.trace.memory_bank import MemoryBankStore
+from novelagent.history import DocumentHistoryStore
 from novelagent.trace.normalized_trajectory import build_trajectory_prompt, validate_trajectory_payload
 from novelagent.trace.semantic_extraction import (
     build_semantic_extraction_section,
@@ -18,6 +18,7 @@ from novelagent.trace.semantic_extraction import (
 )
 from novelagent.tools.base import PermissionResult, ToolContext, ToolResult
 from novelagent.tools.get_trace_context import GetTraceContextTool
+from novelagent.tools.get_history_revision import GetHistoryRevisionTool
 from novelagent.tools.read import ReadTool
 from novelagent.tools.search_rag import SearchRagTool
 
@@ -32,6 +33,7 @@ class FileTraceAnalyzer:
         self.llm, self.workspace_dir, self.trace_store, self.embedding_gate = llm_client, workspace_dir, trace_store, embedding_gate
         self.rag_tool = SearchRagTool(rag_store) if rag_store else None
         self.read_tool = ReadTool()
+        self.history_tool = GetHistoryRevisionTool()
         self.bad_cases = bad_case_recorder
         self.background_tasks = background_tasks
         self._project_locks: dict[str, asyncio.Lock] = {}
@@ -147,10 +149,9 @@ class FileTraceAnalyzer:
         events = TraceStore.annotate_event_turns(events)
         source_trace_ids = list(dict.fromkeys(source_trace_ids or [trace_id]))
         event_trace_ids = {str(event.get("event_id")): str(event.get("trace_id") or trace_id) for event in events}
-        bank = MemoryBankStore(self.workspace_dir, project_id)
-        bank.retain_artifact_revisions(events)
-        related_bank_items = bank.related(events)
-        bank_context = bank.prompt_view(related_bank_items)
+        history = DocumentHistoryStore(Path(self.workspace_dir) / project_id)
+        related_history = history.related_to_events(events)
+        bank_context = history.prompt_view(related_history)
         if self.embedding_gate:
             inputs = [self._event_user_content(e) for e in events if e["event_type"] in {"user_message", "user_answer"}]
             if (await self.embedding_gate.evaluate(inputs)).skip and not require_summary:
@@ -169,7 +170,7 @@ class FileTraceAnalyzer:
             *(("memory", record) for record in records_by_layer["memory"][:80]),
             *(("pattern", record) for record in records_by_layer["pattern"][:40]),
         ]
-        context = [{"id": x["id"], "title": x.get("title", x.get("claim", "")), "layer": layer, "category": x.get("category", "project"), "domain": x.get("domain", "overall"), "kind": x.get("kind", ""), "file_path": x.get("file_path", ""), "weight": x.get("weight", 0), "support_count": x.get("support_count", 1), "promotion_status": x.get("promotion_status", "auto"), "downgraded_from": x.get("downgraded_from", "")} for layer, x in context_records]
+        context = [{"id": x["id"], "title": x.get("title", x.get("claim", "")), "layer": layer, "category": x.get("category", "project"), "domain": x.get("domain", "overall"), "kind": x.get("kind", ""), "file_path": x.get("file_path", ""), "weight": x.get("weight", 0), "support_count": x.get("support_count", 1), "promotion_status": x.get("promotion_status", "auto"), "downgraded_from": x.get("downgraded_from", ""), "semantic_evidence": x.get("semantic_evidence", []), "history_revision_ids": x.get("history_revision_ids", [])} for layer, x in context_records]
         def feedback_source_context(record: dict) -> list[dict]:
             rows = [row for row in (record.get("source_texts") or []) if isinstance(row, dict)]
             if not rows:
@@ -294,6 +295,19 @@ class FileTraceAnalyzer:
         prompt += "\n决定写入前必须先根据 Existing 选择候选：Insight 只能与 Insight 合并，低幅加分；Memory 可以与 Memory 或 Insight 合并，高幅加分。Memory 候选还必须查看 Existing 中的 Pattern：若语义相同，relation=support、related_layer=pattern，直接为该 Pattern 加分，不重复新建 Pattern。records 可额外返回 related_layer=insight|memory|pattern。被容量挤出的旧 Memory 在 Insight 中保留 origin_memory_id，新的 Memory 可以将其重新提升。"
         prompt += "\npromotion_status=manual_review 表示用户曾手动降级并持有不同意见。后续证据仍可追加，但程序禁止自动晋级。只有用户本轮明确重新确认该记录可作为更高等级规则时，才设置 explicit_reconfirmation=true；不得根据普通支持或相似表述自行解除。"
         prompt += "\n每条 records 还必须提供 title 和 content：title 是不超过 40 字、可用于索引和列表的简要标题；content 是可独立理解的具体事实、约束、适用条件和必要背景。claim 保持与 title 一致，用于兼容旧记录。text_feedback 必须提供 user_requirements 和 revision_direction；程序会保存 source_event_ids 对应的完整用户原始输入并将三部分一起落盘。source_bank_item_ids 只能从给出的 Bank evidence 复制；后续核查与合并阶段必须原样保留。若局部 turn 不足，可调用一次 GetTraceContext，按 start_turn/end_turn 补查当前 Session 内任意 Trace 的必要区间；若必须核对工件原文或修订号，可调用一次 Read 读取当前项目文件。不要为了保险读取整条 Trace 或无关文件。获得工具结果后必须输出完整 JSON。"
+        prompt = prompt.replace("source_bank_item_ids", "source_history_revision_ids")
+        prompt = prompt.replace("bank_item_id", "history_revision_id")
+        prompt = prompt.replace("Bank evidence", "Document History evidence")
+        prompt = prompt.replace("Bank 节点", "History 修订")
+        prompt = prompt.replace("Bank 中的 Agent", "History 中的 Agent")
+        prompt = prompt.replace("Bank 推断", "History 推断")
+        prompt = prompt.replace(
+            "Document History evidence 是其他 Trace 中选择性保留的证据节点，不是已经确认的 Memory。artifact_revision 节点",
+            "Document History evidence 是项目内文件的完整版本及其原始需求、审阅和执行证据，不是已经确认的 Memory。History 修订",
+        )
+        prompt = prompt.replace("Document History evidence (cross-Trace, selected)",
+                                "Document History evidence (selected revisions)")
+        prompt += "\n文件相关新记录依据 Document History 中的正文、父版本、需求线和执行思考提取。History 的 no_change 是有依据的无需修改决定，不能把其中的意见自动当作未解决问题或长期偏好。合并/反思 Existing 时优先使用其 semantic_evidence；仅当摘录、范围或因果证据不足时才核对关联 History。source_history_revision_ids 只能引用上述给出的真实 history_revision_id；semantic_evidence 要精确写明主张、适用范围、证据主体（用户/审阅/Agent/提取器）、原文摘录、不确定处及相关 History 修订。无文件目标的项目对话继续依据 Trace，不得编造 History 来源。"
         prompt += f"\n\n{semantic_extraction_section}"
 
         trace_event_block = f"Trace events:{json.dumps(event_view, ensure_ascii=False)}"
@@ -304,7 +318,7 @@ class FileTraceAnalyzer:
             "不要重新复述、改写或猜测原始 Trace。",
         ).replace(
             "若局部 turn 不足，可调用一次 GetTraceContext，按 start_turn/end_turn 补查当前 Session 内任意 Trace 的必要区间；若必须核对工件原文或修订号，可调用一次 Read 读取当前项目文件。不要为了保险读取整条 Trace 或无关文件。获得工具结果后必须输出完整 JSON。",
-            "只允许调用 GetTraceContext 或 Read：前者按 start_turn/end_turn 补查当前 Session 内未被 normalized trajectory 覆盖的必要区间，后者核对当前项目内的工件原文或修订号；其他工具不得调用。获得工具结果后必须输出完整 JSON。",
+            "只允许调用 GetTraceContext、Read 或 GetHistoryRevision：前者补查当前 Session 的必要区间，Read 核对当前工件，GetHistoryRevision 仅在 semantic_evidence 不足时按修订 ID 回读完整旧版与需求证据；其他工具不得调用。获得工具结果后必须输出完整 JSON。",
         ).replace(
             "你收到的不是完整 Trace，而是每条 Trace 中与本次分析锚点临近的少量 ReAct turn。不要回复用户、不要续写，只分析原始 Trace：",
             "上一轮已把当前分析窗口整理成 normalized trajectory。不要回复用户、不要续写，只分析其中与以下来源 Trace 对应的记录：",
@@ -463,10 +477,45 @@ class FileTraceAnalyzer:
         }
         evidence_events = [event for event in events if str(event.get("event_id")) in valid]
         files = FileLifecycleStore(self.workspace_dir, project_id)
-        bank = MemoryBankStore(self.workspace_dir, project_id)
-        bank.retain_semantic_records(
-            data.get("records", []), evidence_events, trace_id, related_bank_items=bank.list(),
-        )
+        history = DocumentHistoryStore(Path(self.workspace_dir) / project_id)
+        allowed_history_ids = {
+            revision["revision_id"] for revision in history.related_to_events(events)
+        }
+        user_event_ids = {str(event.get("event_id")) for event in evidence_events
+                          if event.get("event_type") in {"user_message", "user_answer"}}
+        for item in data.get("records", []):
+            if not isinstance(item, dict):
+                continue
+            ids = [str(value) for value in item.get("source_history_revision_ids", [])]
+            if item.get("artifact_revision_id"):
+                ids.append(str(item["artifact_revision_id"]))
+            revisions = [history.get_revision(value) for value in dict.fromkeys(ids)
+                         if value in allowed_history_ids]
+            revisions = [revision for revision in revisions if revision is not None]
+            item["history_revision_ids"] = [revision["revision_id"] for revision in revisions]
+            semantic = item.get("semantic") if isinstance(item.get("semantic"), dict) else {}
+            source_kind = "reviewer" if item.get("kind") == "review_issue" else (
+                "user" if user_event_ids.intersection(str(value) for value in item.get("source_event_ids", []))
+                else "agent_or_extractor"
+            )
+            if revisions:
+                item["semantic_evidence"] = [{
+                    "claim": str(semantic.get("what") or item.get("claim") or item.get("title") or ""),
+                    "source_kind": source_kind,
+                    "scope": str(item.get("artifact_path") or item.get("domain") or ""),
+                    "excerpt": str(item.get("source_text") or item.get("anchor_excerpt") or "")[:700],
+                    "assertion_status": str(semantic.get("assertion_status") or ""),
+                    "why": str(semantic.get("why") or ""),
+                    "attributes": semantic.get("attributes", {}),
+                    "history_excerpts": [
+                        {"revision_id": revision["revision_id"], "kind": evidence["kind"],
+                         "content": evidence["content"][:700]}
+                        for revision in revisions
+                        for evidence in revision["evidence"]
+                        if evidence["kind"] in {"user_input", "main_delegation", "reviewer_output"}
+                    ][:6],
+                    "history_revision_ids": item["history_revision_ids"],
+                }]
         classifications = []
         for raw_item in data.get("items", []):
             if not isinstance(raw_item, dict) or raw_item.get("type") not in {"error", "correction", "confirmation", "feedback"}:
@@ -581,10 +630,13 @@ class FileTraceAnalyzer:
                         supported, _ = files.add_support(related, record_trace_ids, ids, bonus, item)
                     merged = files.merge_text_feedback(supported, item, record_trace_id, ids, user_inputs)
                     semantic_metadata = self._semantic_metadata(item)
-                    if semantic_metadata.get("bank_item_ids"):
-                        semantic_metadata["bank_item_ids"] = list(dict.fromkeys([
-                            *merged.get("bank_item_ids", []), *semantic_metadata["bank_item_ids"],
+                    if semantic_metadata.get("history_revision_ids"):
+                        semantic_metadata["history_revision_ids"] = list(dict.fromkeys([
+                            *merged.get("history_revision_ids", []), *semantic_metadata["history_revision_ids"],
                         ]))
+                    semantic_metadata["semantic_evidence"] = [
+                        *merged.get("semantic_evidence", []), *semantic_metadata.get("semantic_evidence", []),
+                    ]
                     merged.update(semantic_metadata)
                     merged["trace_ids"] = list(dict.fromkeys([*merged.get("trace_ids", []), *record_trace_ids]))
                     if item.get("explicit_reconfirmation") is True:
@@ -650,8 +702,10 @@ class FileTraceAnalyzer:
                 related["trace_ids"] = list(dict.fromkeys([*related.get("trace_ids", []), *record_trace_ids]))
                 related["trace_refs"] = self._merge_trace_refs(related.get("trace_refs", []), trace_refs)
                 for key, value in self._semantic_metadata(item).items():
-                    if key == "bank_item_ids":
+                    if key == "history_revision_ids":
                         related[key] = list(dict.fromkeys([*related.get(key, []), *value]))
+                    elif key == "semantic_evidence":
+                        related[key] = [*related.get(key, []), *value]
                     else:
                         related.setdefault(key, value)
                 if relation == "append":
@@ -709,10 +763,12 @@ class FileTraceAnalyzer:
             result["semantic"] = item["semantic"]
         if item.get("extraction_profile"):
             result["extraction_profile"] = str(item["extraction_profile"])
-        if isinstance(item.get("bank_item_ids"), list):
-            result["bank_item_ids"] = list(dict.fromkeys(
-                str(value) for value in item["bank_item_ids"] if value
+        if isinstance(item.get("history_revision_ids"), list):
+            result["history_revision_ids"] = list(dict.fromkeys(
+                str(value) for value in item["history_revision_ids"] if value
             ))
+        if isinstance(item.get("semantic_evidence"), list):
+            result["semantic_evidence"] = item["semantic_evidence"]
         return result
 
     async def analyze_window(self, window_id: str, project_id: str, branch_messages=None, _tools=None) -> None:
@@ -749,13 +805,6 @@ class FileTraceAnalyzer:
                     )
                 else:
                     window_events = await self.trace_store.list_trace_window_events(window_id)
-                    # Artifact revisions may sit outside the bounded turns sent to
-                    # the analyzer.  Retain them first so later user feedback can
-                    # reconnect to the responsible writing run across Trace/session
-                    # boundaries.
-                    MemoryBankStore(self.workspace_dir, project_id).retain_artifact_revisions(
-                        TraceStore.annotate_event_turns(window_events)
-                    )
                     events = self._select_analysis_events(window_events)
                     messages = branch_messages if branch_messages is not None else window.get("messages", [])
                     result = await self.analyze(
@@ -810,12 +859,15 @@ class FileTraceAnalyzer:
                        fallback_mode: bool = False) -> str:
         messages = [*branch_messages, {"role": "user", "content": prompt}] if branch_messages else [{"role": "user", "content": prompt}]
         position = "memory_summary_fallback" if fallback_mode or not branch_messages else "main_loop"
+        has_history = DocumentHistoryStore(Path(self.workspace_dir) / project_id).db_path.exists()
         if branch_messages and not fallback_mode:
             available_tools = list(cached_tools or [])
             if trace_tool and not any(tool.get("name") == trace_tool.name for tool in available_tools):
                 available_tools.append(trace_tool.get_schema())
             if not any(tool.get("name") == self.read_tool.name for tool in available_tools):
                 available_tools.append(self.read_tool.get_schema())
+            if has_history and not any(tool.get("name") == self.history_tool.name for tool in available_tools):
+                available_tools.append(self.history_tool.get_schema())
             if not available_tools:
                 return await self._chat_text(
                     messages, position, tag=":trace-fork/cached", execution_events=execution_events,
@@ -829,6 +881,7 @@ class FileTraceAnalyzer:
                 allowed_tool = (
                     trace_tool if trace_tool and call.tool_name == trace_tool.name
                     else self.read_tool if call.tool_name == self.read_tool.name
+                    else self.history_tool if has_history and call.tool_name == self.history_tool.name
                     else None
                 )
                 if not allowed_tool:
@@ -848,7 +901,8 @@ class FileTraceAnalyzer:
             )
 
         text, calls = await self._chat_with_schemas(
-            messages, position, [trace_tool.get_schema(), self.read_tool.get_schema()],
+            messages, position, [trace_tool.get_schema(), self.read_tool.get_schema(),
+                                 *([self.history_tool.get_schema()] if has_history else [])],
             tag=":trace-fork", execution_events=execution_events,
         )
         if not calls:
@@ -857,6 +911,7 @@ class FileTraceAnalyzer:
         allowed_tool = (
             trace_tool if call.tool_name == trace_tool.name
             else self.read_tool if call.tool_name == self.read_tool.name
+            else self.history_tool if has_history and call.tool_name == self.history_tool.name
             else None
         )
         if not allowed_tool:
@@ -881,8 +936,8 @@ class FileTraceAnalyzer:
             working_dir=working_dir, actor="trace_analyzer", source_trace_id=source_trace_id,
         )
         params = call.tool_input or {}
-        if tool is self.read_tool and not tool.validate_params(params):
-            result = ToolResult(success=False, error="Read 缺少必填参数 path")
+        if tool in {self.read_tool, self.history_tool} and not tool.validate_params(params):
+            result = ToolResult(success=False, error=f"{tool.name} 缺少必填参数")
         elif tool is self.read_tool and not (
             Path(context.working_dir) / str(params["path"])
         ).resolve().is_relative_to(Path(context.working_dir).resolve()):
@@ -931,7 +986,7 @@ class FileTraceAnalyzer:
 - text_feedback 还要返回 feedback_relation=same_anchor|cross_text_support|cross_text_conflict；cross_text_conflict 仅用于真正无法消解的方向冲突。
 - promotion_status=manual_review 的记录只有用户本轮明确重新确认时，explicit_reconfirmation 才能为 true。
 
-若标题不足以判断，可调用一次 Read 读取 Existing 的 file_path；若必须回看来源，可调用一次 GetTraceContext。只能使用这两个只读工具。
+优先比较 Existing 的 semantic_evidence。若摘录、适用范围或因果链不足，可调用一次 GetHistoryRevision 按 History ID 回读原始版本；若需看当前 Memory 文件可调用 Read，若需核对无文件目标的对话来源可调用 GetTraceContext。只能使用这些只读工具。
 只输出 JSON：{{"decisions":[{{"candidate_index":0,"relation":"new|support|append|conflict","related_id":"","related_layer":"insight|memory|pattern","feedback_relation":"same_anchor|cross_text_support|cross_text_conflict","explicit_reconfirmation":false,"reason":"简要说明"}}]}}。
 每条候选必须恰好有一个 decision。
 
@@ -944,11 +999,14 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
             {"role": "user", "content": reconcile_prompt},
         ]
         position = "main_loop" if branch_messages else "memory_summary_fallback"
+        has_history = DocumentHistoryStore(Path(self.workspace_dir) / project_id).db_path.exists()
         available_tools = list(cached_tools or []) if branch_messages else []
         if trace_tool and not any(tool.get("name") == trace_tool.name for tool in available_tools):
             available_tools.append(trace_tool.get_schema())
         if not any(tool.get("name") == self.read_tool.name for tool in available_tools):
             available_tools.append(self.read_tool.get_schema())
+        if has_history and not any(tool.get("name") == self.history_tool.name for tool in available_tools):
+            available_tools.append(self.history_tool.get_schema())
         text, calls = await self._chat_with_schemas(
             messages, position, available_tools, tag=":trace-fork/reconcile",
             execution_events=execution_events,
@@ -958,6 +1016,7 @@ Existing:{json.dumps(existing, ensure_ascii=False)}'''
             allowed_tool = (
                 trace_tool if trace_tool and call.tool_name == trace_tool.name
                 else self.read_tool if call.tool_name == self.read_tool.name
+                else self.history_tool if has_history and call.tool_name == self.history_tool.name
                 else None
             )
             if not allowed_tool:

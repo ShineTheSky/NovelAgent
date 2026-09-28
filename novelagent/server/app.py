@@ -20,6 +20,7 @@ from novelagent.tools.bash import BashTool
 from novelagent.tools.subagent_tool import SubAgentTool
 from novelagent.tools.ask_user_question import AskUserQuestionTool
 from novelagent.tools.create_trace_checkpoint import CreateTraceCheckpointTool
+from novelagent.tools.record_no_change import RecordNoChangeTool
 from novelagent.tools.search_rag import SearchRagTool
 from novelagent.security.permission_checker import PermissionChecker
 from novelagent.context.builder import ContextBuilder
@@ -92,7 +93,7 @@ def create_app() -> FastAPI:
         bash_case_recorder,
         command_timeout=bash_cfg.get("command_timeout", 30),
         max_output_size=bash_cfg.get("max_output_size", 10240),
-    ), SubAgentTool(), AskUserQuestionTool(), CreateTraceCheckpointTool(), SearchRagTool(rag_store)]:
+    ), SubAgentTool(), AskUserQuestionTool(), CreateTraceCheckpointTool(), RecordNoChangeTool(), SearchRagTool(rag_store)]:
         registry.register(tool)
 
     permission_checker = PermissionChecker(working_dir)

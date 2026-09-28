@@ -1,6 +1,7 @@
 """子Agent创建与编排"""
 
 import json
+from pathlib import Path
 import uuid
 from novelagent.tools.subagent_tool import SubAgentTool
 from novelagent.core.session import Session, ResponseChunk
@@ -8,6 +9,7 @@ from novelagent.tools.base import ToolContext, ToolResult
 from novelagent.tools.ask_user_question import resolve_question_answers
 from novelagent.core.llm_turn import query
 from novelagent.trace.agent_run import AgentRunTrace, AgentTraceTaskManager
+from novelagent.history import DocumentHistoryStore
 
 
 class SubAgentRunner:
@@ -66,6 +68,7 @@ class SubAgentRunner:
         actor: str | None = None, operation_id: str = "",
         run_id: str = "", parent_run_id: str = "", workflow: str = "",
         context_as_user_message: bool = False, source_trace_id: str = "",
+        history_evidence: dict | None = None,
     ):
         preset = self.presets_tool.get_preset(preset_name)
         if preset is None:
@@ -77,6 +80,15 @@ class SubAgentRunner:
         tool_names = preset.get("tools", [])
 
         current_run_id = run_id or uuid.uuid4().hex
+        history = dict(history_evidence or {})
+        history["dependencies"] = dict(history.get("dependencies") or {})
+        history["run_id"] = current_run_id
+        history.setdefault("main_delegation", task)
+        thinking_kind = {
+            "chapter_writer": "writer_thinking",
+            "chapter_polisher": "polisher_thinking",
+            "reviewer": "reviewer_thinking",
+        }.get(preset_name)
         src = {
             "source": "subagent",
             "run_id": current_run_id,
@@ -166,6 +178,10 @@ class SubAgentRunner:
                 await parent_session.question_event.wait()
                 answers = parent_session.question_answers or []
                 resolved_answers = resolve_question_answers(params.get("questions", []), answers)
+                history["user_input"] = "\n\n".join(filter(None, (
+                    history.get("user_input", ""),
+                    json.dumps(resolved_answers, ensure_ascii=False),
+                )))
                 return True, json.dumps(resolved_answers, ensure_ascii=False), ""
             try:
                 tool = self.tools.get(tool_name)
@@ -178,6 +194,7 @@ class SubAgentRunner:
                     revision_events=revision_events,
                     permission_decision="not_checked",
                     source_trace_id=operation_id,
+                    history_evidence=history,
                 )
                 result = await tool.execute(params, sub_ctx)
                 data = result.data if isinstance(result.data, str) else json.dumps(result.data, ensure_ascii=False)
@@ -212,6 +229,8 @@ class SubAgentRunner:
                             tool=ev["tool"], params={"preset": preset_name},
                         )
                 if ev["type"] == "thinking":
+                    if thinking_kind:
+                        history[thinking_kind] = history.get(thinking_kind, "") + ev["content"]
                     yield ResponseChunk(type="thinking", data={**src, "content": ev["content"]})
                 elif ev["type"] == "text_delta":
                     yield ResponseChunk(type="text_delta", data={**src, "delta": ev["content"]})
@@ -259,8 +278,27 @@ class SubAgentRunner:
                 await agent_trace.finish("completed", result_text)
 
         print(f"[sub/{preset_name}] 完成: result_len={len(result_text)} preview={result_text[:100]}...", flush=True)
+        if revision_events:
+            store = DocumentHistoryStore(f"{self.working_dir}/{parent_session.project_id}")
+            for revision in revision_events:
+                store.add_evidence(revision["revision_id"], history)
+        elif preset_name == "chapter_polisher" and not empty_result and result_text.startswith("无需修改："):
+            rationale = result_text.partition("：")[2].strip()
+            target_path = str(history.get("target_path") or "")
+            opinion = "\n\n".join(filter(None, (
+                str(history.get("user_input") or ""), str(history.get("reviewer_output") or ""),
+            )))
+            if rationale and target_path and opinion:
+                project_dir = Path(self.working_dir) / parent_session.project_id
+                target = (project_dir / target_path).resolve()
+                if target.is_file() and target.is_relative_to(project_dir.resolve()):
+                    store = DocumentHistoryStore(project_dir)
+                    revision_id = store.ensure_baseline(target)
+                    store.record_no_change(revision_id, opinion, result_text)
         yield ResponseChunk(type="subagent_done", data={
             **src, "result": result_text, "empty_result": empty_result,
             "revision_events": revision_events,
             "agent_trace_id": agent_trace.trace_id if agent_trace else "",
+            "history_thinking": history.get(thinking_kind, "") if thinking_kind else "",
+            "history_user_input": history.get("user_input", ""),
         })

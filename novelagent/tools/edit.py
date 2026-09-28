@@ -5,6 +5,7 @@ from pathlib import Path
 from novelagent.tools.base import ToolProtocol, ToolResult, ToolContext, PermissionResult
 from novelagent.tools.write import WriteTool, layout_error
 from novelagent.versioning import RevisionConflict, revision_manager
+from novelagent.history import DocumentHistoryStore
 
 
 def _excerpt(value: str, limit: int = 1200) -> str:
@@ -33,6 +34,12 @@ class EditTool(ToolProtocol):
         if error:
             return ToolResult(success=False, error=error)
         file_path = Path(context.working_dir) / params["path"]
+        managed = revision_manager.is_managed(file_path, context.working_dir)
+        if managed:
+            try:
+                DocumentHistoryStore(context.working_dir).recover_file(file_path)
+            except Exception as exc:
+                return ToolResult(success=False, error=str(exc))
         if not file_path.exists():
             return ToolResult(success=False, error=f"文件不存在: {params['path']}")
 
@@ -42,7 +49,6 @@ class EditTool(ToolProtocol):
         except Exception as e:
             return ToolResult(success=False, error=f"读取文件失败: {e}")
 
-        managed = revision_manager.is_managed(file_path, context.working_dir)
         current = revision_manager.parse(content) if managed else None
         if managed and params.get("expected_revision_id", "") != current.revision_id:
             return ToolResult(success=False, error=(
@@ -68,7 +74,12 @@ class EditTool(ToolProtocol):
                 info = await revision_manager.commit(
                     file_path, updated, params.get("expected_revision_id"),
                     actor=context.actor, operation_id=context.operation_id,
+                    history_store=DocumentHistoryStore(context.working_dir),
+                    history_evidence=context.history_evidence,
+                    dependencies=context.history_evidence.get("dependencies", {}),
                 )
+                if info.revision_id == current.revision_id:
+                    return ToolResult(success=True, data=f"文件内容未变化: {params['path']}\n当前修订: {info.revision_id}")
                 context.revision_events.append({
                     "path": params["path"], "revision_id": info.revision_id,
                     "parent_revision_id": info.metadata.get("parent_revision_id"),

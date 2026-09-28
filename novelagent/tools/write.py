@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from novelagent.tools.base import ToolProtocol, ToolResult, ToolContext, PermissionResult
 from novelagent.versioning import RevisionConflict, revision_manager
+from novelagent.history import DocumentHistoryStore
 
 PROTECTED_DIRS = [".git", ".claude/settings", ".env", ".memory/memory.md"]
 INTERNAL_EDITABLES = [".claude/plans/", ".claude/scratchpad.md"]
@@ -62,12 +63,18 @@ class WriteTool(ToolProtocol):
         file_path = Path(context.working_dir) / params["path"]
         try:
             if revision_manager.is_managed(file_path, context.working_dir):
+                history = DocumentHistoryStore(context.working_dir)
+                history.recover_file(file_path)
                 existing = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
                 current = revision_manager.parse(existing) if existing else None
                 info = await revision_manager.commit(
                     file_path, params["content"], params.get("expected_revision_id"),
                     actor=context.actor, operation_id=context.operation_id,
+                    history_store=history, history_evidence=context.history_evidence,
+                    dependencies=context.history_evidence.get("dependencies", {}),
                 )
+                if current and info.revision_id == current.revision_id:
+                    return ToolResult(success=True, data=f"文件内容未变化: {params['path']}\n当前修订: {info.revision_id}")
                 before_excerpt, after_excerpt = _changed_excerpt(current.body if current else "", info.body)
                 context.revision_events.append({
                     "path": params["path"], "revision_id": info.revision_id,

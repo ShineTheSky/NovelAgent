@@ -10,6 +10,7 @@ from pathlib import Path
 
 from novelagent.core.session import ResponseChunk
 from novelagent.trace.file_lifecycle import FileLifecycleStore
+from novelagent.history import DocumentHistoryStore
 
 
 _CHAPTER_PATH = re.compile(r"^chapters/content_(\d+)\.(\d+)\.(\d+)\.md$", re.IGNORECASE)
@@ -37,7 +38,13 @@ class ReviewPolishWorkflow:
 
     def _read_if_exists(self, project_dir: Path, relative_path: str) -> str:
         path = project_dir / relative_path
-        return path.read_text(encoding="utf-8") if path.is_file() else "（该文件尚不存在）"
+        if path.suffix.lower() == ".md" and ".memory" not in path.parts:
+            DocumentHistoryStore(project_dir).recover_file(path)
+        if not path.is_file():
+            return "（该文件尚不存在）"
+        if path.suffix.lower() == ".md" and ".memory" not in path.parts:
+            DocumentHistoryStore(project_dir).ensure_baseline(path)
+        return path.read_text(encoding="utf-8")
 
     def _reference_feedback_context(self, project_id: str, chapter_path: str, body: str) -> str:
         records = FileLifecycleStore(str(self.working_dir), project_id).text_feedback_for_artifact(chapter_path, body)
@@ -82,6 +89,21 @@ class ReviewPolishWorkflow:
         """Expose the same deterministic context order to manual review/polish calls."""
         return self._artifact_context(project_id, chapter_path)
 
+    def dependency_versions(self, project_id: str, chapter_path: str) -> dict[str, str]:
+        match = _CHAPTER_PATH.match(chapter_path.replace("\\", "/"))
+        if not match:
+            return {}
+        volume, chapter, _ = map(int, match.groups())
+        paths = (f"outlines/outline_{volume}.0.0.md", f"outlines/outline_{volume}.{chapter}.0.md")
+        result = {}
+        history = DocumentHistoryStore(self.working_dir / project_id)
+        for relative in paths:
+            path = self.working_dir / project_id / relative
+            history.recover_file(path)
+            if path.is_file():
+                result[relative] = history.ensure_baseline(path)
+        return result
+
     def build_writer_context(self, project_id: str, chapter_path: str) -> tuple[str, str]:
         """Give the writer the current target, or its most recent sibling when creating one."""
         project_dir = self.working_dir / project_id
@@ -105,15 +127,17 @@ class ReviewPolishWorkflow:
         chapter_outline = f"outlines/outline_{int(volume)}.{int(chapter)}.0.md"
         context = "\n\n".join([
             "## 固定工件上下文（禁止重新读取或改写此区块）",
-            f"### 前序最新正文：{previous_path}\n{previous.read_text(encoding='utf-8')}",
+            f"### 前序最新正文：{previous_path}\n{self._read_if_exists(project_dir, previous_path)}",
             f"### 对应卷纲：{volume_outline}\n{self._read_if_exists(project_dir, volume_outline)}",
             f"### 对应章纲：{chapter_outline}\n{self._read_if_exists(project_dir, chapter_outline)}",
         ])
         return context, self._memory_context(project_id)
 
     async def run(self, parent_session, chapter_path: str, writer_task: str, operation_id: str,
-                  parent_run_id: str = "", source_trace_id: str = ""):
+                  parent_run_id: str = "", source_trace_id: str = "",
+                  history_evidence: dict | None = None):
         artifact_context, memory_context = self._artifact_context(parent_session.project_id, chapter_path)
+        dependencies = self.dependency_versions(parent_session.project_id, chapter_path)
         reviewer_task = (
             f"审阅 `{chapter_path}`。这是写作 Agent 刚提交的版本；只输出可执行的结构化审阅报告，"
             "不要写文件。请按“问题、证据、严重度、建议”列出；没有问题也明确说明。\n\n"
@@ -122,6 +146,8 @@ class ReviewPolishWorkflow:
         reviewer_result = ""
         reviewer_completed = False
         reviewer_empty = False
+        reviewer_thinking = ""
+        reviewer_user_input = str((history_evidence or {}).get("user_input") or "")
         async for chunk in self.runner.spawn_and_run(
             "reviewer", reviewer_task, parent_session, False,
             extra_context=memory_context, artifact_context=artifact_context,
@@ -129,8 +155,11 @@ class ReviewPolishWorkflow:
             parent_run_id=parent_run_id, workflow="auto_review",
             context_as_user_message=True,
             source_trace_id=source_trace_id,
+            history_evidence={**(history_evidence or {}), "dependencies": dependencies},
         ):
             if chunk.type == "subagent_done":
+                reviewer_thinking = chunk.data.get("history_thinking", "")
+                reviewer_user_input = chunk.data.get("history_user_input", reviewer_user_input)
                 reviewer_result = chunk.data.get("result", "")
                 reviewer_empty = bool(chunk.data.get("empty_result")) or not reviewer_result.strip()
                 reviewer_completed = not reviewer_empty and not reviewer_result.startswith("Error:")
@@ -146,6 +175,7 @@ class ReviewPolishWorkflow:
 
         # Re-read after review so the second specialist receives the actual latest header/body.
         artifact_context, memory_context = self._artifact_context(parent_session.project_id, chapter_path)
+        dependencies = self.dependency_versions(parent_session.project_id, chapter_path)
         polisher_task = (
             f"根据以下审阅报告润色 `{chapter_path}`。必须只修改该章节；使用固定正文中的当前修订作为 "
             "expected_revision_id。完成写入后简述修改内容。\n\n"
@@ -160,6 +190,15 @@ class ReviewPolishWorkflow:
             actor="polisher", operation_id=f"{operation_id}:polish",
             parent_run_id=parent_run_id, workflow="auto_polish",
             source_trace_id=source_trace_id,
+            history_evidence={
+                **(history_evidence or {}), "main_delegation": writer_task,
+                "user_input": reviewer_user_input,
+                "reviewer_thinking": reviewer_thinking,
+                "reviewer_output": reviewer_result,
+                "reviewer_delegation": polisher_task,
+                "dependencies": dependencies,
+                "target_path": chapter_path,
+            },
         ):
             if chunk.type == "subagent_done":
                 polisher_result = chunk.data.get("result", "")
