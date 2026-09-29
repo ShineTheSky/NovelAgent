@@ -166,7 +166,7 @@ async def test_persist_turn_updates_session_and_storage(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ask_user_answer_forces_feedback_trace_capture(monkeypatch, tmp_path):
+async def test_ask_user_answer_stays_in_history_without_forcing_trace_analysis(monkeypatch, tmp_path):
     class FakeProjectMemory:
         def __init__(self, *_args, **_kwargs):
             pass
@@ -304,7 +304,16 @@ async def test_ask_user_answer_forces_feedback_trace_capture(monkeypatch, tmp_pa
     await answer_task
     await background.drain()
 
-    assert trace.store.captures[0]["reason"] == "user_feedback"
+    assert trace.store.captures == []
+    from novelagent.history import DocumentHistoryStore
+    history = DocumentHistoryStore(tmp_path / "project-1")
+    unit = history.get_unit(history._unit_id("trace-1", "request"))
+    assert unit["kind"] == "conversation"
+    assert unit["status"] == "completed"
+    answer_event = next(event for event in unit["events"] if event["kind"] == "user_answer")
+    assert json.loads(answer_event["content"])[0]["selected_options"][0]["description"] == (
+        "保留现有设定，并作为后续写作约束。"
+    )
     tool_result = next(
         message for message in llm.requests[1]["messages"] if message["role"] == "tool_result"
     )

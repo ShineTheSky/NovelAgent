@@ -8,6 +8,7 @@ the atomic file replacement.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -75,6 +76,41 @@ class DocumentHistoryStore:
                 rationale TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS history_units (
+                history_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                session_turn_no INTEGER NOT NULL DEFAULT 0,
+                kind TEXT NOT NULL,
+                path TEXT NOT NULL DEFAULT '',
+                base_revision_id TEXT NOT NULL DEFAULT '',
+                final_revision_id TEXT NOT NULL DEFAULT '',
+                previous_attempt_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'collecting',
+                analysis_status TEXT NOT NULL DEFAULT 'pending',
+                assistant_response TEXT NOT NULL DEFAULT '',
+                context_json TEXT NOT NULL DEFAULT '[]',
+                selected_turns_json TEXT NOT NULL DEFAULT '[]',
+                trace_ids_json TEXT NOT NULL DEFAULT '[]',
+                prepared_json TEXT NOT NULL DEFAULT '{}',
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(request_id, kind, path)
+            );
+            CREATE TABLE IF NOT EXISTS history_events (
+                event_id TEXT PRIMARY KEY,
+                history_id TEXT NOT NULL REFERENCES history_units(history_id),
+                kind TEXT NOT NULL,
+                content TEXT NOT NULL,
+                revision_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_history_events_unit
+                ON history_events(history_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_history_units_path
+                ON history_units(path, created_at);
+            CREATE INDEX IF NOT EXISTS idx_history_units_status
+                ON history_units(status, analysis_status);
         """)
         try:
             yield db
@@ -94,6 +130,202 @@ class DocumentHistoryStore:
     @staticmethod
     def _digest(body: str) -> str:
         return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _unit_id(request_id: str, kind: str, path: str = "") -> str:
+        return uuid.uuid5(uuid.NAMESPACE_URL, f"history:{request_id}:{kind}:{path}").hex
+
+    def start_request(self, request_id: str, session_id: str, user_input: str,
+                      context: list[dict] | None = None) -> str:
+        history_id = self._unit_id(request_id, "request")
+        with self._connect() as db:
+            db.execute("""INSERT OR IGNORE INTO history_units
+                (history_id, request_id, session_id, kind, context_json)
+                VALUES (?, ?, ?, 'request', ?)""",
+                (history_id, request_id, session_id, json.dumps(context or [], ensure_ascii=False)))
+            db.execute("""INSERT OR IGNORE INTO history_events(event_id, history_id, kind, content)
+                VALUES (?, ?, 'user_input', ?)""",
+                (f"{history_id}:input", history_id, user_input))
+        return history_id
+
+    def update_request_context(self, request_id: str, context: list[dict]) -> None:
+        with self._connect() as db:
+            db.execute("UPDATE history_units SET context_json = ? WHERE history_id = ?",
+                       (json.dumps(context, ensure_ascii=False), self._unit_id(request_id, "request")))
+
+    def append_request_event(self, request_id: str, kind: str, content: str) -> str:
+        return self._append_event(self._unit_id(request_id, "request"), kind, content)
+
+    def _append_event(self, history_id: str, kind: str, content: str,
+                      revision_id: str = "", event_id: str = "") -> str:
+        event_id = event_id or uuid.uuid4().hex
+        with self._connect() as db:
+            db.execute("""INSERT OR IGNORE INTO history_events
+                (event_id, history_id, kind, content, revision_id) VALUES (?, ?, ?, ?, ?)""",
+                (event_id, history_id, kind, content, revision_id))
+        return event_id
+
+    def _document_unit(self, db: sqlite3.Connection, request_id: str, path: str) -> str:
+        path = path.replace("\\", "/")
+        request = db.execute("SELECT session_id FROM history_units WHERE history_id = ?",
+                             (self._unit_id(request_id, "request"),)).fetchone()
+        if request is None:
+            raise KeyError(f"History request not found: {request_id}")
+        history_id = self._unit_id(request_id, "document", path)
+        previous = db.execute("""SELECT history_id, status FROM history_units
+            WHERE kind = 'document' AND path = ? AND request_id != ?
+            ORDER BY created_at DESC, rowid DESC LIMIT 1""", (path, request_id)).fetchone()
+        db.execute("""INSERT OR IGNORE INTO history_units
+            (history_id, request_id, session_id, kind, path, previous_attempt_id)
+            VALUES (?, ?, ?, 'document', ?, ?)""",
+            (history_id, request_id, request["session_id"], path,
+             previous["history_id"] if previous and previous["status"] in {"failed", "interrupted"} else ""))
+        return history_id
+
+    def attach_revision(self, request_id: str, path: str, revision_id: str,
+                        base_revision_id: str = "") -> str:
+        with self._connect() as db:
+            history_id = self._attach_revision(db, request_id, path, revision_id, base_revision_id)
+        return history_id
+
+    def _attach_revision(self, db: sqlite3.Connection, request_id: str, path: str,
+                         revision_id: str, base_revision_id: str) -> str:
+        history_id = self._document_unit(db, request_id, path)
+        db.execute("""UPDATE history_units SET
+            base_revision_id = CASE WHEN base_revision_id = '' THEN ? ELSE base_revision_id END,
+            final_revision_id = ? WHERE history_id = ?""",
+            (base_revision_id, revision_id, history_id))
+        db.execute("""INSERT OR IGNORE INTO history_events
+            (event_id, history_id, kind, content, revision_id) VALUES (?, ?, 'revision', ?, ?)""",
+            (f"{history_id}:revision:{revision_id}", history_id, revision_id, revision_id))
+        return history_id
+
+    def append_document_event(self, request_id: str, path: str, kind: str, content: str,
+                              revision_id: str = "", event_id: str = "") -> str:
+        with self._connect() as db:
+            history_id = self._document_unit(db, request_id, path)
+            db.execute("""INSERT OR IGNORE INTO history_events
+                (event_id, history_id, kind, content, revision_id) VALUES (?, ?, ?, ?, ?)""",
+                (event_id or uuid.uuid4().hex, history_id, kind, content, revision_id))
+            if kind == "evaluation_no_change" and revision_id:
+                db.execute("""UPDATE history_units SET
+                    base_revision_id = CASE WHEN base_revision_id = '' THEN ? ELSE base_revision_id END
+                    WHERE history_id = ?""", (revision_id, history_id))
+        return history_id
+
+    def close_request(self, request_id: str, status: str, answer: str,
+                      trace_ids: list[str] | None = None, session_turn_no: int = 0) -> list[str]:
+        if status not in {"completed", "failed", "interrupted"}:
+            raise ValueError(status)
+        request_history_id = self._unit_id(request_id, "request")
+        with self._connect() as db:
+            request = db.execute("SELECT * FROM history_units WHERE history_id = ?",
+                                 (request_history_id,)).fetchone()
+            if request is None:
+                return []
+            document_ids = [row[0] for row in db.execute("""SELECT history_id FROM history_units
+                WHERE request_id = ? AND kind = 'document' ORDER BY rowid""", (request_id,))]
+            db.execute("""UPDATE history_units SET status = ?, assistant_response = ?,
+                trace_ids_json = ?, session_turn_no = ? WHERE request_id = ?""",
+                (status, answer, json.dumps(trace_ids or [request_id]), session_turn_no, request_id))
+            if document_ids:
+                db.execute("UPDATE history_units SET kind = 'request' WHERE history_id = ?",
+                           (request_history_id,))
+            else:
+                db.execute("UPDATE history_units SET kind = 'conversation' WHERE history_id = ?",
+                           (request_history_id,))
+            if status != "completed":
+                db.execute("UPDATE history_units SET analysis_status = 'deferred' WHERE request_id = ?",
+                           (request_id,))
+            elif document_ids:
+                db.execute("UPDATE history_units SET analysis_status = 'routed' WHERE history_id = ?",
+                           (request_history_id,))
+                db.execute("""UPDATE history_units SET status = 'failed', analysis_status = 'deferred'
+                    WHERE request_id = ? AND kind = 'document' AND final_revision_id = ''
+                    AND history_id IN (SELECT history_id FROM history_events WHERE kind = 'tool_failure')""",
+                    (request_id,))
+                db.execute("""UPDATE history_units SET status = 'failed', analysis_status = 'deferred'
+                    WHERE request_id = ? AND kind = 'document'
+                    AND history_id IN (SELECT history_id FROM history_events WHERE kind = 'workflow_failure')""",
+                    (request_id,))
+        if status != "completed":
+            return []
+        return [row for row in (document_ids or [request_history_id])
+                if (self.get_unit(row) or {}).get("status") == "completed"]
+
+    def list_analyzable(self) -> list[str]:
+        if not self.db_path.exists():
+            return []
+        with self._connect() as db:
+            return [row[0] for row in db.execute("""SELECT history_id FROM history_units
+                WHERE status = 'completed' AND kind IN ('document', 'conversation')
+                  AND analysis_status IN ('pending', 'failed') ORDER BY created_at, rowid""")]
+
+    def interrupt_collecting(self) -> int:
+        """A process restart cannot resume a suspended model/tool call, but keeps its evidence."""
+        if not self.db_path.exists():
+            return 0
+        with self._connect() as db:
+            cursor = db.execute("""UPDATE history_units
+                SET status = 'interrupted', analysis_status = 'deferred'
+                WHERE status = 'collecting'""")
+            return cursor.rowcount
+
+    def get_unit(self, history_id: str) -> dict | None:
+        if not self.db_path.exists():
+            return None
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM history_units WHERE history_id = ?", (history_id,)).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["context"] = json.loads(result.pop("context_json"))
+            result["selected_turns"] = json.loads(result.pop("selected_turns_json"))
+            result["trace_ids"] = json.loads(result.pop("trace_ids_json"))
+            result["prepared"] = json.loads(result.pop("prepared_json"))
+            ids = [history_id]
+            if result["kind"] == "document":
+                ids.insert(0, self._unit_id(result["request_id"], "request"))
+            result["events"] = [dict(event) for event in db.execute(f"""SELECT * FROM history_events
+                WHERE history_id IN ({','.join('?' for _ in ids)}) ORDER BY rowid""", ids)]
+            prior = db.execute("SELECT request_id FROM history_units WHERE history_id = ?",
+                               (result["previous_attempt_id"],)).fetchone() if result["previous_attempt_id"] else None
+            prior_ids = ([self._unit_id(prior["request_id"], "request"), result["previous_attempt_id"]]
+                         if prior else [])
+            result["previous_attempt_events"] = [dict(event) for event in db.execute(
+                "SELECT * FROM history_events WHERE history_id IN (?, ?) ORDER BY rowid",
+                prior_ids,
+            )] if prior_ids else []
+        if result["kind"] == "document":
+            revision_ids = list(dict.fromkeys(event["revision_id"] for event in result["events"]
+                                                  if event["revision_id"]))
+            result["revisions"] = [self.get_revision(revision_id) for revision_id in revision_ids]
+        return result
+
+    def list_document_units(self, path: str) -> list[dict]:
+        """Read the ordered attempts/evaluations associated with one document."""
+        if not self.db_path.exists():
+            return []
+        with self._connect() as db:
+            ids = [row[0] for row in db.execute("""SELECT history_id FROM history_units
+                WHERE kind = 'document' AND path = ? ORDER BY created_at, rowid""",
+                (path.replace("\\", "/"),))]
+        return [self.get_unit(history_id) for history_id in ids]
+
+    def set_selected_turns(self, history_id: str, turns: dict) -> None:
+        with self._connect() as db:
+            db.execute("UPDATE history_units SET selected_turns_json = ? WHERE history_id = ?",
+                       (json.dumps(turns, ensure_ascii=False), history_id))
+
+    def set_prepared(self, history_id: str, payload: dict) -> None:
+        with self._connect() as db:
+            db.execute("UPDATE history_units SET prepared_json = ? WHERE history_id = ?",
+                       (json.dumps(payload, ensure_ascii=False), history_id))
+
+    def set_analysis_status(self, history_id: str, status: str, error: str = "") -> None:
+        with self._connect() as db:
+            db.execute("UPDATE history_units SET analysis_status = ?, last_error = ? WHERE history_id = ?",
+                       (status, error, history_id))
 
     @staticmethod
     def _replace(path: Path, content: str) -> None:
@@ -196,6 +428,9 @@ class DocumentHistoryStore:
             self._put_evidence(db, revision_id, evidence or {})
             db.execute("UPDATE documents SET latest_revision_id = ? WHERE document_id = ?",
                        (revision_id, document_id))
+            request_id = str((evidence or {}).get("history_request_id") or "")
+            if request_id:
+                self._attach_revision(db, request_id, relative, revision_id, parent_revision_id or "")
 
     def add_evidence(self, revision_id: str, fields: dict) -> None:
         with self._connect() as db:
@@ -227,14 +462,31 @@ class DocumentHistoryStore:
             """, (info.revision_id, document_id, info.body, rendered, self._digest(info.body)))
         return info.revision_id
 
-    def record_no_change(self, revision_id: str, opinion: str, rationale: str) -> None:
+    def record_no_change(self, revision_id: str, opinion: str, rationale: str, *,
+                         request_id: str = "", path: str = "") -> str:
         if not opinion or not rationale:
             raise ValueError("无需修改必须包含意见和明确依据")
         with self._connect() as db:
             if db.execute("SELECT 1 FROM revisions WHERE revision_id = ?", (revision_id,)).fetchone() is None:
                 raise KeyError(revision_id)
+            decision_id = uuid.uuid4().hex
             db.execute("INSERT INTO no_change VALUES (?, ?, ?, ?, datetime('now'))",
-                       (uuid.uuid4().hex, revision_id, opinion, rationale))
+                       (decision_id, revision_id, opinion, rationale))
+            if request_id:
+                if not path:
+                    row = db.execute("""SELECT d.path FROM revisions r JOIN documents d
+                        ON d.document_id = r.document_id WHERE r.revision_id = ?""",
+                        (revision_id,)).fetchone()
+                    path = str(row[0]) if row else ""
+                history_id = self._document_unit(db, request_id, path)
+                db.execute("""INSERT INTO history_events
+                    (event_id, history_id, kind, content, revision_id)
+                    VALUES (?, ?, 'evaluation_no_change', ?, ?)""",
+                    (decision_id, history_id, opinion + "\n\n" + rationale, revision_id))
+                db.execute("""UPDATE history_units SET
+                    base_revision_id = CASE WHEN base_revision_id = '' THEN ? ELSE base_revision_id END
+                    WHERE history_id = ?""", (revision_id, history_id))
+        return decision_id
 
     def get_revision(self, revision_id: str) -> dict | None:
         if not self.db_path.exists():

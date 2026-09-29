@@ -320,6 +320,14 @@ class FileLifecycleStore:
             existing["support_count"] = max(
                 int(existing.get("support_count", 1)), int(memory.get("support_count", 1)),
             )
+            existing["history_ids"] = list(dict.fromkeys([
+                *existing.get("history_ids", []), *memory.get("history_ids", []),
+            ]))
+            existing["history_revision_ids"] = list(dict.fromkeys([
+                *existing.get("history_revision_ids", []), *memory.get("history_revision_ids", []),
+            ]))
+            existing["semantic_evidence"] = memory.get("semantic_evidence", existing.get("semantic_evidence", []))
+            existing["support_sources"] = memory.get("support_sources", existing.get("support_sources", []))
             return self.write("pattern", existing)
         return self.write("pattern", {
             "title": memory.get("title", memory["claim"]),
@@ -333,6 +341,10 @@ class FileLifecycleStore:
             "trace_refs": memory.get("trace_refs", []),
             "weight": memory["weight"],
             "support_count": memory["support_count"],
+            "history_ids": memory.get("history_ids", []),
+            "history_revision_ids": memory.get("history_revision_ids", []),
+            "semantic_evidence": memory.get("semantic_evidence", []),
+            "support_sources": memory.get("support_sources", []),
         })
 
     def merge_text_feedback(self, existing: dict, incoming: dict, trace_id: str,

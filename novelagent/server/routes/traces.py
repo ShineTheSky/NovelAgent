@@ -2,10 +2,12 @@
 
 import asyncio
 import json
+from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from novelagent.trace.file_lifecycle import FileLifecycleStore
 from novelagent.trace.store import TraceStore
+from novelagent.history import DocumentHistoryStore
 
 
 router = APIRouter(prefix="/api")
@@ -20,13 +22,18 @@ def _files(request: Request, project_id: str) -> FileLifecycleStore:
 
 
 @router.post("/projects/{project_id}/traces/analyze-pending")
-async def analyze_pending_traces(project_id: str, request: Request):
-    """Schedule historical/pending Trace extraction without blocking the UI."""
-    traces = await _store(request).list_project_traces(project_id, limit=500)
-    pending = [trace for trace in traces if trace.get("analysis_status") == "pending"]
-    analyzer = request.app.state.agent_loop.post_turn_analyzer
-    for trace in pending:
-        asyncio.create_task(analyzer.analyze(trace["trace_id"], project_id))
+@router.post("/projects/{project_id}/history/analyze-pending")
+async def analyze_pending_history(project_id: str, request: Request):
+    """Legacy endpoint: schedule pending History extraction, not Trace memories."""
+    workspace = Path(request.app.state.agent_loop.working_dir).resolve()
+    project_dir = (workspace / project_id).resolve()
+    if not project_dir.is_relative_to(workspace):
+        raise HTTPException(status_code=403, detail="项目路径越界")
+    history = DocumentHistoryStore(project_dir)
+    pending = history.list_analyzable()
+    analyzer = request.app.state.agent_loop.history_analyzer
+    for history_id in pending:
+        asyncio.create_task(analyzer.analyze(project_id, history_id))
     return {"scheduled": len(pending)}
 
 

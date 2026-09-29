@@ -1,10 +1,10 @@
-## 长期记忆与 Trace
+## 长期记忆与 History
 
 项目内容（正文、卷纲、章纲、人物、世界观）必须保存在项目内容目录，不能用记忆替代。
 
 | 层级 | 位置 | 用途 |
 |---|---|---|
-| Insight | `.insight/{user,project,reference,agent}/` | 从 Trace 推导出的低置信观察或假设；仅后台提炼流程使用。 |
+| Insight | `.insight/{user,project,reference,agent}/` | 从 History 提炼出的低置信观察或假设；仅后台提炼流程使用。 |
 | Memory | `.memory/{user,project,reference}/` | 当前项目可用的长期记忆。`memory.md` 只保留最多 200 条活跃索引。 |
 | Pattern | `.pattern/{user,project,reference}/` | 多次验证后形成的稳定模式。 |
 | Agent 洞察 | `.insight/agent/`、`.memory/agent/`、`.pattern/agent/` | 独立、无上限，只用于后续优化 Agent 调度；绝不注入小说写作、审阅或大纲任务。 |
@@ -19,8 +19,8 @@
 - Memory 在至少 3 条支持且权重达到 200 时晋升为 Pattern；记录权重最高为 300。后续相似的 Memory 可继续为已有 Pattern 加分，不重复创建。
 - `reference` 中的 `kind: text_feedback` 也是普通记忆：用户引用原文后的修改意见会带文本锚点保存，并像其他 Memory 一样由索引预取。对同一锚点的重复意见只补充“修改方向、观察、推测和待确认点”，不加分；只有不同但相似的文本出现同方向反馈时，才可作为跨文本支持加分或形成 Pattern。
 - 超出 200 条活跃容量的 Memory 会降回 Insight，保留来源、权重和 `origin_memory_id`，不是删除。
-- 用户手动降低 Memory 或 Pattern 层级时，记录正文会写明降级来源与用户保留意见。后续 Trace 只能将其作为低幅证据支持；除非用户明确重新确认，不能直接恢复高优先级。
-- 主 Agent 发现重要错误、明确修正、稳定偏好或关键约束时，调用 `CreateTraceCheckpoint`。Trace 是不可变证据，由后台流程决定 Insight、Memory 或 Pattern；主 Agent 不得直接改写这些索引。
+- 用户手动降低 Memory 或 Pattern 层级时，记录正文会写明降级来源与用户保留意见。后续 History 只能将其作为低幅证据支持；除非用户明确重新确认，不能直接恢复高优先级。
+- 普通记忆由文件或对话 History 在本轮结束后提炼；Trace 保留执行证据和诊断摘要。主 Agent 不得直接改写这些索引。
 
 ## 项目记忆索引
 

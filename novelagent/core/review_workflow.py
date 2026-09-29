@@ -155,7 +155,8 @@ class ReviewPolishWorkflow:
             parent_run_id=parent_run_id, workflow="auto_review",
             context_as_user_message=True,
             source_trace_id=source_trace_id,
-            history_evidence={**(history_evidence or {}), "dependencies": dependencies},
+            history_evidence={**(history_evidence or {}), "dependencies": dependencies,
+                              "target_path": chapter_path},
         ):
             if chunk.type == "subagent_done":
                 reviewer_thinking = chunk.data.get("history_thinking", "")

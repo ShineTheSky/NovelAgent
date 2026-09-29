@@ -1,6 +1,6 @@
 # 文档 History 需求与代码影响评估
 
-状态：文档 History 主路径已实施。本文定义以创作文件为中心的 History；不把 History 当作 Memory，也不要求文档 History 依赖原始 Trace。无文件目标的项目讨论继续由现有 Trace 分析处理，独立的 Project History 留待后续设计。
+状态：本文保留最初的文档 History 需求与当时的代码评估。扩展后的实施边界和验收顺序见 [History 记忆迁移计划](history-memory-migration-plan.md)：无文件目标的项目讨论也形成对话 History；普通记忆不再由定期 Trace 窗口提取。
 
 ## 目标与边界
 

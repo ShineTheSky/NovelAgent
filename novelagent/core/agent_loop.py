@@ -22,6 +22,7 @@ from novelagent.trace.agent_bad_cases import AgentBadCaseRecorder
 from novelagent.trace.stream_compaction import TraceStreamBuffer
 from novelagent.memory.memory_manager import MemoryManager
 from novelagent.core.review_workflow import ReviewPolishWorkflow
+from novelagent.history import DocumentHistoryStore
 
 
 @dataclass
@@ -36,7 +37,7 @@ class AgentLoop:
     def __init__(self, llm_client, tool_registry, permission_checker, context_builder, memory_manager,
                  config: dict | None = None, subagent_runner=None, trace_recorder: TraceRecorder | None = None,
                  post_turn_analyzer=None, preference_context_provider=None, rag_store=None, bash_case_recorder=None,
-                 bad_case_analyzer=None, background_tasks=None):
+                 bad_case_analyzer=None, background_tasks=None, history_analyzer=None):
         self.llm = llm_client
 
         self.tools = tool_registry
@@ -55,6 +56,7 @@ class AgentLoop:
         self.bad_cases = AgentBadCaseRecorder(trace_recorder.store, self.working_dir, bad_case_analyzer) if trace_recorder else None
         self.bash_cases = bash_case_recorder
         self.post_turn_analyzer = post_turn_analyzer
+        self.history_analyzer = history_analyzer
         self.preference_context_provider = preference_context_provider
         self.rag_store = rag_store
         self.review_workflow = ReviewPolishWorkflow(subagent_runner, self.working_dir) if subagent_runner else None
@@ -104,6 +106,8 @@ class AgentLoop:
 
     async def run(self, request: InternalRequest, session: Session, project_info: dict | None = None) -> ResponseChunk:
         trace_id = await self.trace.start(session.session_id, session.project_id, request.content) if self.trace else f"op_{uuid.uuid4().hex}"
+        history_request_id = trace_id
+        session.active_history_request_id = history_request_id
         # The HTTP route can finish this trace if a client disconnects while the
 
         # generator is awaiting a tool or model response.
@@ -135,7 +139,6 @@ class AgentLoop:
         async def capture_embedded_user_answer(chunk: ResponseChunk, source: str,
                                                 parent_event_id: str) -> None:
             """Promote a sub-agent AskUserQuestion response to first-class Trace evidence."""
-            nonlocal feedback_trace_requested
             data = chunk.data
             if (
                 chunk.type != "tool_result"
@@ -153,12 +156,13 @@ class AgentLoop:
                 "answers": answers,
                 "source": source,
             }, parent_event_id)
-            feedback_trace_requested = True
+            history_store.append_request_event(
+                history_request_id, "user_answer", json.dumps(answers, ensure_ascii=False),
+            )
 
         pi = project_info or {}
         trace_checkpoint_requested = False
         compression_trace_requested = False
-        feedback_trace_requested = False
 
         # 项目记忆保存在工作区文件中，来源 Trace 与窗口摘要保存在 SQLite。
         import os as _os
@@ -263,7 +267,7 @@ class AgentLoop:
                         session.session_id, session.project_id, messages_snapshot, token_count, reason,
                     )
                     if captured and self.post_turn_analyzer:
-                        analysis = self.post_turn_analyzer.analyze_window(
+                        analysis = self.post_turn_analyzer.summarize_window(
                             captured["window_id"], session.project_id, captured["messages"], main_tool_schemas,
                         )
                         if self.background_tasks:
@@ -275,9 +279,8 @@ class AgentLoop:
 
         def schedule_trace_capture(answer: str = "", *, force_capture: bool = False,
                                    append_turn: bool = True, messages_snapshot: list[dict] | None = None,
-                                   token_count: int | None = None, reason: str = "interval") -> None:
-            if not self.trace:
-                return
+                                   token_count: int | None = None, reason: str = "interval",
+                                   status: str = "completed") -> None:
             snapshot = copy.deepcopy(messages_snapshot if messages_snapshot is not None else ctx.to_llm_messages())
             event_snapshot = copy.deepcopy(deferred_trace_events)
             capture = capture_trace_if_due(
@@ -285,18 +288,34 @@ class AgentLoop:
                 snapshot,
                 event_snapshot,
                 token_count if token_count is not None else self.context_builder.token_counter.count_messages(snapshot),
-                trace_checkpoint_requested or compression_trace_requested or feedback_trace_requested or force_capture,
+                trace_checkpoint_requested or compression_trace_requested or force_capture,
                 "agent_request" if trace_checkpoint_requested else (
-                    "compression" if compression_trace_requested else (
-                        "user_feedback" if feedback_trace_requested else reason
-                    )
+                    "compression" if compression_trace_requested else reason
                 ),
                 append_turn,
             )
+            async def capture_and_close_history() -> None:
+                await capture
+                ids = list(dict.fromkeys([history_request_id, trace_id]))
+                turns = (await self.trace.store.list_session_turns(session.session_id)
+                         if self.trace and hasattr(self.trace.store, "list_session_turns") else [])
+                current_turn = next((int(row["turn_no"]) for row in reversed(turns)
+                                     if row.get("source_trace_id") == trace_id), 0)
+                unit_ids = history_store.close_request(
+                    history_request_id, status, answer, ids, current_turn,
+                )
+                if status == "completed" and self.history_analyzer:
+                    for unit_id in unit_ids:
+                        try:
+                            await self.history_analyzer.analyze(session.project_id, unit_id)
+                        except Exception as exc:
+                            print(f"[history] analysis failed: {unit_id}: {exc}", flush=True)
+
             if self.background_tasks:
-                self.background_tasks.submit(capture, label=f"trace-capture:{session.session_id}")
+                self.background_tasks.submit(capture_and_close_history(), label=f"history-close:{session.session_id}")
             else:
-                asyncio.create_task(capture)
+                asyncio.create_task(capture_and_close_history())
+            session.active_history_request_id = ""
 
         await record("context_built", "system", {
             "history_message_count": len(history_msgs),
@@ -327,9 +346,13 @@ class AgentLoop:
             operation_id=f"op_{session.session_id}_{trace_id}",
             actor="main_agent",
             source_trace_id=trace_id,
-            history_evidence={"user_input": request.content, "run_id": trace_id, "dependencies": {}},
+            history_evidence={"user_input": request.content, "run_id": trace_id,
+                              "history_request_id": history_request_id, "dependencies": {}},
         )
         ctx.tool_context = tool_ctx
+        history_store = DocumentHistoryStore(project_working_dir)
+        history_store.start_request(history_request_id, session.session_id, request.content,
+                                    ctx.to_llm_messages())
 
         # 5.5. 进入循环前先检查是否需要压缩
         pre_check_tokens = self.context_builder.token_counter.count_messages(ctx.to_llm_messages())
@@ -363,6 +386,8 @@ class AgentLoop:
                     source_agent_trace_id="",
                 )
                 await finish("failed")
+                history_store.close_request(history_request_id, "failed", str(exc), [trace_id])
+                session.active_history_request_id = ""
                 yield ResponseChunk(type="error", data={
                     "message": f"上下文压缩失败，原会话未修改：{exc}",
                 })
@@ -407,6 +432,7 @@ class AgentLoop:
             session.active_trace_id = trace_id
             tool_ctx.operation_id = f"op_{session.session_id}_{trace_id}"
             tool_ctx.source_trace_id = trace_id
+            history_store.update_request_context(history_request_id, ctx.to_llm_messages())
             print(f"[compress] 完成: {pre_check_tokens} → {session.token_count} tokens ({time.time()-t0:.2f}s)", flush=True)
 
         # 确保用户消息已持久化，防止ReAct循环异常退出时丢失
@@ -424,12 +450,13 @@ class AgentLoop:
             if session.stop_requested:
                 await record("interrupted", "user", {"reason": "stop_requested"})
                 await finish("interrupted")
-                schedule_trace_capture(final_text)
+                schedule_trace_capture(final_text, status="interrupted")
                 yield ResponseChunk(type="done", data={"finish_reason": "interrupted", "message": "用户中断",
                                                         "trace_id": ""})
                 return
 
             llm_messages = ctx.to_llm_messages()
+            history_store.update_request_context(history_request_id, llm_messages)
             tool_schemas = main_tool_schemas
             await record("llm_request", "main_agent", {
                 "turn": turn, "position": "main_loop", "message_count": len(llm_messages), "tool_count": len(tool_schemas),
@@ -448,7 +475,7 @@ class AgentLoop:
                 await record("error", "main_agent", {"message": str(exc), "turn": turn})
                 capture_bad_case("main_agent_failure", "main_agent", str(exc))
                 await finish("failed")
-                schedule_trace_capture(turn_result.text)
+                schedule_trace_capture(turn_result.text, status="failed")
                 yield ResponseChunk(type="error", data={
                     "message": f"LLM调用失败: {exc}", "trace_id": "",
                 })
@@ -461,7 +488,7 @@ class AgentLoop:
                 await record("error", "main_agent", {"message": turn_result.error, "turn": turn})
                 capture_bad_case("main_agent_failure", "main_agent", turn_result.error)
                 await finish("failed")
-                schedule_trace_capture(turn_result.text)
+                schedule_trace_capture(turn_result.text, status="failed")
                 yield ResponseChunk(type="error", data={
                     "message": turn_result.error, "trace_id": "",
                 })
@@ -554,6 +581,9 @@ class AgentLoop:
                     answers = session.question_answers or []
                     resolved_answers = resolve_question_answers(params.get("questions", []), answers)
                     tool_ctx.history_evidence["user_input"] += "\n\n" + json.dumps(resolved_answers, ensure_ascii=False)
+                    history_store.append_request_event(
+                        history_request_id, "user_answer", json.dumps(resolved_answers, ensure_ascii=False),
+                    )
                     ctx.messages.append(Message(
                         role="tool_result",
                         content=json.dumps(resolved_answers, ensure_ascii=False),
@@ -571,7 +601,6 @@ class AgentLoop:
                     await record("tool_result", "tool", {
                         "tool": tool_name, "success": True, "data": resolved_answers,
                     }, tool_event_id)
-                    feedback_trace_requested = True
                     continue
 
                 # Execute tool — SubAgent gets special streaming treatment
@@ -628,8 +657,10 @@ class AgentLoop:
                     subagent_history = {
                         "user_input": tool_ctx.history_evidence.get("user_input", ""),
                         "main_delegation": task,
+                        "history_request_id": history_request_id,
                         "dependencies": {},
                     }
+                    history_store.append_request_event(history_request_id, "main_delegation", task)
                     if chapter_path:
                         subagent_history["target_path"] = chapter_path
                     if chapter_path and self.review_workflow and "对应卷纲" in artifact_context:
@@ -660,6 +691,18 @@ class AgentLoop:
                         if sub_chunk.type == "subagent_done":
                             subagent_result_text = sub_chunk.data.get("result", "")
                             writer_revision_events = sub_chunk.data.get("revision_events", [])
+                            targets = {str(item.get("path") or "") for item in writer_revision_events}
+                            if not targets and chapter_path:
+                                targets = {chapter_path}
+                            for target in targets - {""}:
+                                if sub_chunk.data.get("history_thinking"):
+                                    history_store.append_document_event(
+                                        history_request_id, target, f"{preset}_thinking",
+                                        sub_chunk.data["history_thinking"],
+                                    )
+                                history_store.append_document_event(
+                                    history_request_id, target, f"{preset}_output", subagent_result_text,
+                                )
                             if sub_chunk.data.get("empty_result"):
                                 subagent_failed = True
                                 subagent_result_text = "Error: 子 Agent 未返回有效内容"
@@ -702,6 +745,21 @@ class AgentLoop:
                                     f"workflow:{workflow_chunk.data.get('workflow', 'review_polish')}",
                                     tool_event_id,
                                 )
+                                if workflow_chunk.type == "subagent_done":
+                                    workflow_preset = str(workflow_chunk.data.get("preset") or "")
+                                    for kind, value in (
+                                        (f"{workflow_preset}_thinking", workflow_chunk.data.get("history_thinking")),
+                                        (f"{workflow_preset}_output", workflow_chunk.data.get("result")),
+                                    ):
+                                        if value:
+                                            history_store.append_document_event(
+                                                history_request_id, event["path"], kind, str(value),
+                                            )
+                                elif workflow_chunk.type == "error":
+                                    history_store.append_document_event(
+                                        history_request_id, event["path"], "workflow_failure",
+                                        str(workflow_chunk.data.get("message") or ""),
+                                    )
                                 yield workflow_chunk
                             await workflow_trace_stream.flush()
 
@@ -738,6 +796,16 @@ class AgentLoop:
                     "error": result.error if not result.success else "",
                     "revision_events": tool_ctx.revision_events[revision_event_start:],
                 }, tool_event_id, duration)
+                if not result.success and tool_name in {"Write", "Edit", "SubAgent"}:
+                    failed_path = str(params.get("path") or (chapter_path if tool_name == "SubAgent" else "") or "")
+                    if failed_path.endswith(".md"):
+                        history_store.append_document_event(
+                            history_request_id, failed_path, "tool_failure", result.error,
+                        )
+                    else:
+                        history_store.append_request_event(
+                            history_request_id, "tool_failure", f"{tool_name}: {result.error}",
+                        )
                 if not result.success and not (tool_name == "SubAgent" and subagent_failed):
                     capture_bad_case(
                         "tool_failure", "main_agent", result.error or f"{tool_name} 执行失败",
@@ -772,7 +840,7 @@ class AgentLoop:
                 if loop_count >= self.loop_threshold:
                     await record("loop_detected", "system", {"turn": turn})
                     await finish("interrupted")
-                    schedule_trace_capture(final_text)
+                    schedule_trace_capture(final_text, status="interrupted")
                     yield ResponseChunk(type="done", data={"finish_reason": "loop_detected",
                                                             "trace_id": ""})
                     return
@@ -787,6 +855,7 @@ class AgentLoop:
                 params={"max_turns": self.max_turns, "last_tool_call_count": len(last_tool_calls)},
             )
             ctx.messages.append(Message(role="user", content=FINALIZATION_PROMPT))
+            history_store.update_request_context(history_request_id, ctx.to_llm_messages())
             await record("llm_request", "main_agent", {
                 "turn": turn + 1, "position": "main_loop", "message_count": len(ctx.to_llm_messages()),
                 "tool_count": 0, "forced_finalization": True,

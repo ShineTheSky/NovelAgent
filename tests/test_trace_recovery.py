@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 from novelagent.storage import database
 from novelagent.trace.file_analyzer import FileTraceAnalyzer
@@ -99,5 +100,38 @@ def test_prepared_window_replays_without_llm_and_without_duplicate(tmp_path, mon
         final_window = await trace_store.get_trace_window(window["window_id"])
         assert final_window["status"] == "complete"
         assert final_window["summary"] == "本轮确认动作场景空间关系要求。"
+
+    asyncio.run(scenario())
+
+
+def test_production_trace_window_only_writes_compression_summary(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "summary-only.db"))
+
+    class LLM:
+        calls = 0
+
+        async def chat(self, **_kwargs):
+            self.calls += 1
+            yield type("Chunk", (), {"type": "text_delta", "content": json.dumps({
+                "window_summary": "用户讨论了章节节奏，后续需核对改稿。",
+            }, ensure_ascii=False)})()
+
+    async def scenario():
+        await database.init()
+        trace_store = TraceStore()
+        recorder = TraceRecorder(trace_store)
+        trace_id = await recorder.start("session-a", "project-a", "这段节奏太快")
+        await recorder.finish(trace_id, "completed", "收到")
+        await trace_store.append_session_turn("session-a", "这段节奏太快", "收到", source_trace_id=trace_id)
+        window = await trace_store.capture_pending_trace_window("session-a", "project-a", [])
+        llm = LLM()
+        analyzer = FileTraceAnalyzer(llm, str(tmp_path / "workspace"), trace_store)
+        await analyzer.summarize_window(window["window_id"], "project-a")
+        await analyzer.summarize_window(window["window_id"], "project-a")
+        assert llm.calls == 1
+        assert (await trace_store.get_trace_window(window["window_id"]))["summary"] == "用户讨论了章节节奏，后续需核对改稿。"
+        files = FileLifecycleStore(str(tmp_path / "workspace"), "project-a")
+        assert files.list("insight") == []
+        assert files.list("memory") == []
 
     asyncio.run(scenario())

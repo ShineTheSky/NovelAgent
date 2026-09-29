@@ -5,7 +5,7 @@ from novelagent.tools.base import PermissionResult, ToolContext, ToolProtocol, T
 
 class CreateTraceCheckpointTool(ToolProtocol):
     name = "CreateTraceCheckpoint"
-    description = "当用户提出关键纠错、长期偏好、明确确认或重要项目设定时，提前记录当前聚合 Trace 并安排后台分析。"
+    description = "仅在诊断需要时提前关闭当前 Trace 摘要窗口；普通记忆由 History 在请求结束后提炼。"
     parameters = {
         "type": "object",
         "properties": {

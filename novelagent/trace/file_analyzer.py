@@ -831,9 +831,45 @@ class FileTraceAnalyzer:
                     )
                 raise
 
+    async def summarize_window(self, window_id: str, project_id: str,
+                               branch_messages=None, _tools=None) -> None:
+        """Keep Trace summaries for compression without deriving ordinary memories."""
+        lock = self._project_locks.setdefault(project_id, asyncio.Lock())
+        async with lock:
+            window = await self.trace_store.get_trace_window(window_id)
+            if not window or window.get("status") == "complete":
+                return
+            await self.trace_store.set_trace_window_status(window_id, "running")
+            try:
+                events = await self.trace_store.list_trace_window_events(window_id)
+                turns = [self._event_summary(event) for event in self._select_analysis_events(events)]
+                prompt = (
+                    "只概括以下会话窗口供后续上下文压缩。保留用户明确的要求、待办、"
+                    "决定、文件路径、修订结果和未解决问题；不提取或写入记忆。"
+                    "只输出 JSON：{\"window_summary\":\"...\"}。\n"
+                    + json.dumps(turns, ensure_ascii=False)
+                )
+                result = self._json(await self._chat_text(
+                    [{"role": "user", "content": prompt}], "memory_summary_fallback",
+                    tag=":trace-window/summary",
+                ))
+                summary = str(result.get("window_summary") or "").strip()[:8000]
+                if not summary:
+                    raise ValueError("Trace window summary is empty")
+                await self.trace_store.complete_trace_window_summary(window_id, summary)
+            except Exception as exc:
+                state = await self.trace_store.record_trace_window_failure(window_id, str(exc))
+                if state.get("status") == "retry_wait" and self.background_tasks:
+                    self.background_tasks.submit(
+                        self._retry_window_after(window_id, project_id,
+                                                 int(state.get("delay_seconds") or 0)),
+                        label=f"trace-summary-retry:{window_id}",
+                    )
+                raise
+
     async def _retry_window_after(self, window_id: str, project_id: str, delay_seconds: int) -> None:
         await asyncio.sleep(max(0, delay_seconds))
-        await self.analyze_window(window_id, project_id)
+        await self.summarize_window(window_id, project_id)
 
     async def recover_pending_windows(self) -> int:
         """Resume durable window jobs after process startup or an interrupted write."""
@@ -847,7 +883,7 @@ class FileTraceAnalyzer:
                 )
                 continue
             try:
-                await self.analyze_window(window["window_id"], window["project_id"])
+                await self.summarize_window(window["window_id"], window["project_id"])
             except Exception as exc:
                 print(f"[trace] window recovery failed: {window['window_id']}: {exc}", flush=True)
         return len(windows)

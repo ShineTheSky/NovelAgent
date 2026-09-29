@@ -35,7 +35,11 @@ class RecordNoChangeTool(ToolProtocol):
             revision_id = history.ensure_baseline(path)
             if revision_id != params["expected_revision_id"]:
                 return ToolResult(success=False, error=f"revision_conflict: 当前版本 {revision_id}")
-            history.record_no_change(revision_id, str(params["opinion"]), str(params["rationale"]))
+            request_id = str(context.history_evidence.get("history_request_id") or "")
+            history.record_no_change(
+                revision_id, str(params["opinion"]), str(params["rationale"]),
+                request_id=request_id, path=str(params["path"]),
+            )
             return ToolResult(success=True, data=f"无需修改的决定已记录于 {params['path']}@{revision_id}")
         except Exception as exc:
             return ToolResult(success=False, error=str(exc))

@@ -21,6 +21,7 @@ from novelagent.tools.subagent_tool import SubAgentTool
 from novelagent.tools.ask_user_question import AskUserQuestionTool
 from novelagent.tools.create_trace_checkpoint import CreateTraceCheckpointTool
 from novelagent.tools.record_no_change import RecordNoChangeTool
+from novelagent.history.analyzer import HistoryAnalyzer
 from novelagent.tools.search_rag import SearchRagTool
 from novelagent.security.permission_checker import PermissionChecker
 from novelagent.context.builder import ContextBuilder
@@ -117,6 +118,7 @@ def create_app() -> FastAPI:
         llm_client, working_dir, trace_store, embedding_gate, rag_store, bad_case_recorder,
         agent_trace_tasks,
     )
+    history_analyzer = HistoryAnalyzer(llm_client, working_dir, trace_store)
     preference_context_provider = FilePatternContextProvider(working_dir)
 
     agent_config = {
@@ -139,7 +141,7 @@ def create_app() -> FastAPI:
     agent_loop = AgentLoop(
         llm_client, registry, permission_checker, context_builder, memory_manager, agent_config, subagent_runner,
         trace_recorder, post_turn_analyzer, preference_context_provider,
-        rag_store, bash_case_recorder, bad_case_analyzer, agent_trace_tasks,
+        rag_store, bash_case_recorder, bad_case_analyzer, agent_trace_tasks, history_analyzer,
     )
 
     # Inject into app state
@@ -168,6 +170,7 @@ def create_app() -> FastAPI:
         agent_trace_tasks.submit(
             post_turn_analyzer.recover_pending_windows(), label="trace-window-recovery",
         )
+        agent_trace_tasks.submit(history_analyzer.recover(), label="history-analysis-recovery")
 
     @app.on_event("shutdown")
     async def shutdown():

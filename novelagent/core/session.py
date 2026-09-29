@@ -46,3 +46,4 @@ class Session:
     permission_granted: bool = False
     # 用户问答（运行时动态设置）
     question_answers: list | None = None
+    active_history_request_id: str = ""

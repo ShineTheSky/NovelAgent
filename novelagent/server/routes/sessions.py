@@ -243,6 +243,17 @@ async def send_message(session_id: str, body: SendMessageRequest, request: Reque
             yield f"event: error\ndata: {json.dumps({'type': 'error', 'message': f'服务器内部错误: {e}', 'timestamp': ''})}\n\n"
         finally:
             active_trace_id = getattr(session, "active_trace_id", "")
+            active_history_request_id = getattr(session, "active_history_request_id", "")
+            if active_history_request_id:
+                from novelagent.history import DocumentHistoryStore
+                session.active_history_request_id = ""
+                try:
+                    DocumentHistoryStore(project_dir).close_request(
+                        active_history_request_id, "interrupted", "",
+                        [active_history_request_id, active_trace_id] if active_trace_id else [active_history_request_id],
+                    )
+                except Exception as history_error:
+                    print(f"[history] interrupted request close failed: {history_error}", flush=True)
             if active_trace_id and agent_loop.trace:
                 session.active_trace_id = ""
                 asyncio.create_task(agent_loop.trace.finish(active_trace_id, "interrupted"))

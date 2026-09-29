@@ -170,6 +170,20 @@ class SubAgentRunner:
                 messages=messages or [{"role": "system", "content": system_prompt}, *initial_messages],
             )
 
+        def retain_failed_attempt(error: str) -> None:
+            request_id = str(history.get("history_request_id") or "")
+            if not request_id:
+                return
+            store = DocumentHistoryStore(f"{self.working_dir}/{parent_session.project_id}")
+            target = str(history.get("target_path") or "")
+            if target:
+                if thinking_kind and history.get(thinking_kind):
+                    store.append_document_event(request_id, target, thinking_kind,
+                                                str(history[thinking_kind]))
+                store.append_document_event(request_id, target, "tool_failure", error)
+            else:
+                store.append_request_event(request_id, "tool_failure", f"{preset_name}: {error}")
+
         async def execute_tool(tool_name, params, tool_call_id):
             if tool_name == "AskUserQuestion":
                 import asyncio
@@ -251,6 +265,7 @@ class SubAgentRunner:
                     if agent_trace:
                         await agent_trace.finish("failed", error=ev["error"])
                     await capture_bad_case("subagent_failure", ev["error"])
+                    retain_failed_attempt(str(ev["error"]))
                     yield ResponseChunk(type="error", data={**src, "message": f"子Agent执行失败: {ev['error']}"})
                     return
                 elif ev["type"] == "result":
@@ -261,6 +276,7 @@ class SubAgentRunner:
             if agent_trace:
                 await agent_trace.finish("failed", error=str(e))
             await capture_bad_case("subagent_failure", str(e))
+            retain_failed_attempt(str(e))
             yield ResponseChunk(type="error", data={**src, "message": f"子Agent执行失败: {e}"})
             return
 
@@ -268,6 +284,7 @@ class SubAgentRunner:
             if agent_trace:
                 await agent_trace.finish("failed", error="子 Agent 未返回有效内容")
             await capture_bad_case("empty_response", "子 Agent 未返回有效内容")
+            retain_failed_attempt("子 Agent 未返回有效内容")
         elif agent_trace:
             if self.trace_tasks:
                 self.trace_tasks.submit(
@@ -282,7 +299,7 @@ class SubAgentRunner:
             store = DocumentHistoryStore(f"{self.working_dir}/{parent_session.project_id}")
             for revision in revision_events:
                 store.add_evidence(revision["revision_id"], history)
-        elif preset_name == "chapter_polisher" and not empty_result and result_text.startswith("无需修改："):
+        elif preset_name in {"chapter_polisher", "reviewer"} and not empty_result and result_text.startswith("无需修改："):
             rationale = result_text.partition("：")[2].strip()
             target_path = str(history.get("target_path") or "")
             opinion = "\n\n".join(filter(None, (
@@ -294,7 +311,11 @@ class SubAgentRunner:
                 if target.is_file() and target.is_relative_to(project_dir.resolve()):
                     store = DocumentHistoryStore(project_dir)
                     revision_id = store.ensure_baseline(target)
-                    store.record_no_change(revision_id, opinion, result_text)
+                    request_id = str(history.get("history_request_id") or "")
+                    store.record_no_change(
+                        revision_id, opinion, result_text,
+                        request_id=request_id, path=target_path,
+                    )
         yield ResponseChunk(type="subagent_done", data={
             **src, "result": result_text, "empty_result": empty_result,
             "revision_events": revision_events,
