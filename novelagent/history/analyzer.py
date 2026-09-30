@@ -18,6 +18,8 @@ from novelagent.trace.semantic_extraction import (
 
 
 class HistoryAnalyzer:
+    _VERSION_EVENTS = {"revision", "revision_reference"}
+
     def __init__(self, llm_client, workspace_dir: str, trace_store):
         self.llm = llm_client
         self.workspace_dir = Path(workspace_dir)
@@ -87,7 +89,7 @@ class HistoryAnalyzer:
                  "content": event["content"],
                  "preset": "reviewer" if event["kind"].startswith("reviewer_") else "",
                  "params": {"path": unit.get("path", "")}}
-                for event in unit["events"]]
+                for event in unit["events"] if event["kind"] not in HistoryAnalyzer._VERSION_EVENTS]
 
     @staticmethod
     def _evidence_view(unit: dict) -> dict:
@@ -106,14 +108,16 @@ class HistoryAnalyzer:
             "session_turn_no": unit["session_turn_no"],
             "base_revision_id": unit["base_revision_id"],
             "final_revision_id": unit["final_revision_id"],
+            "previous_history_id": unit.get("previous_history_id", ""),
             "previous_attempt_id": unit["previous_attempt_id"],
             "previous_attempt_events": [
                 {"kind": e["kind"], "content": e["content"], "revision_id": e["revision_id"]}
                 for e in unit.get("previous_attempt_events", [])
+                if e["kind"] not in HistoryAnalyzer._VERSION_EVENTS
             ],
             "events": [{"event_id": e["event_id"], "kind": e["kind"],
                         "content": e["content"], "revision_id": e["revision_id"]}
-                       for e in unit["events"]],
+                       for e in unit["events"] if e["kind"] not in HistoryAnalyzer._VERSION_EVENTS],
             "revisions": revisions,
             "selected_turns": unit["selected_turns"],
             "actual_model_context": unit["context"][-12:],
@@ -146,7 +150,8 @@ class HistoryAnalyzer:
                     response = await self._chat_json(
                         "[History 记忆提取]\nHistory 是证据根源；Trace 仅用于诊断和上下文摘要。"
                         "只保留未来值得复用的事实；无需记忆时 records=[]。不得把模型推测当用户意见，"
-                        "不得把审阅建议当已确认的用户偏好。针对文件的修改，比较本单元全部版本和评价，"
+                        "不得把审阅建议当已确认的用户偏好。修订 ID 仅用于定位版本，不能作为记忆事实或引用证据。"
+                        "针对文件的修改，比较本单元全部版本和评价，"
                         "分析用户需求、Agent 思考与实际改法之间的差异。"
                         "每条记录必须引用下方真实 event_id（source_event_ids），并给出与现有记录的关系。"
                         "若现有语义证据不足以判断合并关系，把对应 history_id 或 revision_id 放入 needs_history_ids，"
@@ -200,7 +205,8 @@ class HistoryAnalyzer:
 
     def _apply(self, project_id: str, unit: dict, prepared: dict) -> None:
         files = FileLifecycleStore(str(self.workspace_dir), project_id)
-        valid = {event["event_id"] for event in unit["events"]}
+        valid = {event["event_id"] for event in unit["events"]
+                 if event["kind"] not in self._VERSION_EVENTS}
         for index, raw in enumerate(prepared.get("records", [])):
             if not isinstance(raw, dict):
                 continue

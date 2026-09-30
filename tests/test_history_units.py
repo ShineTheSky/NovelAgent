@@ -66,6 +66,81 @@ def test_one_request_with_two_files_creates_two_units_after_all_asks(tmp_path):
                for history_id in ids)
 
 
+def test_agent_runs_on_same_file_form_separate_history_units(tmp_path):
+    store = DocumentHistoryStore(tmp_path / "project-a")
+    store.start_request("root", "session-a", "修改本节")
+    path = store.project_dir / "chapters" / "content_1.1.1.md"
+    for run_id, changes in (("writer", [("rev-1", None, "初稿"), ("rev-2", "rev-1", "改稿")]),
+                            ("polisher", [("rev-3", "rev-2", "润色稿")])):
+        request_id = store.run_request_id("root", run_id)
+        store.start_request(request_id, "session-a", "修改本节", parent_request_id="root")
+        for revision_id, parent_id, body in changes:
+            store.record_revision(path, revision_id, parent_id, body, body,
+                                  previous_body="改稿" if parent_id else "",
+                                  previous_rendered="改稿" if parent_id else "",
+                                  evidence={"history_request_id": request_id})
+        store.close_request(request_id, "completed", "完成", ["root"])
+    ids = store.close_request("root", "completed", "完成", ["root"])
+    units = store.list_document_units("chapters/content_1.1.1.md")
+    assert [unit["history_id"] for unit in units] == ids
+    assert [(unit["base_revision_id"], unit["final_revision_id"]) for unit in units] == [
+        ("", "rev-2"), ("rev-2", "rev-3")]
+    assert len(units[0]["revisions"]) == 2
+    assert units[0]["previous_history_id"] == ""
+    assert units[1]["previous_history_id"] == units[0]["history_id"]
+    assert store.get_unit(store._unit_id("root", "request"))["kind"] == "request"
+
+
+def test_no_change_and_unwritten_failure_do_not_advance_file_history(tmp_path):
+    store = DocumentHistoryStore(tmp_path / "project-a")
+    path = "chapters/content_1.1.1.md"
+    store.start_request("first", "session-a", "写正文")
+    store.record_revision(store.project_dir / path, "rev-1", None, "初稿", "初稿",
+                          evidence={"history_request_id": "first"})
+    first_id = store.close_request("first", "completed", "已写")[0]
+
+    store.start_request("evaluation", "session-a", "需要改吗？")
+    store.record_no_change("rev-1", "需要改吗？", "无需修改",
+                           request_id="evaluation", path=path)
+    evaluation_id = store.close_request("evaluation", "completed", "无需修改")[0]
+    assert store.get_unit(evaluation_id)["previous_history_id"] == first_id
+
+    store.start_request("failed", "session-a", "尝试修改")
+    store.append_document_event("failed", path, "tool_failure", "修订冲突")
+    store.close_request("failed", "completed", "修改失败")
+    failed_id = store._unit_id("failed", "document", path)
+    assert store.get_unit(failed_id)["previous_history_id"] == first_id
+
+    store.start_request("second", "session-a", "修改正文")
+    store.record_revision(store.project_dir / path, "rev-2", "rev-1", "改稿", "改稿",
+                          previous_body="初稿", previous_rendered="初稿",
+                          evidence={"history_request_id": "second"})
+    second_id = store.close_request("second", "completed", "已修改")[0]
+    assert store.get_unit(second_id)["previous_history_id"] == first_id
+
+
+def test_failed_run_that_wrote_a_revision_remains_in_file_chain(tmp_path):
+    store = DocumentHistoryStore(tmp_path / "project-a")
+    path = "chapters/content_1.1.1.md"
+    for request_id, revision_id, parent_id, status in (
+        ("first", "rev-1", None, "completed"),
+        ("partial", "rev-2", "rev-1", "failed"),
+        ("next", "rev-3", "rev-2", "completed"),
+    ):
+        store.start_request(request_id, "session-a", request_id)
+        store.record_revision(store.project_dir / path, revision_id, parent_id,
+                              revision_id, revision_id,
+                              previous_body=parent_id or "",
+                              previous_rendered=parent_id or "",
+                              evidence={"history_request_id": request_id})
+        store.close_request(request_id, status, status)
+    first = store.get_unit(store._unit_id("first", "document", path))
+    partial = store.get_unit(store._unit_id("partial", "document", path))
+    next_unit = store.get_unit(store._unit_id("next", "document", path))
+    assert partial["previous_history_id"] == first["history_id"]
+    assert next_unit["previous_history_id"] == partial["history_id"]
+
+
 def test_no_change_is_event_without_new_body_version(tmp_path):
     store = DocumentHistoryStore(tmp_path / "project-a")
     path = store.project_dir / "chapters" / "content_1.1.1.md"
@@ -173,6 +248,37 @@ def test_extracted_source_text_must_occur_in_user_evidence(tmp_path):
     record = FileLifecycleStore(str(tmp_path), "project-a").list("memory")[0]
     assert "source_text" not in record
     assert record["semantic_evidence"][0]["history_excerpts"][0]["content"] == "这句太直白：她握紧杯子。"
+
+
+def test_revision_markers_cannot_be_memory_sources(tmp_path):
+    store = DocumentHistoryStore(tmp_path / "project-a")
+    store.start_request("trace-revision", "session-a", "把语气改得克制")
+    path = "chapters/content_1.1.2.md"
+    store.record_revision(store.project_dir / path, "rev-1", None, "改稿", "改稿",
+                          evidence={"history_request_id": "trace-revision"})
+    store.append_document_event("trace-revision", path, "revision_reference",
+                                '{"revision_id":"rev-1"}')
+    history_id = store.close_request("trace-revision", "completed", "已修改")[0]
+    unit = store.get_unit(history_id)
+    user_id = next(e["event_id"] for e in unit["events"] if e["kind"] == "user_input")
+    revision_ids = [e["event_id"] for e in unit["events"]
+                    if e["kind"] in {"revision", "revision_reference"}]
+    analyzer = HistoryAnalyzer(None, str(tmp_path), None)
+    view = analyzer._evidence_view(unit)
+    assert not {"revision", "revision_reference"} & {e["kind"] for e in view["events"]}
+    assert not {"revision", "revision_reference"} & {
+        e["type"] for e in analyzer._event_view(unit)}
+    analyzer._apply("project-a", unit, {"records": [{
+        "layer": "memory", "claim": "修订号不是偏好", "source_event_ids": revision_ids,
+    }]})
+    assert FileLifecycleStore(str(tmp_path), "project-a").list("memory") == []
+    analyzer._apply("project-a", unit, {"records": [{
+        "layer": "memory", "claim": "写作语气保持克制",
+        "source_event_ids": [*revision_ids, user_id],
+    }]})
+    record = FileLifecycleStore(str(tmp_path), "project-a").list("memory")[0]
+    assert record["history_event_ids"] == [user_id]
+    assert record["semantic_evidence"][0]["history_excerpts"][0]["kind"] == "user_input"
 
 
 def test_two_findings_in_one_history_add_only_one_independent_support(tmp_path):

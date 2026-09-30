@@ -658,6 +658,7 @@ class AgentLoop:
                         "user_input": tool_ctx.history_evidence.get("user_input", ""),
                         "main_delegation": task,
                         "history_request_id": history_request_id,
+                        "root_history_request_id": history_request_id,
                         "dependencies": {},
                     }
                     history_store.append_request_event(history_request_id, "main_delegation", task)
@@ -691,18 +692,6 @@ class AgentLoop:
                         if sub_chunk.type == "subagent_done":
                             subagent_result_text = sub_chunk.data.get("result", "")
                             writer_revision_events = sub_chunk.data.get("revision_events", [])
-                            targets = {str(item.get("path") or "") for item in writer_revision_events}
-                            if not targets and chapter_path:
-                                targets = {chapter_path}
-                            for target in targets - {""}:
-                                if sub_chunk.data.get("history_thinking"):
-                                    history_store.append_document_event(
-                                        history_request_id, target, f"{preset}_thinking",
-                                        sub_chunk.data["history_thinking"],
-                                    )
-                                history_store.append_document_event(
-                                    history_request_id, target, f"{preset}_output", subagent_result_text,
-                                )
                             if sub_chunk.data.get("empty_result"):
                                 subagent_failed = True
                                 subagent_result_text = "Error: 子 Agent 未返回有效内容"
@@ -719,7 +708,8 @@ class AgentLoop:
                     # Writer commits are the only automatic trigger.  Polisher commits do not recurse.
                     workflow_summaries = []
                     if preset == "chapter_writer" and self.review_workflow:
-                        chapter_events = [event for event in writer_revision_events if self.review_workflow.is_chapter(event.get("path", ""))]
+                        chapter_events = list({event["path"]: event for event in writer_revision_events
+                                               if self.review_workflow.is_chapter(event.get("path", ""))}.values())
                         for event in chapter_events:
                             yield ResponseChunk(type="thinking", data={"content": "章节已写入，正在自动审阅并润色…", "workflow": "auto_review"})
                             workflow_trace_stream = TraceStreamBuffer(record)
@@ -745,21 +735,6 @@ class AgentLoop:
                                     f"workflow:{workflow_chunk.data.get('workflow', 'review_polish')}",
                                     tool_event_id,
                                 )
-                                if workflow_chunk.type == "subagent_done":
-                                    workflow_preset = str(workflow_chunk.data.get("preset") or "")
-                                    for kind, value in (
-                                        (f"{workflow_preset}_thinking", workflow_chunk.data.get("history_thinking")),
-                                        (f"{workflow_preset}_output", workflow_chunk.data.get("result")),
-                                    ):
-                                        if value:
-                                            history_store.append_document_event(
-                                                history_request_id, event["path"], kind, str(value),
-                                            )
-                                elif workflow_chunk.type == "error":
-                                    history_store.append_document_event(
-                                        history_request_id, event["path"], "workflow_failure",
-                                        str(workflow_chunk.data.get("message") or ""),
-                                    )
                                 yield workflow_chunk
                             await workflow_trace_stream.flush()
 

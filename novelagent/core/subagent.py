@@ -84,6 +84,15 @@ class SubAgentRunner:
         history["dependencies"] = dict(history.get("dependencies") or {})
         history["run_id"] = current_run_id
         history.setdefault("main_delegation", task)
+        root_history_id = str(history.get("root_history_request_id") or history.get("history_request_id") or "")
+        history_store = None
+        if root_history_id:
+            history_store = DocumentHistoryStore(f"{self.working_dir}/{parent_session.project_id}")
+            history["root_history_request_id"] = root_history_id
+            history["history_request_id"] = history_store.run_request_id(root_history_id, current_run_id)
+            history_store.start_request(history["history_request_id"], parent_session.session_id,
+                                        str(history.get("user_input") or ""), parent_request_id=root_history_id)
+            history_store.append_request_event(history["history_request_id"], "main_delegation", task)
         thinking_kind = {
             "chapter_writer": "writer_thinking",
             "chapter_polisher": "polisher_thinking",
@@ -180,9 +189,14 @@ class SubAgentRunner:
                 if thinking_kind and history.get(thinking_kind):
                     store.append_document_event(request_id, target, thinking_kind,
                                                 str(history[thinking_kind]))
+                for kind in ("reviewer_thinking", "reviewer_output", "reviewer_delegation"):
+                    if kind != thinking_kind and history.get(kind):
+                        store.append_document_event(request_id, target, kind, str(history[kind]))
                 store.append_document_event(request_id, target, "tool_failure", error)
             else:
                 store.append_request_event(request_id, "tool_failure", f"{preset_name}: {error}")
+            store.close_request(request_id, "failed", error,
+                                [source_trace_id, agent_trace.trace_id if agent_trace else ""])
 
         async def execute_tool(tool_name, params, tool_call_id):
             if tool_name == "AskUserQuestion":
@@ -196,6 +210,9 @@ class SubAgentRunner:
                     history.get("user_input", ""),
                     json.dumps(resolved_answers, ensure_ascii=False),
                 )))
+                if history_store:
+                    history_store.append_request_event(history["history_request_id"], "user_answer",
+                                                       json.dumps(resolved_answers, ensure_ascii=False))
                 return True, json.dumps(resolved_answers, ensure_ascii=False), ""
             try:
                 tool = self.tools.get(tool_name)
@@ -207,11 +224,25 @@ class SubAgentRunner:
                     operation_id=operation_id,
                     revision_events=revision_events,
                     permission_decision="not_checked",
-                    source_trace_id=operation_id,
+                    source_trace_id=agent_trace.trace_id if agent_trace else source_trace_id,
                     history_evidence=history,
                 )
                 result = await tool.execute(params, sub_ctx)
                 data = result.data if isinstance(result.data, str) else json.dumps(result.data, ensure_ascii=False)
+                if history_store and tool_name in {"Write", "Edit"}:
+                    raw_path = str(params.get("path") or "")
+                    project_dir = Path(self.working_dir) / parent_session.project_id
+                    target = (project_dir / raw_path).resolve()
+                    if target.is_relative_to(project_dir.resolve()) and target.suffix == ".md":
+                        path = target.relative_to(project_dir.resolve()).as_posix()
+                        history_store.append_document_event(history["history_request_id"], path,
+                                                            "file_change_attempt", json.dumps({
+                            "tool": tool_name, "params": params, "success": result.success,
+                            "result": data if result.success else result.error,
+                        }, ensure_ascii=False))
+                        if not result.success:
+                            history_store.append_document_event(history["history_request_id"], path,
+                                                                "tool_failure", result.error)
                 return result.success, data, result.error
             except Exception as e:
                 return False, "", str(e)
@@ -299,6 +330,16 @@ class SubAgentRunner:
             store = DocumentHistoryStore(f"{self.working_dir}/{parent_session.project_id}")
             for revision in revision_events:
                 store.add_evidence(revision["revision_id"], history)
+            for target in {str(item.get("path") or "") for item in revision_events} - {""}:
+                for kind, value in (
+                    (thinking_kind, history.get(thinking_kind) if thinking_kind else ""),
+                    (f"{preset_name}_output", result_text),
+                    ("reviewer_thinking", history.get("reviewer_thinking")),
+                    ("reviewer_output", history.get("reviewer_output")),
+                    ("reviewer_delegation", history.get("reviewer_delegation")),
+                ):
+                    if kind and value:
+                        store.append_document_event(history["history_request_id"], target, kind, str(value))
         elif preset_name in {"chapter_polisher", "reviewer"} and not empty_result and result_text.startswith("无需修改："):
             rationale = result_text.partition("：")[2].strip()
             target_path = str(history.get("target_path") or "")
@@ -316,6 +357,20 @@ class SubAgentRunner:
                         revision_id, opinion, result_text,
                         request_id=request_id, path=target_path,
                     )
+                    recorded_kinds = set()
+                    for kind, value in (
+                        (thinking_kind, history.get(thinking_kind) if thinking_kind else ""),
+                        ("reviewer_thinking", history.get("reviewer_thinking")),
+                        ("reviewer_output", history.get("reviewer_output")),
+                        ("reviewer_delegation", history.get("reviewer_delegation")),
+                    ):
+                        if kind and value and kind not in recorded_kinds:
+                            store.append_document_event(request_id, target_path, kind, str(value))
+                            recorded_kinds.add(kind)
+        if history_store:
+            history_store.close_request(history["history_request_id"],
+                                        "failed" if empty_result else "completed", result_text,
+                                        [value for value in (source_trace_id, agent_trace.trace_id if agent_trace else "") if value])
         yield ResponseChunk(type="subagent_done", data={
             **src, "result": result_text, "empty_result": empty_result,
             "revision_events": revision_events,

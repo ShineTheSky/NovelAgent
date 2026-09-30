@@ -10,6 +10,7 @@ import type {
 } from '../types/chat';
 import type { LLMPositionUpdate, LLMSettings, ProviderSettingsUpdate } from '../types/llm';
 import type { LifecycleRecord, TraceAgentStats, TraceEvidence, TracePage, TraceValidation } from '../types/insights';
+import type { HistoryFilePage, HistoryKind, HistoryPage, HistoryUnit } from '../types/history';
 import type { MaterialDocument, MaterialTree, NovelDocument, NovelTree } from '../types/novel';
 
 const BASE = '/api';
@@ -423,6 +424,23 @@ export function validateTrace(traceId: string) {
 
 export function fetchTraceAgentStats(projectId: string) {
   return requestJson<TraceAgentStats>(`/projects/${resourceId(projectId)}/trace-agent-stats`);
+}
+
+export function fetchHistoryFiles(projectId: string, offset = 0, limit = 25) {
+  return requestJson<HistoryFilePage>(
+    `/projects/${resourceId(projectId)}/history/files?offset=${offset}&limit=${limit}`,
+  );
+}
+
+export function fetchProjectHistory(projectId: string, kind: HistoryKind | '', offset = 0,
+                                    limit = 25, path = '') {
+  const params = new URLSearchParams({ kind, offset: String(offset), limit: String(limit) });
+  if (path) params.set('path', path);
+  return requestJson<HistoryPage>(`/projects/${resourceId(projectId)}/history?${params}`);
+}
+
+export function fetchHistoryUnit(projectId: string, historyId: string) {
+  return requestJson<HistoryUnit>(`/projects/${resourceId(projectId)}/history/${resourceId(historyId)}`);
 }
 
 export type { Message };

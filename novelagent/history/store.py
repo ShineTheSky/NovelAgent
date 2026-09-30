@@ -79,12 +79,14 @@ class DocumentHistoryStore:
             CREATE TABLE IF NOT EXISTS history_units (
                 history_id TEXT PRIMARY KEY,
                 request_id TEXT NOT NULL,
+                parent_request_id TEXT NOT NULL DEFAULT '',
                 session_id TEXT NOT NULL,
                 session_turn_no INTEGER NOT NULL DEFAULT 0,
                 kind TEXT NOT NULL,
                 path TEXT NOT NULL DEFAULT '',
                 base_revision_id TEXT NOT NULL DEFAULT '',
                 final_revision_id TEXT NOT NULL DEFAULT '',
+                previous_history_id TEXT NOT NULL DEFAULT '',
                 previous_attempt_id TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'collecting',
                 analysis_status TEXT NOT NULL DEFAULT 'pending',
@@ -112,6 +114,13 @@ class DocumentHistoryStore:
             CREATE INDEX IF NOT EXISTS idx_history_units_status
                 ON history_units(status, analysis_status);
         """)
+        if "parent_request_id" not in {row[1] for row in db.execute("PRAGMA table_info(history_units)")}:
+            db.execute("ALTER TABLE history_units ADD COLUMN parent_request_id TEXT NOT NULL DEFAULT ''")
+        if "previous_history_id" not in {row[1] for row in db.execute("PRAGMA table_info(history_units)")}:
+            db.execute("ALTER TABLE history_units ADD COLUMN previous_history_id TEXT NOT NULL DEFAULT ''")
+            for row in db.execute("""SELECT history_id FROM history_units
+                WHERE kind = 'document' ORDER BY created_at, rowid""").fetchall():
+                self._link_document_history(db, row["history_id"])
         try:
             yield db
             db.commit()
@@ -136,13 +145,14 @@ class DocumentHistoryStore:
         return uuid.uuid5(uuid.NAMESPACE_URL, f"history:{request_id}:{kind}:{path}").hex
 
     def start_request(self, request_id: str, session_id: str, user_input: str,
-                      context: list[dict] | None = None) -> str:
+                      context: list[dict] | None = None, parent_request_id: str = "") -> str:
         history_id = self._unit_id(request_id, "request")
         with self._connect() as db:
             db.execute("""INSERT OR IGNORE INTO history_units
-                (history_id, request_id, session_id, kind, context_json)
-                VALUES (?, ?, ?, 'request', ?)""",
-                (history_id, request_id, session_id, json.dumps(context or [], ensure_ascii=False)))
+                (history_id, request_id, parent_request_id, session_id, kind, context_json)
+                VALUES (?, ?, ?, ?, 'request', ?)""",
+                (history_id, request_id, parent_request_id, session_id,
+                 json.dumps(context or [], ensure_ascii=False)))
             db.execute("""INSERT OR IGNORE INTO history_events(event_id, history_id, kind, content)
                 VALUES (?, ?, 'user_input', ?)""",
                 (f"{history_id}:input", history_id, user_input))
@@ -155,6 +165,10 @@ class DocumentHistoryStore:
 
     def append_request_event(self, request_id: str, kind: str, content: str) -> str:
         return self._append_event(self._unit_id(request_id, "request"), kind, content)
+
+    @staticmethod
+    def run_request_id(request_id: str, run_id: str) -> str:
+        return f"{request_id}:run:{run_id}"
 
     def _append_event(self, history_id: str, kind: str, content: str,
                       revision_id: str = "", event_id: str = "") -> str:
@@ -182,6 +196,32 @@ class DocumentHistoryStore:
              previous["history_id"] if previous and previous["status"] in {"failed", "interrupted"} else ""))
         return history_id
 
+    @staticmethod
+    def _link_document_history(db: sqlite3.Connection, history_id: str) -> None:
+        current = db.execute("""SELECT history_id, path, base_revision_id, final_revision_id,
+            created_at, rowid FROM history_units WHERE history_id = ? AND kind = 'document'""",
+            (history_id,)).fetchone()
+        if not current:
+            return
+        previous = None
+        if current["base_revision_id"]:
+            previous = db.execute("""SELECT history_id FROM history_units
+                WHERE kind = 'document' AND path = ? AND history_id != ?
+                  AND final_revision_id = ?
+                  AND (created_at < ? OR (created_at = ? AND rowid < ?))
+                ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                (current["path"], history_id, current["base_revision_id"],
+                 current["created_at"], current["created_at"], current["rowid"])).fetchone()
+        if not previous and not current["final_revision_id"]:
+            previous = db.execute("""SELECT history_id FROM history_units
+                WHERE kind = 'document' AND path = ? AND final_revision_id != ''
+                  AND (created_at < ? OR (created_at = ? AND rowid < ?))
+                ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                (current["path"], current["created_at"], current["created_at"],
+                 current["rowid"])).fetchone()
+        db.execute("UPDATE history_units SET previous_history_id = ? WHERE history_id = ?",
+                   (previous["history_id"] if previous else "", history_id))
+
     def attach_revision(self, request_id: str, path: str, revision_id: str,
                         base_revision_id: str = "") -> str:
         with self._connect() as db:
@@ -192,9 +232,11 @@ class DocumentHistoryStore:
                          revision_id: str, base_revision_id: str) -> str:
         history_id = self._document_unit(db, request_id, path)
         db.execute("""UPDATE history_units SET
-            base_revision_id = CASE WHEN base_revision_id = '' THEN ? ELSE base_revision_id END,
+            base_revision_id = CASE WHEN NOT EXISTS (
+                SELECT 1 FROM history_events WHERE history_id = ? AND kind = 'revision'
+            ) THEN ? ELSE base_revision_id END,
             final_revision_id = ? WHERE history_id = ?""",
-            (base_revision_id, revision_id, history_id))
+            (history_id, base_revision_id, revision_id, history_id))
         db.execute("""INSERT OR IGNORE INTO history_events
             (event_id, history_id, kind, content, revision_id) VALUES (?, ?, 'revision', ?, ?)""",
             (f"{history_id}:revision:{revision_id}", history_id, revision_id, revision_id))
@@ -225,10 +267,17 @@ class DocumentHistoryStore:
                 return []
             document_ids = [row[0] for row in db.execute("""SELECT history_id FROM history_units
                 WHERE request_id = ? AND kind = 'document' ORDER BY rowid""", (request_id,))]
+            child_ids = [row[0] for row in db.execute("""SELECT d.history_id FROM history_units d
+                JOIN history_units r ON r.request_id = d.request_id AND r.kind = 'request'
+                WHERE r.parent_request_id = ? AND d.kind = 'document'
+                ORDER BY d.rowid""", (request_id,))]
             db.execute("""UPDATE history_units SET status = ?, assistant_response = ?,
                 trace_ids_json = ?, session_turn_no = ? WHERE request_id = ?""",
                 (status, answer, json.dumps(trace_ids or [request_id]), session_turn_no, request_id))
-            if document_ids:
+            if document_ids or child_ids:
+                db.execute("UPDATE history_units SET kind = 'request' WHERE history_id = ?",
+                           (request_history_id,))
+            elif request["parent_request_id"]:
                 db.execute("UPDATE history_units SET kind = 'request' WHERE history_id = ?",
                            (request_history_id,))
             else:
@@ -237,7 +286,7 @@ class DocumentHistoryStore:
             if status != "completed":
                 db.execute("UPDATE history_units SET analysis_status = 'deferred' WHERE request_id = ?",
                            (request_id,))
-            elif document_ids:
+            elif document_ids or child_ids:
                 db.execute("UPDATE history_units SET analysis_status = 'routed' WHERE history_id = ?",
                            (request_history_id,))
                 db.execute("""UPDATE history_units SET status = 'failed', analysis_status = 'deferred'
@@ -248,9 +297,14 @@ class DocumentHistoryStore:
                     WHERE request_id = ? AND kind = 'document'
                     AND history_id IN (SELECT history_id FROM history_events WHERE kind = 'workflow_failure')""",
                     (request_id,))
+            elif request["parent_request_id"]:
+                db.execute("UPDATE history_units SET analysis_status = 'routed' WHERE history_id = ?",
+                           (request_history_id,))
+            for history_id in document_ids:
+                self._link_document_history(db, history_id)
         if status != "completed":
             return []
-        return [row for row in (document_ids or [request_history_id])
+        return [row for row in (document_ids + child_ids or [request_history_id])
                 if (self.get_unit(row) or {}).get("status") == "completed"]
 
     def list_analyzable(self) -> list[str]:
@@ -311,6 +365,62 @@ class DocumentHistoryStore:
                 WHERE kind = 'document' AND path = ? ORDER BY created_at, rowid""",
                 (path.replace("\\", "/"),))]
         return [self.get_unit(history_id) for history_id in ids]
+
+    def list_files(self, *, limit: int = 25, offset: int = 0) -> dict:
+        """List file-level History groups without loading individual evidence."""
+        if not self.db_path.exists():
+            return {"items": [], "total": 0}
+        with self._connect() as db:
+            total = db.execute("""SELECT COUNT(DISTINCT path) FROM history_units
+                WHERE kind = 'document'""").fetchone()[0]
+            rows = db.execute("""SELECT path, COUNT(*) AS history_count,
+                       MAX(created_at) AS updated_at,
+                       (SELECT recent.history_id FROM history_units recent
+                        WHERE recent.kind = 'document' AND recent.path = h.path
+                        ORDER BY recent.created_at DESC, recent.rowid DESC LIMIT 1)
+                       AS latest_history_id
+                    FROM history_units h WHERE kind = 'document'
+                    GROUP BY path ORDER BY updated_at DESC, path LIMIT ? OFFSET ?""",
+                (limit, offset)).fetchall()
+        return {"items": [dict(row) for row in rows], "total": total}
+
+    def list_units(self, *, kind: str = "", path: str = "", limit: int = 25,
+                   offset: int = 0) -> dict:
+        """List lightweight project History summaries without loading revision bodies."""
+        if kind not in {"", "document", "conversation"}:
+            raise ValueError(kind)
+        if path and kind != "document":
+            raise ValueError("A file path requires kind=document")
+        if not self.db_path.exists():
+            return {"items": [], "total": 0}
+        where = "kind IN ('document', 'conversation')"
+        args: list = []
+        if kind:
+            where += " AND kind = ?"
+            args.append(kind)
+        if path:
+            where += " AND path = ?"
+            args.append(path.replace("\\", "/"))
+        with self._connect() as db:
+            total = db.execute(f"SELECT COUNT(*) FROM history_units WHERE {where}", args).fetchone()[0]
+            rows = db.execute(f"""SELECT h.history_id, h.kind, h.path, h.status,
+                       h.analysis_status, h.created_at, h.session_turn_no,
+                       h.base_revision_id, h.final_revision_id, h.previous_history_id,
+                       (SELECT substr(e.content, 1, 240) FROM history_events e
+                        WHERE e.history_id = CASE WHEN h.kind = 'document' THEN
+                            (SELECT r.history_id FROM history_units r
+                             WHERE r.request_id = h.request_id AND r.kind = 'request')
+                            ELSE h.history_id END
+                          AND e.kind = 'user_input' LIMIT 1) AS user_input,
+                       (SELECT substr(e.content, 1, 240) FROM history_events e
+                        JOIN history_units r ON r.history_id = e.history_id
+                        WHERE r.request_id = h.request_id AND r.kind = 'request'
+                          AND e.kind = 'main_delegation' LIMIT 1) AS task_summary
+                    FROM history_units h WHERE {where}
+                    ORDER BY h.created_at DESC, h.rowid DESC LIMIT ? OFFSET ?""",
+                [*args, limit, offset],
+            ).fetchall()
+        return {"items": [dict(row) for row in rows], "total": total}
 
     def set_selected_turns(self, history_id: str, turns: dict) -> None:
         with self._connect() as db:

@@ -21,6 +21,42 @@ def _files(request: Request, project_id: str) -> FileLifecycleStore:
     return FileLifecycleStore(request.app.state.agent_loop.working_dir, project_id)
 
 
+def _history(request: Request, project_id: str) -> DocumentHistoryStore:
+    workspace = Path(request.app.state.agent_loop.working_dir).resolve()
+    project_dir = (workspace / project_id).resolve()
+    if not project_dir.is_relative_to(workspace):
+        raise HTTPException(status_code=403, detail="项目路径越界")
+    if not project_dir.is_dir():
+        raise HTTPException(status_code=404, detail="项目不存在")
+    return DocumentHistoryStore(project_dir)
+
+
+@router.get("/projects/{project_id}/history/files")
+async def list_project_history_files(project_id: str, request: Request,
+                                     limit: int = Query(25, ge=1, le=100),
+                                     offset: int = Query(0, ge=0)):
+    return _history(request, project_id).list_files(limit=limit, offset=offset)
+
+
+@router.get("/projects/{project_id}/history")
+async def list_project_history(project_id: str, request: Request, kind: str = "", path: str = "",
+                               limit: int = Query(25, ge=1, le=100), offset: int = Query(0, ge=0)):
+    if kind not in {"", "document", "conversation"}:
+        raise HTTPException(status_code=422, detail="无效的 History 类型")
+    if path and kind != "document":
+        raise HTTPException(status_code=422, detail="文件路径仅适用于文件 History")
+    return _history(request, project_id).list_units(kind=kind, path=path,
+                                                     limit=limit, offset=offset)
+
+
+@router.get("/projects/{project_id}/history/{history_id}")
+async def get_project_history(project_id: str, history_id: str, request: Request):
+    unit = _history(request, project_id).get_unit(history_id)
+    if unit is None or unit["kind"] not in {"document", "conversation"}:
+        raise HTTPException(status_code=404, detail="History 不存在")
+    return unit
+
+
 @router.post("/projects/{project_id}/traces/analyze-pending")
 @router.post("/projects/{project_id}/history/analyze-pending")
 async def analyze_pending_history(project_id: str, request: Request):
