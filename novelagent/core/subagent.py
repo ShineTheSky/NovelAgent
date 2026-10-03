@@ -1,6 +1,7 @@
 """子Agent创建与编排"""
 
 import json
+from copy import deepcopy
 from pathlib import Path
 import uuid
 from novelagent.tools.subagent_tool import SubAgentTool
@@ -69,6 +70,8 @@ class SubAgentRunner:
         run_id: str = "", parent_run_id: str = "", workflow: str = "",
         context_as_user_message: bool = False, source_trace_id: str = "",
         history_evidence: dict | None = None,
+        fork_context: list[dict] | None = None,
+        context_snapshot: list[dict] | None = None,
     ):
         preset = self.presets_tool.get_preset(preset_name)
         if preset is None:
@@ -78,10 +81,17 @@ class SubAgentRunner:
         inherit = inherit_history if inherit_history is not None else preset.get("inherit_history", True)
         max_turns = preset.get("max_turns", 20)
         tool_names = preset.get("tools", [])
+        if preset_name == "reviewer":
+            tool_names = [name for name in tool_names if name in {"Read", "Glob", "Grep", "TextStats", "CheckContent", "AskUserQuestion"}]
+            preset = {**preset, "tools": tool_names}
+        if fork_context and preset_name != "reviewer":
+            raise ValueError("Only reviewer can fork writing context")
 
         current_run_id = run_id or uuid.uuid4().hex
         history = dict(history_evidence or {})
         history["dependencies"] = dict(history.get("dependencies") or {})
+        history["user_answers"] = list(history.get("user_answers") or [])
+        history["requirement_event_ids"] = list(history.get("requirement_event_ids") or [])
         history["run_id"] = current_run_id
         history.setdefault("main_delegation", task)
         root_history_id = str(history.get("root_history_request_id") or history.get("history_request_id") or "")
@@ -90,9 +100,25 @@ class SubAgentRunner:
             history_store = DocumentHistoryStore(f"{self.working_dir}/{parent_session.project_id}")
             history["root_history_request_id"] = root_history_id
             history["history_request_id"] = history_store.run_request_id(root_history_id, current_run_id)
-            history_store.start_request(history["history_request_id"], parent_session.session_id,
-                                        str(history.get("user_input") or ""), parent_request_id=root_history_id)
+            request_history_id = history_store.start_request(
+                history["history_request_id"], parent_session.session_id,
+                "" if history.get("requirement_history_id") else str(history.get("user_input") or ""), parent_request_id=root_history_id)
+            if history.get("requirement_history_id"):
+                history_store.set_requirement_refs(history["history_request_id"], history["requirement_history_id"], history["requirement_event_ids"])
+            for index, answers in enumerate(history["user_answers"] if not history.get("requirement_history_id") else []):
+                history_store.append_request_event(
+                    history["history_request_id"], "user_answer", json.dumps(answers, ensure_ascii=False),
+                    event_id=f"{request_history_id}:answer:{index}")
             history_store.append_request_event(history["history_request_id"], "main_delegation", task)
+            if preset_name == "reviewer":
+                if not history.get("requirement_history_id"):
+                    requirement_id = history_store._unit_id(root_history_id, "request")
+                    history_store.set_requirement_refs(history["history_request_id"], requirement_id, [f"{requirement_id}:input"])
+                    history["requirement_history_id"] = requirement_id
+                    history["requirement_event_ids"] = [f"{requirement_id}:input"]
+                history["review_history_id"] = history_store.start_review(history["history_request_id"], str(history.get("target_path") or ""))
+            elif history.get("review_history_id"):
+                history_store.link_review(history["history_request_id"], history["review_history_id"])
         thinking_kind = {
             "chapter_writer": "writer_thinking",
             "chapter_polisher": "polisher_thinking",
@@ -127,6 +153,15 @@ class SubAgentRunner:
             if runtime_context:
                 initial_messages.append({"role": "user", "content": runtime_context})
         initial_messages.append({"role": "user", "content": task})
+        if fork_context:
+            runtime_context = "\n\n".join(part for part in (fixed_context, extra_context) if part)
+            initial_messages = [*deepcopy(fork_context), {"role": "user", "content":
+                "【服务端阶段切换：审阅】\n写作阶段已结束。保留以上上下文作为证据，以下是本阶段的审阅要求（不取消安全约束）：\n"
+                + system_prompt + "\n\n" + runtime_context + "\n\n" + task}]
+            system_prompt = ""
+        if history_store:
+            history_store.update_request_context(history["history_request_id"],
+                ([{"role": "system", "content": system_prompt}] if system_prompt else []) + initial_messages)
 
         # Debug
         import sys
@@ -153,7 +188,7 @@ class SubAgentRunner:
             if agent_trace:
                 agent_trace.add_request(
                     position="sub_agent", tag=f":sub/{preset_name}",
-                    messages=[{"role": "system", "content": system_prompt}, *initial_messages],
+                    messages=([{"role": "system", "content": system_prompt}] if system_prompt else []) + initial_messages,
                     tools=sub_tool_schemas,
                 )
 
@@ -185,7 +220,10 @@ class SubAgentRunner:
                 return
             store = DocumentHistoryStore(f"{self.working_dir}/{parent_session.project_id}")
             target = str(history.get("target_path") or "")
-            if target:
+            if preset_name == "reviewer":
+                store.record_review(request_id, str(history.get("reviewer_thinking") or ""), "")
+                store.append_request_event(request_id, "tool_failure", error)
+            elif target:
                 if thinking_kind and history.get(thinking_kind):
                     store.append_document_event(request_id, target, thinking_kind,
                                                 str(history[thinking_kind]))
@@ -199,20 +237,31 @@ class SubAgentRunner:
                                 [source_trace_id, agent_trace.trace_id if agent_trace else ""])
 
         async def execute_tool(tool_name, params, tool_call_id):
+            if preset_name == "reviewer" and tool_name not in tool_names:
+                return False, "", f"审阅阶段禁止调用 {tool_name}；只能使用只读工具和 AskUserQuestion"
             if tool_name == "AskUserQuestion":
                 import asyncio
+                if history_store and history.get("requirement_history_id"):
+                    history_store.append_request_event(root_history_id, "question_ask", json.dumps({"run_id": current_run_id, "questions": params.get("questions", [])}, ensure_ascii=False))
                 parent_session.question_event = asyncio.Event()
                 parent_session.question_answers = None
                 await parent_session.question_event.wait()
                 answers = parent_session.question_answers or []
                 resolved_answers = resolve_question_answers(params.get("questions", []), answers)
+                history["user_answers"].append(resolved_answers)
                 history["user_input"] = "\n\n".join(filter(None, (
                     history.get("user_input", ""),
                     json.dumps(resolved_answers, ensure_ascii=False),
                 )))
                 if history_store:
-                    history_store.append_request_event(history["history_request_id"], "user_answer",
-                                                       json.dumps(resolved_answers, ensure_ascii=False))
+                    answer_event_id = history_store.append_request_event(
+                        root_history_id if history.get("requirement_history_id") else history["history_request_id"],
+                        "user_answer", json.dumps(resolved_answers, ensure_ascii=False),
+                        scope={"run_id": current_run_id, "preset": preset_name, "path": history.get("target_path", "")})
+                    if history.get("requirement_history_id"):
+                        history["last_answer_event_id"] = answer_event_id
+                        history["requirement_event_ids"].append(answer_event_id)
+                        history_store.set_requirement_refs(history["history_request_id"], history["requirement_history_id"], history["requirement_event_ids"])
                 return True, json.dumps(resolved_answers, ensure_ascii=False), ""
             try:
                 tool = self.tools.get(tool_name)
@@ -255,6 +304,7 @@ class SubAgentRunner:
                 system_prompt=system_prompt, tools=sub_tool_schemas if sub_tool_schemas else None,
                 max_turns=max_turns, tag=f":sub/{preset_name}",
                 execute_tool=execute_tool, sub_type=preset_name,
+                context_snapshot=context_snapshot,
             ):
                 if ev["type"] in {"thinking", "text_delta"}:
                     record_agent_event(ev["type"], {"content": ev["content"]})
@@ -282,7 +332,8 @@ class SubAgentRunner:
                 elif ev["type"] == "tool_call":
                     yield ResponseChunk(type="tool_call", data={**src, "tool": ev["tool"], "params": ev["params"]})
                 elif ev["type"] == "tool_result":
-                    yield ResponseChunk(type="tool_result", data={**src, "tool": ev["tool"], "success": ev["success"], "data": ev["data"], "error": ev["error"]})
+                    yield ResponseChunk(type="tool_result", data={**src, "tool": ev["tool"], "success": ev["success"], "data": ev["data"], "error": ev["error"],
+                        "requirement_event_id": history.get("last_answer_event_id", "") if ev["tool"] == "AskUserQuestion" else ""})
                 elif ev["type"] == "question_ask":
                     yield ResponseChunk(type="question_ask", data={**src, "questions": ev["questions"]})
                 elif ev["type"] == "max_turns_exhausted":
@@ -326,6 +377,8 @@ class SubAgentRunner:
                 await agent_trace.finish("completed", result_text)
 
         print(f"[sub/{preset_name}] 完成: result_len={len(result_text)} preview={result_text[:100]}...", flush=True)
+        if history_store and preset_name == "reviewer" and not empty_result:
+            history_store.record_review(history["history_request_id"], str(history.get("reviewer_thinking") or ""), result_text)
         if revision_events:
             store = DocumentHistoryStore(f"{self.working_dir}/{parent_session.project_id}")
             for revision in revision_events:
@@ -340,7 +393,7 @@ class SubAgentRunner:
                 ):
                     if kind and value:
                         store.append_document_event(history["history_request_id"], target, kind, str(value))
-        elif preset_name in {"chapter_polisher", "reviewer"} and not empty_result and result_text.startswith("无需修改："):
+        elif preset_name == "chapter_polisher" and not empty_result and result_text.startswith("无需修改："):
             rationale = result_text.partition("：")[2].strip()
             target_path = str(history.get("target_path") or "")
             opinion = "\n\n".join(filter(None, (
@@ -377,4 +430,7 @@ class SubAgentRunner:
             "agent_trace_id": agent_trace.trace_id if agent_trace else "",
             "history_thinking": history.get(thinking_kind, "") if thinking_kind else "",
             "history_user_input": history.get("user_input", ""),
+            "history_user_answers": history["user_answers"],
+            "requirement_event_ids": history["requirement_event_ids"],
+            "review_history_id": history.get("review_history_id", ""),
         })

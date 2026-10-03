@@ -158,6 +158,7 @@ class AgentLoop:
             }, parent_event_id)
             history_store.append_request_event(
                 history_request_id, "user_answer", json.dumps(answers, ensure_ascii=False),
+                event_id=str(data.get("requirement_event_id") or ""),
             )
 
         pi = project_info or {}
@@ -305,6 +306,7 @@ class AgentLoop:
                     history_request_id, status, answer, ids, current_turn,
                 )
                 if status == "completed" and self.history_analyzer:
+                    unit_ids.sort(key=lambda value: {"requirement": 0, "review": 1}.get((history_store.get_unit(value) or {}).get("kind"), 2))
                     for unit_id in unit_ids:
                         try:
                             await self.history_analyzer.analyze(session.project_id, unit_id)
@@ -353,6 +355,10 @@ class AgentLoop:
         history_store = DocumentHistoryStore(project_working_dir)
         history_store.start_request(history_request_id, session.session_id, request.content,
                                     ctx.to_llm_messages())
+        requirement_id = history_store._unit_id(history_request_id, "request")
+        tool_ctx.history_evidence.update(requirement_history_id=requirement_id,
+                                         requirement_event_ids=[f"{requirement_id}:input"])
+        history_store.set_requirement_refs(history_request_id, requirement_id, [f"{requirement_id}:input"])
 
         # 5.5. 进入循环前先检查是否需要压缩
         pre_check_tokens = self.context_builder.token_counter.count_messages(ctx.to_llm_messages())
@@ -503,6 +509,9 @@ class AgentLoop:
                 "reasoning_content": full_reasoning,
                 "tool_names": [call.tool_name for call in current_tool_calls],
             })
+            for kind, content in (("main_agent_thinking", full_reasoning), ("main_agent_output", full_response)):
+                if content:
+                    history_store.append_request_event(history_request_id, kind, content)
             print(f"[LLM:main] 循环结束: turn={turn}, text_len={len(full_response)}, tool_calls={len(current_tool_calls)}", flush=True)
 
             # No tool calls → final answer
@@ -575,15 +584,20 @@ class AgentLoop:
                         "questions": params.get("questions", []),
                     })
                     await record("question_ask", "main_agent", {"questions": params.get("questions", [])}, tool_event_id)
+                    history_store.append_request_event(history_request_id, "question_ask", json.dumps(params.get("questions", []), ensure_ascii=False))
                     session.question_event = asyncio.Event()
                     session.question_answers = None
                     await session.question_event.wait()
                     answers = session.question_answers or []
                     resolved_answers = resolve_question_answers(params.get("questions", []), answers)
                     tool_ctx.history_evidence["user_input"] += "\n\n" + json.dumps(resolved_answers, ensure_ascii=False)
-                    history_store.append_request_event(
+                    tool_ctx.history_evidence.setdefault("user_answers", []).append(resolved_answers)
+                    answer_event_id = history_store.append_request_event(
                         history_request_id, "user_answer", json.dumps(resolved_answers, ensure_ascii=False),
                     )
+                    tool_ctx.history_evidence["requirement_event_ids"].append(answer_event_id)
+                    history_store.set_requirement_refs(history_request_id, requirement_id,
+                                                       tool_ctx.history_evidence["requirement_event_ids"])
                     ctx.messages.append(Message(
                         role="tool_result",
                         content=json.dumps(resolved_answers, ensure_ascii=False),
@@ -656,18 +670,23 @@ class AgentLoop:
                     subagent_trace_stream = TraceStreamBuffer(record)
                     subagent_history = {
                         "user_input": tool_ctx.history_evidence.get("user_input", ""),
+                        "user_answers": list(tool_ctx.history_evidence.get("user_answers", [])),
                         "main_delegation": task,
                         "history_request_id": history_request_id,
                         "root_history_request_id": history_request_id,
+                        "requirement_history_id": requirement_id,
+                        "requirement_event_ids": list(tool_ctx.history_evidence["requirement_event_ids"]),
                         "dependencies": {},
                     }
-                    history_store.append_request_event(history_request_id, "main_delegation", task)
+                    history_store.append_request_event(history_request_id, "main_delegation", task,
+                        scope={"run_id": subagent_run_id, "preset": preset, "path": chapter_path or ""})
                     if chapter_path:
                         subagent_history["target_path"] = chapter_path
                     if chapter_path and self.review_workflow and "对应卷纲" in artifact_context:
                         subagent_history["dependencies"].update(
                             self.review_workflow.dependency_versions(session.project_id, chapter_path)
                         )
+                    writer_context = []
                     async for sub_chunk in self.subagent_runner.spawn_and_run(
                         preset, task, session, inherit,
                         attachments=attachments if not artifact_context else None,
@@ -679,6 +698,7 @@ class AgentLoop:
                         context_as_user_message=preset == "reviewer",
                         source_trace_id=trace_id,
                         history_evidence=subagent_history,
+                        context_snapshot=writer_context if preset == "chapter_writer" else None,
                     ):
                         await subagent_trace_stream.add(
                             f"subagent_{sub_chunk.type}", f"subagent:{preset}", sub_chunk.data, tool_event_id,
@@ -692,6 +712,9 @@ class AgentLoop:
                         if sub_chunk.type == "subagent_done":
                             subagent_result_text = sub_chunk.data.get("result", "")
                             writer_revision_events = sub_chunk.data.get("revision_events", [])
+                            subagent_history["user_input"] = sub_chunk.data.get("history_user_input", subagent_history["user_input"])
+                            subagent_history["user_answers"] = sub_chunk.data.get("history_user_answers", subagent_history["user_answers"])
+                            subagent_history["requirement_event_ids"] = sub_chunk.data.get("requirement_event_ids", subagent_history["requirement_event_ids"])
                             if sub_chunk.data.get("empty_result"):
                                 subagent_failed = True
                                 subagent_result_text = "Error: 子 Agent 未返回有效内容"
@@ -718,6 +741,7 @@ class AgentLoop:
                                 parent_run_id=subagent_run_id,
                                 source_trace_id=trace_id,
                                 history_evidence=subagent_history,
+                                fork_context=writer_context,
                             ):
                                 if (
                                     workflow_chunk.type == "subagent_done"
@@ -758,6 +782,12 @@ class AgentLoop:
                     duration = (time.time() - t0) * 1000
                 if tool_name == "CreateTraceCheckpoint" and result.success:
                     trace_checkpoint_requested = True
+                if tool_name == "Read" and result.success:
+                    path = str(params.get("path") or "").replace("\\", "/")
+                    revision_id = tool_ctx.history_evidence.get("dependencies", {}).get(path, "")
+                    history_store.append_request_event(history_request_id, "document_reference", json.dumps({
+                        "path": path, "revision_id": revision_id, "params": params, "content": result.data,
+                    }, ensure_ascii=False))
                 duration = (time.time() - t0) * 1000
 
                 audit_log(trace_id, tool_name, params,

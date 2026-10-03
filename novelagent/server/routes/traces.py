@@ -41,7 +41,7 @@ async def list_project_history_files(project_id: str, request: Request,
 @router.get("/projects/{project_id}/history")
 async def list_project_history(project_id: str, request: Request, kind: str = "", path: str = "",
                                limit: int = Query(25, ge=1, le=100), offset: int = Query(0, ge=0)):
-    if kind not in {"", "document", "conversation"}:
+    if kind not in {"", "document", "conversation", "requirement", "review"}:
         raise HTTPException(status_code=422, detail="无效的 History 类型")
     if path and kind != "document":
         raise HTTPException(status_code=422, detail="文件路径仅适用于文件 History")
@@ -52,7 +52,7 @@ async def list_project_history(project_id: str, request: Request, kind: str = ""
 @router.get("/projects/{project_id}/history/{history_id}")
 async def get_project_history(project_id: str, history_id: str, request: Request):
     unit = _history(request, project_id).get_unit(history_id)
-    if unit is None or unit["kind"] not in {"document", "conversation"}:
+    if unit is None or unit["kind"] not in {"document", "conversation", "requirement", "review"}:
         raise HTTPException(status_code=404, detail="History 不存在")
     return unit
 

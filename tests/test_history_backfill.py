@@ -210,6 +210,99 @@ def test_reorganize_splits_multiple_agent_runs_on_one_file(tmp_path):
     assert len(store.list_document_units("chapters/content_1.1.1.md")) == 2
 
 
+def test_reorganize_repairs_ask_answers_without_changing_earlier_runs(tmp_path):
+    workspace = tmp_path / "workspace"
+    project = workspace / "project-a"
+    project.mkdir(parents=True)
+    path = "chapters/content_1.1.2.md"
+    first_answer = [{"question": "语气如何？", "selected_options": [
+        {"label": "克制", "description": "通过动作表达，不直接解释情绪"}], "custom_input": "保留杯子细节"}]
+    second_answer = ["加上第一个月工资买鞋的来历"]
+    trace_db = tmp_path / "trace.db"
+    with _trace_db(trace_db) as db:
+        db.execute("INSERT INTO traces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   ("trace-ask", "session-a", "project-a", "main_agent", "live", "completed",
+                    "修改正文", "完成", "2026-01-01", None, 1))
+        sequence = 1
+        for index, run_id in enumerate(("before", "after-first", "after-second")):
+            if index:
+                _event(db, "trace-ask", sequence, "user_answer", {
+                    "answers": first_answer if index == 1 else second_answer})
+                sequence += 1
+            _event(db, "trace-ask", sequence, "subagent_subagent_start", {
+                "run_id": run_id, "preset": "chapter_polisher", "task_prompt": f"修改 {path}"})
+            sequence += 1
+            _event(db, "trace-ask", sequence, "subagent_subagent_done", {
+                "run_id": run_id, "preset": "chapter_polisher", "result": "已修改",
+                "revision_events": [{"path": path, "revision_id": f"rev-{index}",
+                                     "parent_revision_id": f"rev-{index - 1}" if index else ""}]})
+            sequence += 1
+    assert backfill(trace_db, workspace, apply=True)["errors"] == []
+    assert reorganize(trace_db, workspace, apply=True)["errors"] == []
+    store = DocumentHistoryStore(project)
+    before = [(u["history_id"], u["base_revision_id"], u["final_revision_id"])
+              for u in store.list_document_units(path)]
+    with sqlite3.connect(store.db_path) as db:
+        db.execute("DELETE FROM history_events WHERE kind='user_answer' AND history_id IN "
+                   "(SELECT history_id FROM history_units WHERE kind='document')")
+    assert backfill(trace_db, workspace, check=True)["errors"]
+    repaired = reorganize(trace_db, workspace, apply=True)
+    assert repaired["repaired_events"] == 3
+    units = store.list_document_units(path)
+    assert [(u["history_id"], u["base_revision_id"], u["final_revision_id"]) for u in units] == before
+    assert [[json.loads(e["content"]) for e in u["events"] if e["kind"] == "user_answer"]
+            for u in units] == [[], [first_answer], [first_answer, second_answer]]
+    assert reorganize(trace_db, workspace, apply=True)["repaired_events"] == 0
+    assert backfill(trace_db, workspace, check=True)["errors"] == []
+    # Live Agent runs store inherited answers in their child request, which is
+    # already part of the file History view; a later import must not duplicate it.
+    with sqlite3.connect(store.db_path) as db:
+        db.execute("UPDATE history_events SET history_id=? WHERE history_id=? AND kind='user_answer'",
+                   (store._unit_id(units[1]["request_id"], "request"), units[1]["history_id"]))
+    assert reorganize(trace_db, workspace, apply=True)["repaired_events"] == 0
+    assert backfill(trace_db, workspace, check=True)["errors"] == []
+
+
+def test_reviewer_ask_is_carried_to_polisher_without_leaking_to_other_files(tmp_path):
+    workspace = tmp_path / "workspace"
+    project = workspace / "project-a"
+    project.mkdir(parents=True)
+    trace_db = tmp_path / "trace.db"
+    path = "chapters/content_1.1.1.md"
+    answer = [{"question": "保留人物动机吗？", "custom_input": "保留，但通过行动表达"}]
+    with _trace_db(trace_db) as db:
+        db.execute("INSERT INTO traces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   ("trace-review", "session-a", "project-a", "main_agent", "live", "completed",
+                    "审阅正文", "完成", "2026-01-01", None, 1))
+        _event(db, "trace-review", 1, "workflow_subagent_start", {
+            "run_id": "reviewer", "preset": "reviewer", "parent_run_id": "writer",
+            "task_prompt": f"审阅 {path}"})
+        _event(db, "trace-review", 2, "workflow_tool_result", {
+            "run_id": "reviewer", "tool": "AskUserQuestion", "success": True,
+            "data": json.dumps(answer, ensure_ascii=False)})
+        _event(db, "trace-review", 3, "user_answer", {"source": "workflow:auto_review", "answers": answer})
+        _event(db, "trace-review", 4, "workflow_subagent_done", {
+            "run_id": "reviewer", "preset": "reviewer", "result": "需要用行动表达"})
+        for sequence, run_id, target, parent in (
+            (5, "polisher", path, "writer"),
+            (7, "other", "world/worldview.md", ""),
+        ):
+            _event(db, "trace-review", sequence, "workflow_subagent_start", {
+                "run_id": run_id, "preset": "chapter_polisher" if parent else "outliner",
+                "parent_run_id": parent, "task_prompt": f"修改 {target}"})
+            _event(db, "trace-review", sequence + 1, "workflow_subagent_done", {
+                "run_id": run_id, "result": "已修改",
+                "revision_events": [{"path": target, "revision_id": f"rev-{run_id}"}]})
+    assert backfill(trace_db, workspace, apply=True)["errors"] == []
+    assert reorganize(trace_db, workspace, apply=True)["errors"] == []
+    store = DocumentHistoryStore(project)
+    polisher = store.list_document_units(path)[0]
+    other = store.list_document_units("world/worldview.md")[0]
+    assert [json.loads(e["content"]) for e in polisher["events"] if e["kind"] == "user_answer"] == [answer]
+    assert not any(e["kind"] == "user_answer" for e in other["events"])
+    assert backfill(trace_db, workspace, check=True)["errors"] == []
+
+
 def test_linked_traces_split_by_user_turn_but_keep_compression_in_same_turn(tmp_path):
     workspace = tmp_path / "workspace"
     project = workspace / "project-a"

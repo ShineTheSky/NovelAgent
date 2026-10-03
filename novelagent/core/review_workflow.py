@@ -1,16 +1,18 @@
 """Program-owned chapter review and polish pipeline.
 
-The coordinator does not relay the novel body.  A completed writer revision
-causes this module to construct the identical leading artifact block for the
-reviewer and polisher, then it runs the two specialist agents in order.
+The reviewer forks the writer's finished model messages and receives its phase
+instructions at the end. Missing latest artifacts are appended, not replayed.
+The polisher receives current artifacts and the resulting two-part report.
 """
 
 import re
+import json
 from pathlib import Path
 
 from novelagent.core.session import ResponseChunk
 from novelagent.trace.file_lifecycle import FileLifecycleStore
 from novelagent.history import DocumentHistoryStore
+from novelagent.versioning import RevisionManager
 
 
 _CHAPTER_PATH = re.compile(r"^chapters/content_(\d+)\.(\d+)\.(\d+)\.md$", re.IGNORECASE)
@@ -89,6 +91,30 @@ class ReviewPolishWorkflow:
         """Expose the same deterministic context order to manual review/polish calls."""
         return self._artifact_context(project_id, chapter_path)
 
+    @staticmethod
+    def _missing_context(context: str, fork_context: list[dict]) -> str:
+        """Keep the fork prefix intact; append only artifact blocks absent from it."""
+        contents = [str(message.get("content") or "") for message in fork_context]
+        for message in fork_context:
+            for call in message.get("tool_calls", []):
+                try:
+                    args = json.loads(call.get("function", {}).get("arguments", "{}"))
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(args, dict) and isinstance(args.get("content"), str):
+                    contents.append(args["content"])
+        blocks = re.split(r"(?=^### )", context, flags=re.MULTILINE)
+        missing = []
+        for block in blocks:
+            heading, separator, body = block.partition("\n")
+            info = RevisionManager.parse(body)
+            if separator and not info.legacy and info.body.strip() and any(info.body.strip() in content for content in contents):
+                missing.append(f"{heading}\n当前修订：{info.revision_id}（正文已在继承的写作上下文中，不重复附带）")
+                continue
+            if separator and body.strip() and not any(body.strip() in content for content in contents):
+                missing.append(block.strip())
+        return "\n\n".join(missing)
+
     def dependency_versions(self, project_id: str, chapter_path: str) -> dict[str, str]:
         match = _CHAPTER_PATH.match(chapter_path.replace("\\", "/"))
         if not match:
@@ -135,32 +161,48 @@ class ReviewPolishWorkflow:
 
     async def run(self, parent_session, chapter_path: str, writer_task: str, operation_id: str,
                   parent_run_id: str = "", source_trace_id: str = "",
-                  history_evidence: dict | None = None):
+                  history_evidence: dict | None = None, fork_context: list[dict] | None = None):
         artifact_context, memory_context = self._artifact_context(parent_session.project_id, chapter_path)
         dependencies = self.dependency_versions(parent_session.project_id, chapter_path)
         reviewer_task = (
             f"审阅 `{chapter_path}`。这是写作 Agent 刚提交的版本；只输出可执行的结构化审阅报告，"
-            "不要写文件。请按“问题、证据、严重度、建议”列出；没有问题也明确说明。\n\n"
-            f"## 本轮写作需求（用于判断是否满足用户目标）\n{writer_task}"
+            "不要写文件。必须分别输出 `## 用户需求验收` 和 `## 常规写作检查`，"
+            "分别检查明确需求落实和其他常规问题；问题需附证据、严重度、建议，没有问题也明确说明。"
         )
+        if not fork_context:
+            reviewer_task += f"\n\n## 本轮写作需求（主 Agent 任务传递）\n{writer_task}"
+        elif not any(writer_task in str(m.get("content") or "") for m in fork_context):
+            reviewer_task += f"\n\n## 本轮写作需求（主 Agent 任务传递）\n{writer_task}"
+        raw_requirement = str((history_evidence or {}).get("user_input") or "")
+        if raw_requirement and (not fork_context or not any(raw_requirement in str(m.get("content") or "") for m in fork_context)):
+            reviewer_task += f"\n\n## 用户需求原文与澄清回答\n{raw_requirement}"
+        reviewer_artifact = self._missing_context(artifact_context, fork_context) if fork_context else artifact_context
+        reviewer_memory = self._missing_context(memory_context, fork_context) if fork_context else memory_context
         reviewer_result = ""
         reviewer_completed = False
         reviewer_empty = False
         reviewer_thinking = ""
+        review_history_id = ""
         reviewer_user_input = str((history_evidence or {}).get("user_input") or "")
+        reviewer_user_answers = list((history_evidence or {}).get("user_answers") or [])
+        requirement_event_ids = list((history_evidence or {}).get("requirement_event_ids") or [])
         async for chunk in self.runner.spawn_and_run(
             "reviewer", reviewer_task, parent_session, False,
-            extra_context=memory_context, artifact_context=artifact_context,
+            extra_context=reviewer_memory, artifact_context=reviewer_artifact,
             actor="reviewer", operation_id=f"{operation_id}:review",
             parent_run_id=parent_run_id, workflow="auto_review",
             context_as_user_message=True,
+            fork_context=fork_context,
             source_trace_id=source_trace_id,
             history_evidence={**(history_evidence or {}), "dependencies": dependencies,
                               "target_path": chapter_path},
         ):
             if chunk.type == "subagent_done":
                 reviewer_thinking = chunk.data.get("history_thinking", "")
+                review_history_id = chunk.data.get("review_history_id", "")
                 reviewer_user_input = chunk.data.get("history_user_input", reviewer_user_input)
+                reviewer_user_answers = chunk.data.get("history_user_answers", reviewer_user_answers)
+                requirement_event_ids = chunk.data.get("requirement_event_ids", requirement_event_ids)
                 reviewer_result = chunk.data.get("result", "")
                 reviewer_empty = bool(chunk.data.get("empty_result")) or not reviewer_result.strip()
                 reviewer_completed = not reviewer_empty and not reviewer_result.startswith("Error:")
@@ -194,9 +236,12 @@ class ReviewPolishWorkflow:
             history_evidence={
                 **(history_evidence or {}), "main_delegation": writer_task,
                 "user_input": reviewer_user_input,
+                "user_answers": reviewer_user_answers,
+                "requirement_event_ids": requirement_event_ids,
                 "reviewer_thinking": reviewer_thinking,
                 "reviewer_output": reviewer_result,
                 "reviewer_delegation": polisher_task,
+                "review_history_id": review_history_id,
                 "dependencies": dependencies,
                 "target_path": chapter_path,
             },

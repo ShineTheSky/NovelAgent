@@ -4,6 +4,7 @@ import { cancelLifecycleManualReview, downgradeLifecycleRecord, fetchInsights, f
 import type { LifecycleRecord, TraceEvidence } from '../types/insights';
 import { LifecycleRecordDetailDialog } from './LifecycleRecordDetailDialog';
 import { TraceDetailDialog } from './TraceDetailDialog';
+import { HistoryDetailDialog } from './HistoryDetailDialog';
 
 type Layer = 'insight' | 'memory' | 'pattern';
 const label: Record<Layer, string> = { insight: 'Insight', memory: 'Memory', pattern: 'Pattern' };
@@ -17,6 +18,7 @@ export function FileInsightsPanel({ projectId }: { projectId: string | null }) {
   const [error, setError] = useState<string | null>(null);
   const [selectedRecord, setSelectedRecord] = useState<LifecycleRecord | null>(null);
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
+  const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
   const [traceDetails, setTraceDetails] = useState<Record<string, TraceEvidence>>({});
   const [traceLoading, setTraceLoading] = useState(false);
   const [traceError, setTraceError] = useState<string | null>(null);
@@ -48,6 +50,7 @@ export function FileInsightsPanel({ projectId }: { projectId: string | null }) {
     setOpen(true);
     setSelectedRecord(null);
     setSelectedTraceId(null);
+    setSelectedHistoryId(null);
     void load();
   };
 
@@ -96,7 +99,7 @@ export function FileInsightsPanel({ projectId }: { projectId: string | null }) {
       <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" role="dialog" aria-modal="true">
         <div style={{ transform: `translate(${panelOffset.x}px, ${panelOffset.y}px)` }} className="relative flex max-h-[80vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
           <header onPointerDown={startDrag} onPointerMove={dragPanel} onPointerUp={stopDrag} onPointerCancel={stopDrag} className="flex cursor-grab touch-none items-start justify-between border-b px-6 py-5 active:cursor-grabbing">
-            <div><h2 className="font-semibold text-gray-800">项目洞察</h2><p className="mt-1 text-xs text-gray-400">点击记录 ID 查看正文；点击 Trace ID 回溯完整事件。</p></div>
+            <div><h2 className="font-semibold text-gray-800">项目洞察</h2><p className="mt-1 text-xs text-gray-400">点击记录 ID 查看正文；点击 History ID 查看来源历史；原始 Trace 保留在详情的诊断信息中。</p></div>
             <button type="button" onClick={() => setOpen(false)} className="text-gray-400 hover:text-gray-700">✕</button>
           </header>
           <div className="flex items-center gap-1 bg-gray-50 px-6 py-3">
@@ -105,11 +108,12 @@ export function FileInsightsPanel({ projectId }: { projectId: string | null }) {
           </div>
           <main className="min-h-0 flex-1 overflow-y-auto p-5">
             {error && <div role="alert" className="mb-3 rounded-lg border border-red-100 bg-red-50 px-3 py-2 text-sm text-red-600">{error}</div>}
-            {data[tab].map(record => <RecordCard key={record.id} record={record} tab={tab} onOpen={() => setSelectedRecord(record)} onOpenTrace={traceId => void openTrace(traceId)} onDowngrade={() => void downgrade(record)} onCancelManualReview={() => void cancelManualReview(record)} />)}
+            {data[tab].map(record => <RecordCard key={record.id} record={record} tab={tab} onOpen={() => setSelectedRecord(record)} onOpenTrace={traceId => void openTrace(traceId)} onOpenHistory={setSelectedHistoryId} onDowngrade={() => void downgrade(record)} onCancelManualReview={() => void cancelManualReview(record)} />)}
             {!busy && data[tab].length === 0 && <p className="py-16 text-center text-sm text-gray-400">暂无 {label[tab]}。</p>}
           </main>
-          {selectedRecord && <LifecycleRecordDetailDialog record={selectedRecord} onClose={() => setSelectedRecord(null)} onOpenTrace={traceId => void openTrace(traceId)} />}
+          {selectedRecord && <LifecycleRecordDetailDialog record={selectedRecord} onClose={() => setSelectedRecord(null)} onOpenTrace={traceId => void openTrace(traceId)} onOpenHistory={setSelectedHistoryId} />}
           {selectedTraceId && <TraceDetailDialog trace={selectedTrace} loading={traceLoading} error={traceError} onClose={() => { setSelectedTraceId(null); setTraceError(null); }} />}
+          {selectedHistoryId && projectId && <HistoryDetailDialog key={`${projectId}:${selectedHistoryId}`} projectId={projectId} historyId={selectedHistoryId} onClose={() => setSelectedHistoryId(null)} onSelectHistory={setSelectedHistoryId} />}
         </div>
       </div>,
       document.body,
@@ -117,11 +121,12 @@ export function FileInsightsPanel({ projectId }: { projectId: string | null }) {
   </>;
 }
 
-function RecordCard({ record, tab, onOpen, onOpenTrace, onDowngrade, onCancelManualReview }: {
+function RecordCard({ record, tab, onOpen, onOpenTrace, onOpenHistory, onDowngrade, onCancelManualReview }: {
   record: LifecycleRecord;
   tab: Layer;
   onOpen: () => void;
   onOpenTrace: (traceId: string) => void;
+  onOpenHistory: (historyId: string) => void;
   onDowngrade: () => void;
   onCancelManualReview: () => void;
 }) {
@@ -139,9 +144,11 @@ function RecordCard({ record, tab, onOpen, onOpenTrace, onDowngrade, onCancelMan
     <button type="button" onClick={onOpen} className="w-full text-left text-sm leading-6 text-gray-700 hover:text-purple-700">{record.title || record.claim}</button>
     {record.promotion_status === 'manual_review' && <p className="mt-2 text-xs leading-5 text-amber-700">{record.downgrade_reason || '用户曾手动降低该记录层级，后续不会自动恢复。'}</p>}
     <div className="mt-3 flex flex-wrap items-center gap-3 text-[11px] text-gray-400">
-      {traceRefs.map(ref => <button type="button" key={`${ref.trace_id}-${ref.turn ?? 'legacy'}`} onClick={() => onOpenTrace(ref.trace_id)} title={ref.trace_id} className="font-mono text-purple-600 hover:text-purple-800 hover:underline">Trace {ref.trace_id}{ref.turn ? ` · Turn ${ref.turn}` : ''}</button>)}
-      {traceRefs.length === 0 && <span>Trace -</span>}
-      <span>事件 {record.source_event_ids?.length || 0}</span>
+      {(record.history_ids ?? []).map(historyId => <button type="button" key={historyId} onClick={() => onOpenHistory(historyId)} title="查看来源 History（需求根或审阅）" className="break-all font-mono text-purple-600 hover:text-purple-800 hover:underline">History {historyId}</button>)}
+      {!record.history_ids?.length && !record.related_history_ids?.length && <span>尚未关联 History</span>}
+      {!!record.related_history_ids?.length && !record.history_ids?.length && <button type="button" onClick={onOpen} className="text-amber-700 hover:underline">相关 History {record.related_history_ids.length} 条（非直接来源）</button>}
+      {!record.history_ids?.length && traceRefs.length > 0 && <button type="button" onClick={() => onOpenTrace(traceRefs[0].trace_id)} className="text-gray-400 hover:underline">原始 Trace（诊断）</button>}
+      <span>History 证据 {record.history_event_ids?.length || 0}</span>
       {record.support_count && <span>支持 {record.support_count}</span>}
       <span className="ml-auto flex gap-3">
         {record.promotion_status === 'manual_review' && <button type="button" onClick={onCancelManualReview} className="text-purple-600 hover:text-purple-800">取消锁定</button>}

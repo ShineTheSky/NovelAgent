@@ -10,6 +10,11 @@ export interface LifecycleRecord {
   trace_ids?: string[];
   trace_refs?: Array<{ trace_id: string; turn: number; source_event_ids?: string[] }>;
   source_event_ids?: string[];
+  history_ids?: string[];
+  related_history_ids?: string[];
+  history_event_ids?: string[];
+  provenance_notes?: string[];
+  history_source_links?: Array<{ source_event_id: string; history_id: string; history_event_ids: string[]; match: 'evidence' | 'context' }>;
   weight: number;
   support_count?: number;
   promotion_status?: 'auto' | 'manual_review';

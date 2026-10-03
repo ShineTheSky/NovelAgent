@@ -1,6 +1,7 @@
 """共享 LLM query 执行器 — 主Agent和SubAgent共用"""
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 
@@ -23,6 +24,7 @@ async def query(
     execute_tool,      # async fn(tool_name, params, tool_call_id) -> (success, data, error)
     stop_check=None,   # fn() -> bool
     sub_type=None,
+    context_snapshot: list[dict] | None = None,
 ):
     """
     执行一次完整的 ReAct query（async generator）。
@@ -37,7 +39,11 @@ async def query(
       {"type": "error", "error": str}
       {"type": "result", "final_text": str}  # 最后一条
     """
-    full_messages = [{"role": "system", "content": system_prompt}] + list(messages)
+    full_messages = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + deepcopy(messages)
+
+    def save_context():
+        if context_snapshot is not None:
+            context_snapshot[:] = deepcopy(full_messages)
 
     for turn in range(max_turns):
         if stop_check and stop_check():
@@ -76,6 +82,7 @@ async def query(
                 "content": turn_result.full_response,
                 **({"reasoning_content": turn_result.full_reasoning} if turn_result.full_reasoning else {}),
             })
+            save_context()
             yield {"type": "result", "final_text": turn_result.full_response}
             return
 
@@ -114,9 +121,13 @@ async def query(
             elif chunk.type == "error":
                 yield {"type": "error", "error": chunk.error}
                 return
+        full_messages = [*full_messages, {"role": "assistant", "content": final_result.full_response,
+                              **({"reasoning_content": final_result.full_reasoning} if final_result.full_reasoning else {})}]
+        save_context()
         yield {"type": "result", "final_text": final_result.full_response}
         return
 
+    save_context()
     yield {"type": "result", "final_text": ""}
 
 

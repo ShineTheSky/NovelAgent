@@ -113,9 +113,34 @@ class DocumentHistoryStore:
                 ON history_units(path, created_at);
             CREATE INDEX IF NOT EXISTS idx_history_units_status
                 ON history_units(status, analysis_status);
+            CREATE TABLE IF NOT EXISTS history_requirement_refs (
+                history_id TEXT NOT NULL REFERENCES history_units(history_id),
+                event_id TEXT NOT NULL REFERENCES history_events(event_id),
+                PRIMARY KEY(history_id, event_id)
+            );
+            CREATE TABLE IF NOT EXISTS history_source_events (
+                source_event_id TEXT NOT NULL,
+                event_id TEXT NOT NULL REFERENCES history_events(event_id),
+                PRIMARY KEY(source_event_id, event_id)
+            );
+            CREATE TABLE IF NOT EXISTS history_event_order (
+                event_id TEXT PRIMARY KEY REFERENCES history_events(event_id),
+                event_order INTEGER,
+                occurred_at TEXT NOT NULL DEFAULT '',
+                order_status TEXT NOT NULL,
+                canonical_event_id TEXT NOT NULL DEFAULT '',
+                original_event_id TEXT NOT NULL DEFAULT ''
+            );
         """)
         if "parent_request_id" not in {row[1] for row in db.execute("PRAGMA table_info(history_units)")}:
             db.execute("ALTER TABLE history_units ADD COLUMN parent_request_id TEXT NOT NULL DEFAULT ''")
+        if "requirement_history_id" not in {row[1] for row in db.execute("PRAGMA table_info(history_units)")}:
+            db.execute("ALTER TABLE history_units ADD COLUMN requirement_history_id TEXT NOT NULL DEFAULT ''")
+        for column in ("review_history_id", "target_history_id"):
+            if column not in {row[1] for row in db.execute("PRAGMA table_info(history_units)")}:
+                db.execute(f"ALTER TABLE history_units ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+        if "scope_json" not in {row[1] for row in db.execute("PRAGMA table_info(history_events)")}:
+            db.execute("ALTER TABLE history_events ADD COLUMN scope_json TEXT NOT NULL DEFAULT '{}'")
         if "previous_history_id" not in {row[1] for row in db.execute("PRAGMA table_info(history_units)")}:
             db.execute("ALTER TABLE history_units ADD COLUMN previous_history_id TEXT NOT NULL DEFAULT ''")
             for row in db.execute("""SELECT history_id FROM history_units
@@ -156,6 +181,9 @@ class DocumentHistoryStore:
             db.execute("""INSERT OR IGNORE INTO history_events(event_id, history_id, kind, content)
                 VALUES (?, ?, 'user_input', ?)""",
                 (f"{history_id}:input", history_id, user_input))
+            if context and not parent_request_id:
+                db.execute("INSERT OR IGNORE INTO history_events(event_id, history_id, kind, content) VALUES (?, ?, 'initial_context', ?)",
+                           (f"{history_id}:initial-context", history_id, json.dumps(context, ensure_ascii=False)))
         return history_id
 
     def update_request_context(self, request_id: str, context: list[dict]) -> None:
@@ -163,8 +191,67 @@ class DocumentHistoryStore:
             db.execute("UPDATE history_units SET context_json = ? WHERE history_id = ?",
                        (json.dumps(context, ensure_ascii=False), self._unit_id(request_id, "request")))
 
-    def append_request_event(self, request_id: str, kind: str, content: str) -> str:
-        return self._append_event(self._unit_id(request_id, "request"), kind, content)
+    def start_review(self, request_id: str, path: str) -> str:
+        """Review is an addressable evidence node, never a new body revision."""
+        target = (self.project_dir / path).resolve()
+        relative = self._relative(target) if path else ""
+        revision_id = self.ensure_baseline(target) if path and target.is_file() else ""
+        history_id = self._unit_id(request_id, "request")
+        with self._connect() as db:
+            target_unit = db.execute("""SELECT history_id FROM history_units
+                WHERE kind = 'document' AND path = ? AND final_revision_id = ?
+                ORDER BY rowid DESC LIMIT 1""", (relative, revision_id)).fetchone() if revision_id else None
+            db.execute("""UPDATE history_units SET kind = 'review', path = ?,
+                base_revision_id = ?, target_history_id = ? WHERE history_id = ?""",
+                (relative, revision_id, target_unit[0] if target_unit else "", history_id))
+        return history_id
+
+    def record_review(self, request_id: str, thinking: str, report: str) -> None:
+        if thinking:
+            self.append_request_event(request_id, "reviewer_thinking", thinking)
+        self.append_request_event(request_id, "reviewer_output", report)
+        sections = list(re.finditer(r"^##\s+(用户需求验收|常规写作检查)\s*$", report, re.MULTILINE))
+        for index, match in enumerate(sections):
+            end = sections[index + 1].start() if index + 1 < len(sections) else len(report)
+            section = "requirement" if match.group(1) == "用户需求验收" else "general"
+            self.append_request_event(request_id, f"reviewer_{section}_report", report[match.start():end].strip(),
+                                      scope={"review_section": section})
+
+    def link_review(self, request_id: str, review_history_id: str) -> None:
+        with self._connect() as db:
+            review = db.execute("SELECT kind FROM history_units WHERE history_id = ?", (review_history_id,)).fetchone()
+            if not review or review[0] != "review":
+                raise ValueError("Review History not found")
+            db.execute("UPDATE history_units SET review_history_id = ? WHERE request_id = ?",
+                       (review_history_id, request_id))
+
+    def set_requirement_refs(self, request_id: str, requirement_id: str, event_ids: list[str], *, path: str = "") -> None:
+        """Freeze the exact shared evidence consumed by an execution, not future answers."""
+        with self._connect() as db:
+            units = db.execute("SELECT history_id FROM history_units WHERE request_id = ? AND (? = '' OR (kind = 'document' AND path = ?))",
+                               (request_id, path, path.replace("\\", "/"))).fetchall()
+            for event_id in dict.fromkeys(event_ids):
+                owner = db.execute("SELECT history_id FROM history_events WHERE event_id = ?", (event_id,)).fetchone()
+                if not owner or owner[0] != requirement_id:
+                    raise ValueError(f"Requirement evidence does not belong to {requirement_id}: {event_id}")
+            for unit in units:
+                db.execute("UPDATE history_units SET requirement_history_id = ? WHERE history_id = ?", (requirement_id, unit[0]))
+                db.execute("DELETE FROM history_requirement_refs WHERE history_id = ?", (unit[0],))
+                db.executemany("INSERT INTO history_requirement_refs VALUES (?, ?)",
+                               [(unit[0], event_id) for event_id in dict.fromkeys(event_ids)])
+
+    def request_requirement_refs(self, request_id: str) -> list[str]:
+        with self._connect() as db:
+            return [row[0] for row in db.execute("SELECT event_id FROM history_requirement_refs WHERE history_id = ? ORDER BY rowid",
+                                               (self._unit_id(request_id, "request"),))]
+
+    def append_request_event(self, request_id: str, kind: str, content: str,
+                             event_id: str = "", scope: dict | None = None) -> str:
+        eid = self._append_event(self._unit_id(request_id, "request"), kind, content, event_id=event_id)
+        if scope:
+            with self._connect() as db:
+                db.execute("UPDATE history_events SET scope_json = ? WHERE event_id = ?", (json.dumps(scope, ensure_ascii=False), eid))
+        return eid
 
     @staticmethod
     def run_request_id(request_id: str, run_id: str) -> str:
@@ -181,7 +268,7 @@ class DocumentHistoryStore:
 
     def _document_unit(self, db: sqlite3.Connection, request_id: str, path: str) -> str:
         path = path.replace("\\", "/")
-        request = db.execute("SELECT session_id FROM history_units WHERE history_id = ?",
+        request = db.execute("SELECT session_id, requirement_history_id, review_history_id FROM history_units WHERE history_id = ?",
                              (self._unit_id(request_id, "request"),)).fetchone()
         if request is None:
             raise KeyError(f"History request not found: {request_id}")
@@ -189,11 +276,19 @@ class DocumentHistoryStore:
         previous = db.execute("""SELECT history_id, status FROM history_units
             WHERE kind = 'document' AND path = ? AND request_id != ?
             ORDER BY created_at DESC, rowid DESC LIMIT 1""", (path, request_id)).fetchone()
-        db.execute("""INSERT OR IGNORE INTO history_units
+        inserted = db.execute("""INSERT OR IGNORE INTO history_units
             (history_id, request_id, session_id, kind, path, previous_attempt_id)
             VALUES (?, ?, ?, 'document', ?, ?)""",
             (history_id, request_id, request["session_id"], path,
              previous["history_id"] if previous and previous["status"] in {"failed", "interrupted"} else ""))
+        if inserted.rowcount and request["requirement_history_id"]:
+            db.execute("UPDATE history_units SET requirement_history_id = ? WHERE history_id = ?",
+                       (request["requirement_history_id"], history_id))
+            db.execute("""INSERT OR IGNORE INTO history_requirement_refs
+                SELECT ?, event_id FROM history_requirement_refs WHERE history_id = ? ORDER BY rowid""",
+                (history_id, self._unit_id(request_id, "request")))
+        if inserted.rowcount and request["review_history_id"]:
+            db.execute("UPDATE history_units SET review_history_id = ? WHERE history_id = ?", (request["review_history_id"], history_id))
         return history_id
 
     @staticmethod
@@ -271,12 +366,18 @@ class DocumentHistoryStore:
                 JOIN history_units r ON r.request_id = d.request_id AND r.kind = 'request'
                 WHERE r.parent_request_id = ? AND d.kind = 'document'
                 ORDER BY d.rowid""", (request_id,))]
+            child_ids.extend(row[0] for row in db.execute("SELECT history_id FROM history_units WHERE parent_request_id = ? AND kind = 'review' ORDER BY rowid", (request_id,)))
             db.execute("""UPDATE history_units SET status = ?, assistant_response = ?,
                 trace_ids_json = ?, session_turn_no = ? WHERE request_id = ?""",
                 (status, answer, json.dumps(trace_ids or [request_id]), session_turn_no, request_id))
-            if document_ids or child_ids:
-                db.execute("UPDATE history_units SET kind = 'request' WHERE history_id = ?",
-                           (request_history_id,))
+            if child_ids and session_turn_no:
+                db.execute("""UPDATE history_units SET session_turn_no = ? WHERE request_id IN
+                    (SELECT request_id FROM history_units WHERE parent_request_id = ?)""", (session_turn_no, request_id))
+            if request["kind"] == "review":
+                pass
+            elif document_ids or child_ids:
+                db.execute("UPDATE history_units SET kind = ? WHERE history_id = ?",
+                           ("request" if request["parent_request_id"] else "requirement", request_history_id))
             elif request["parent_request_id"]:
                 db.execute("UPDATE history_units SET kind = 'request' WHERE history_id = ?",
                            (request_history_id,))
@@ -286,9 +387,11 @@ class DocumentHistoryStore:
             if status != "completed":
                 db.execute("UPDATE history_units SET analysis_status = 'deferred' WHERE request_id = ?",
                            (request_id,))
+            elif request["kind"] == "review":
+                db.execute("UPDATE history_units SET analysis_status = 'pending' WHERE history_id = ?", (request_history_id,))
             elif document_ids or child_ids:
-                db.execute("UPDATE history_units SET analysis_status = 'routed' WHERE history_id = ?",
-                           (request_history_id,))
+                db.execute("UPDATE history_units SET analysis_status = ? WHERE history_id = ?",
+                           ("routed" if request["parent_request_id"] else "pending", request_history_id))
                 db.execute("""UPDATE history_units SET status = 'failed', analysis_status = 'deferred'
                     WHERE request_id = ? AND kind = 'document' AND final_revision_id = ''
                     AND history_id IN (SELECT history_id FROM history_events WHERE kind = 'tool_failure')""",
@@ -304,7 +407,13 @@ class DocumentHistoryStore:
                 self._link_document_history(db, history_id)
         if status != "completed":
             return []
-        return [row for row in (document_ids + child_ids or [request_history_id])
+        candidates = document_ids + child_ids or [request_history_id]
+        if (document_ids or child_ids) and not request["parent_request_id"]:
+            if any((self.get_unit(value) or {}).get("status") == "completed" for value in document_ids + child_ids):
+                candidates.append(request_history_id)
+            else:
+                self.set_analysis_status(request_history_id, "deferred")
+        return [row for row in candidates
                 if (self.get_unit(row) or {}).get("status") == "completed"]
 
     def list_analyzable(self) -> list[str]:
@@ -312,8 +421,12 @@ class DocumentHistoryStore:
             return []
         with self._connect() as db:
             return [row[0] for row in db.execute("""SELECT history_id FROM history_units
-                WHERE status = 'completed' AND kind IN ('document', 'conversation')
-                  AND analysis_status IN ('pending', 'failed') ORDER BY created_at, rowid""")]
+                WHERE status = 'completed' AND kind IN ('document', 'conversation', 'requirement', 'review')
+                  AND analysis_status IN ('pending', 'failed')
+                  AND (kind NOT IN ('document', 'review') OR requirement_history_id = '' OR EXISTS
+                    (SELECT 1 FROM history_units r WHERE r.history_id = history_units.requirement_history_id AND r.status = 'completed'))
+                  ORDER BY CASE kind WHEN 'requirement' THEN 0 WHEN 'review' THEN 1 ELSE 2 END,
+                           created_at, rowid""")]
 
     def interrupt_collecting(self) -> int:
         """A process restart cannot resume a suspended model/tool call, but keeps its evidence."""
@@ -342,6 +455,34 @@ class DocumentHistoryStore:
                 ids.insert(0, self._unit_id(result["request_id"], "request"))
             result["events"] = [dict(event) for event in db.execute(f"""SELECT * FROM history_events
                 WHERE history_id IN ({','.join('?' for _ in ids)}) ORDER BY rowid""", ids)]
+            if result["kind"] == "requirement":
+                canonical = {row[0] for row in db.execute("SELECT s.event_id FROM history_source_events s JOIN history_events e ON e.event_id = s.event_id WHERE e.history_id = ?", (history_id,))}
+                if canonical:
+                    result["events"] = [e for e in result["events"] if e["kind"] not in {"user_input", "user_answer", "question_ask"} or e["event_id"] in canonical]
+            refs = [row[0] for row in db.execute("SELECT event_id FROM history_requirement_refs WHERE history_id = ? ORDER BY rowid", (history_id,))]
+            result["requirement_event_ids"] = refs
+            if result["kind"] in {"document", "review"} and result["requirement_history_id"]:
+                result["events"] = [event for event in result["events"]
+                    if event["kind"] not in {"user_input", "user_answer", "question_ask"}
+                    and event["history_id"] != result["requirement_history_id"]]
+                for event in result["events"]:
+                    event["evidence_history_id"] = history_id
+                for event_id in refs:
+                    event = db.execute("SELECT * FROM history_events WHERE event_id = ?", (event_id,)).fetchone()
+                    if event:
+                        result["events"].append({**dict(event), "evidence_history_id": result["requirement_history_id"], "inherited_requirement": True})
+            if result["kind"] == "document" and result["review_history_id"]:
+                result["events"] = [e for e in result["events"] if e["kind"] not in {"reviewer_thinking", "reviewer_output"}]
+                result["events"].extend({**dict(e), "evidence_history_id": result["review_history_id"], "inherited_review": True}
+                    for e in db.execute("SELECT * FROM history_events WHERE history_id = ? AND kind LIKE 'reviewer_%' ORDER BY rowid", (result["review_history_id"],)))
+            result["affected_files"] = [dict(row) for row in db.execute("""SELECT history_id, path, status, previous_history_id
+                FROM history_units WHERE kind = 'document' AND requirement_history_id = ? ORDER BY rowid""", (history_id,))]
+            result["reviews"] = [dict(row) for row in db.execute("""SELECT history_id, path, status, base_revision_id FROM history_units
+                WHERE kind = 'review' AND (requirement_history_id = ? OR target_history_id = ?) ORDER BY rowid""", (history_id, history_id))]
+            result["result_histories"] = [dict(row) for row in db.execute("SELECT history_id, path, status FROM history_units WHERE kind = 'document' AND review_history_id = ? ORDER BY rowid", (history_id,))]
+            for event in result["events"]:
+                event["scope"] = json.loads(event.pop("scope_json", "{}"))
+            result["events"], result["archived_events"] = self._ordered_events(db, result["events"])
             prior = db.execute("SELECT request_id FROM history_units WHERE history_id = ?",
                                (result["previous_attempt_id"],)).fetchone() if result["previous_attempt_id"] else None
             prior_ids = ([self._unit_id(prior["request_id"], "request"), result["previous_attempt_id"]]
@@ -350,11 +491,35 @@ class DocumentHistoryStore:
                 "SELECT * FROM history_events WHERE history_id IN (?, ?) ORDER BY rowid",
                 prior_ids,
             )] if prior_ids else []
-        if result["kind"] == "document":
+            result["previous_attempt_events"], _ = self._ordered_events(db, result["previous_attempt_events"])
+        if result["kind"] in {"document", "review"}:
             revision_ids = list(dict.fromkeys(event["revision_id"] for event in result["events"]
                                                   if event["revision_id"]))
+            if result["kind"] == "review" and result["base_revision_id"]:
+                revision_ids = [result["base_revision_id"]]
             result["revisions"] = [self.get_revision(revision_id) for revision_id in revision_ids]
         return result
+
+    @staticmethod
+    def _ordered_events(db: sqlite3.Connection, events: list[dict]) -> tuple[list[dict], list[dict]]:
+        """Use repaired Trace order only for offline imports; retain live insertion order."""
+        if not events:
+            return events, []
+        orders = {row["event_id"]: dict(row) for row in db.execute(
+            f"SELECT * FROM history_event_order WHERE event_id IN ({','.join('?' for _ in events)})",
+            [event["event_id"] for event in events])}
+        if not orders:
+            positions = dict(db.execute(f"SELECT event_id, rowid FROM history_events WHERE event_id IN ({','.join('?' for _ in events)})",
+                                        [e["event_id"] for e in events]))
+            events.sort(key=lambda e: positions[e["event_id"]])
+            return events, []
+        visible, archived = [], []
+        for event in events:
+            event.update(orders.get(event["event_id"], {"event_order": None, "occurred_at": "", "order_status": "unverified"}))
+            (archived if event["order_status"] in {"duplicate", "superseded"} else visible).append(event)
+        # Unknown evidence stays visible, but cannot pretend to precede verified events.
+        visible.sort(key=lambda event: (event["event_order"] is None, event["event_order"] or 0))
+        return visible, archived
 
     def list_document_units(self, path: str) -> list[dict]:
         """Read the ordered attempts/evaluations associated with one document."""
@@ -387,13 +552,13 @@ class DocumentHistoryStore:
     def list_units(self, *, kind: str = "", path: str = "", limit: int = 25,
                    offset: int = 0) -> dict:
         """List lightweight project History summaries without loading revision bodies."""
-        if kind not in {"", "document", "conversation"}:
+        if kind not in {"", "document", "conversation", "requirement", "review"}:
             raise ValueError(kind)
         if path and kind != "document":
             raise ValueError("A file path requires kind=document")
         if not self.db_path.exists():
             return {"items": [], "total": 0}
-        where = "kind IN ('document', 'conversation')"
+        where = "kind IN ('document', 'conversation', 'requirement', 'review')"
         args: list = []
         if kind:
             where += " AND kind = ?"
@@ -405,16 +570,17 @@ class DocumentHistoryStore:
             total = db.execute(f"SELECT COUNT(*) FROM history_units WHERE {where}", args).fetchone()[0]
             rows = db.execute(f"""SELECT h.history_id, h.kind, h.path, h.status,
                        h.analysis_status, h.created_at, h.session_turn_no,
-                       h.base_revision_id, h.final_revision_id, h.previous_history_id,
+                       h.base_revision_id, h.final_revision_id, h.previous_history_id, h.requirement_history_id,
                        (SELECT substr(e.content, 1, 240) FROM history_events e
                         WHERE e.history_id = CASE WHEN h.kind = 'document' THEN
-                            (SELECT r.history_id FROM history_units r
-                             WHERE r.request_id = h.request_id AND r.kind = 'request')
+                            CASE WHEN h.requirement_history_id != '' THEN h.requirement_history_id ELSE (SELECT r.history_id FROM history_units r
+                             WHERE r.request_id = h.request_id AND r.kind IN ('request', 'requirement'))
+                            END
                             ELSE h.history_id END
                           AND e.kind = 'user_input' LIMIT 1) AS user_input,
                        (SELECT substr(e.content, 1, 240) FROM history_events e
                         JOIN history_units r ON r.history_id = e.history_id
-                        WHERE r.request_id = h.request_id AND r.kind = 'request'
+                        WHERE r.request_id = h.request_id AND r.kind IN ('request', 'requirement', 'review')
                           AND e.kind = 'main_delegation' LIMIT 1) AS task_summary
                     FROM history_units h WHERE {where}
                     ORDER BY h.created_at DESC, h.rowid DESC LIMIT ? OFFSET ?""",
@@ -483,6 +649,8 @@ class DocumentHistoryStore:
             "user_input", "main_delegation", "reviewer_thinking", "reviewer_output",
             "reviewer_delegation", "writer_thinking", "polisher_thinking",
         ):
+            if kind == "user_input" and fields.get("requirement_history_id"):
+                continue
             content = str(fields.get(kind) or "")
             if not content:
                 continue

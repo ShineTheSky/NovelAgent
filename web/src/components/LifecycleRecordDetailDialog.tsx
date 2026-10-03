@@ -4,9 +4,10 @@ interface LifecycleRecordDetailDialogProps {
   record: LifecycleRecord;
   onClose: () => void;
   onOpenTrace: (traceId: string) => void;
+  onOpenHistory: (historyId: string) => void;
 }
 
-export function LifecycleRecordDetailDialog({ record, onClose, onOpenTrace }: LifecycleRecordDetailDialogProps) {
+export function LifecycleRecordDetailDialog({ record, onClose, onOpenTrace, onOpenHistory }: LifecycleRecordDetailDialogProps) {
   const traceRefs = relatedTraceRefs(record);
   const metadata = Object.entries(record).filter(([key]) => !['content', 'claim', 'title'].includes(key));
   return <div className="absolute inset-0 z-30 flex flex-col bg-white" role="dialog" aria-modal="true" aria-labelledby="lifecycle-record-title">
@@ -20,14 +21,24 @@ export function LifecycleRecordDetailDialog({ record, onClose, onOpenTrace }: Li
     <main className="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-5">
       <section><h4 className="mb-2 text-sm font-semibold text-gray-700">标题</h4><p className="rounded-xl bg-gray-50 p-4 text-sm leading-6 text-gray-700">{record.title || record.claim}</p></section>
       <section><h4 className="mb-2 text-sm font-semibold text-gray-700">完整正文</h4><pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words rounded-xl bg-gray-50 p-4 font-sans text-sm leading-6 text-gray-700">{record.content || record.claim}</pre></section>
+      {!!record.provenance_notes?.length && <section><h4 className="mb-2 text-sm font-semibold text-gray-700">来源核验说明</h4><div className="space-y-2 rounded-xl bg-amber-50 p-4 text-xs leading-5 text-amber-800">{record.provenance_notes.map(note => <p key={note}>{note}</p>)}</div></section>}
+      <section>
+        <h4 className="mb-2 text-sm font-semibold text-gray-700">来源 History（需求根或独立审阅节点）</h4>
+        <div className="flex flex-wrap gap-2 rounded-xl border border-gray-100 p-4">
+          {(record.history_ids ?? []).map(historyId => <button key={historyId} type="button" onClick={() => onOpenHistory(historyId)} className="break-all rounded-md bg-purple-50 px-2 py-1 font-mono text-xs text-purple-700 hover:bg-purple-100 hover:underline">{historyId}</button>)}
+          {!record.history_ids?.length && <span className="text-xs text-gray-400">（无关联 History）</span>}
+        </div>
+        {record.history_source_links?.some(link => link.match === 'context') && <p className="mt-2 text-xs text-amber-700">部分关联仅作上下文，不是当前记忆的直接支持。</p>}
+      </section>
+      {!!record.related_history_ids?.length && <details className="text-xs text-gray-500"><summary className="cursor-pointer">相关根 History（非直接来源）· {record.related_history_ids.length} 条</summary><div className="mt-2 flex flex-wrap gap-2">{record.related_history_ids.map(id => <button key={id} type="button" onClick={() => onOpenHistory(id)} className="break-all font-mono text-purple-600 hover:underline">{id}</button>)}</div></details>}
       <section>
         <h4 className="mb-2 text-sm font-semibold text-gray-700">记录字段</h4>
         <div className="space-y-3 rounded-xl border border-gray-100 p-4">{metadata.map(([key, value]) => <div key={key} className="grid gap-1 text-xs md:grid-cols-[10rem_1fr]"><div className="font-mono text-gray-400">{key}</div><pre className="overflow-auto whitespace-pre-wrap break-words font-mono text-gray-700">{formatValue(value)}</pre></div>)}</div>
       </section>
-      <section>
-        <h4 className="mb-2 text-sm font-semibold text-gray-700">关联 Trace</h4>
-        <div className="flex flex-wrap gap-2 rounded-xl border border-gray-100 p-4">{traceRefs.map(ref => <button key={`${ref.trace_id}-${ref.turn ?? 'legacy'}`} type="button" onClick={() => onOpenTrace(ref.trace_id)} className="break-all rounded-md bg-purple-50 px-2 py-1 font-mono text-xs text-purple-700 hover:bg-purple-100 hover:underline">{ref.trace_id}{ref.turn ? ` · Turn ${ref.turn}` : ''}</button>)}{traceRefs.length === 0 && <span className="text-xs text-gray-400">（无关联 Trace）</span>}</div>
-      </section>
+      {traceRefs.length > 0 && <details className="text-xs text-gray-500">
+        <summary className="cursor-pointer">原始 Trace（诊断与旧数据溯源）· {traceRefs.length} 条</summary>
+        <div className="mt-2 flex flex-wrap gap-2 rounded-xl border border-gray-100 p-4">{traceRefs.map(ref => <button key={`${ref.trace_id}-${ref.turn ?? 'legacy'}`} type="button" onClick={() => onOpenTrace(ref.trace_id)} className="break-all rounded-md bg-gray-50 px-2 py-1 font-mono text-xs text-gray-600 hover:bg-gray-100 hover:underline">{ref.trace_id}{ref.turn ? ` · Turn ${ref.turn}` : ''}</button>)}</div>
+      </details>}
     </main>
   </div>;
 }

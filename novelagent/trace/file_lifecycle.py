@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 import yaml
 
+from novelagent.history.sources import normalize_history_roots
+
 LAYERS = {"insight": ".insight", "memory": ".memory", "pattern": ".pattern"}
 CATEGORIES = {"user", "project", "reference", "agent"}
 DOMAINS = {"writing", "outline", "overall"}
@@ -326,6 +328,9 @@ class FileLifecycleStore:
             existing["history_revision_ids"] = list(dict.fromkeys([
                 *existing.get("history_revision_ids", []), *memory.get("history_revision_ids", []),
             ]))
+            for field in ("history_event_ids", "related_history_ids"):
+                existing[field] = list(dict.fromkeys([*existing.get(field, []), *memory.get(field, [])]))
+            existing["history_source_links"] = memory.get("history_source_links", existing.get("history_source_links", []))
             existing["semantic_evidence"] = memory.get("semantic_evidence", existing.get("semantic_evidence", []))
             existing["support_sources"] = memory.get("support_sources", existing.get("support_sources", []))
             return self.write("pattern", existing)
@@ -342,6 +347,9 @@ class FileLifecycleStore:
             "weight": memory["weight"],
             "support_count": memory["support_count"],
             "history_ids": memory.get("history_ids", []),
+            "history_event_ids": memory.get("history_event_ids", []),
+            "history_source_links": memory.get("history_source_links", []),
+            "related_history_ids": memory.get("related_history_ids", []),
             "history_revision_ids": memory.get("history_revision_ids", []),
             "semantic_evidence": memory.get("semantic_evidence", []),
             "support_sources": memory.get("support_sources", []),
@@ -527,6 +535,7 @@ class FileLifecycleStore:
 
     def write(self, layer: str, item: dict) -> dict:
         self.ensure(); category = str(item.get("category", "project"))
+        item.update(normalize_history_roots(self.project, item))
         item["category"] = category if category in CATEGORIES else "project"
         item["domain"] = item.get("domain") if item.get("domain") in DOMAINS else "overall"
         item["title"] = str(item.get("title") or item.get("claim") or item.get("content") or "").strip().split("\n", 1)[0]

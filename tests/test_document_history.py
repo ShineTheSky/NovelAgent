@@ -182,6 +182,8 @@ class DocumentHistoryTests(unittest.IsolatedAsyncioTestCase):
                     yield ResponseChunk(type="subagent_done", data={
                         "result": "人物动机不明", "history_thinking": "检查了动机链",
                         "history_user_input": "用户原话\n\n澄清后的完整选项",
+                        "history_user_answers": [[{"selected_options": [
+                            {"label": "保留动机", "description": "用行动表达"}]}]],
                     })
                 else:
                     yield ResponseChunk(type="subagent_done", data={"result": "已润色"})
@@ -199,6 +201,7 @@ class DocumentHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["reviewer_output"], "人物动机不明")
         self.assertEqual(evidence["reviewer_delegation"], runner.calls[1][1])
         self.assertIn("澄清后的完整选项", evidence["user_input"])
+        self.assertEqual(evidence["user_answers"][0][0]["selected_options"][0]["description"], "用行动表达")
         self.assertEqual(chunks[-1].type, "subagent_done")
 
 

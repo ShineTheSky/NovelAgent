@@ -5,11 +5,11 @@ import type { HistoryFilePage, HistoryKind, HistorySummary, HistoryUnit } from '
 
 const PAGE_SIZE = 25;
 const errorText = (error: unknown) => error instanceof Error ? error.message : '加载 History 失败';
-const labels: Record<HistoryKind, string> = { document: '文件', conversation: '对话' };
+const labels: Record<HistoryKind, string> = { document: '文件', conversation: '对话', requirement: '需求', review: '审阅' };
 
 export function HistoryPanel({ projectId }: { projectId: string | null }) {
   const [open, setOpen] = useState(false);
-  const [mode, setMode] = useState<'files' | 'conversation'>('files');
+  const [mode, setMode] = useState<'files' | 'conversation' | 'requirement' | 'review'>('files');
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [files, setFiles] = useState<HistoryFilePage['items']>([]);
   const [items, setItems] = useState<HistorySummary[]>([]);
@@ -61,7 +61,7 @@ export function HistoryPanel({ projectId }: { projectId: string | null }) {
       if (requestId !== listRequest.current) return;
       setItems(page.items);
       setTotal(page.total);
-      setMode(kind === 'conversation' ? 'conversation' : 'files');
+      setMode(kind === 'document' ? 'files' : kind);
       setSelectedFile(path || null);
       setOffset(nextOffset);
     } catch (requestError) {
@@ -102,7 +102,9 @@ export function HistoryPanel({ projectId }: { projectId: string | null }) {
           <div className="flex shrink-0 items-center gap-2 border-b bg-gray-50 px-5 py-3 text-xs">
             <button type="button" onClick={() => void loadFiles(0)} className={`rounded-lg px-3 py-1.5 ${mode === 'files' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-purple-600'}`}>文件</button>
             <button type="button" onClick={() => void loadHistory('conversation')} className={`rounded-lg px-3 py-1.5 ${mode === 'conversation' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-purple-600'}`}>对话</button>
-            <button type="button" disabled={busy} onClick={() => void (selectedFile ? loadHistory('document', selectedFile, offset) : mode === 'files' ? loadFiles(offset) : loadHistory('conversation', '', offset))} className="ml-auto text-purple-600 disabled:opacity-40">{busy ? '加载中…' : '刷新'}</button>
+            <button type="button" onClick={() => void loadHistory('requirement')} className={`rounded-lg px-3 py-1.5 ${mode === 'requirement' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-purple-600'}`}>需求</button>
+            <button type="button" onClick={() => void loadHistory('review')} className={`rounded-lg px-3 py-1.5 ${mode === 'review' ? 'bg-white text-purple-700 shadow-sm' : 'text-gray-500 hover:text-purple-600'}`}>审阅</button>
+            <button type="button" disabled={busy} onClick={() => void (selectedFile ? loadHistory('document', selectedFile, offset) : mode === 'files' ? loadFiles(offset) : loadHistory(mode, '', offset))} className="ml-auto text-purple-600 disabled:opacity-40">{busy ? '加载中…' : '刷新'}</button>
           </div>
           <div className="flex min-h-0 flex-1 flex-col md:flex-row">
             <section className="flex min-h-0 w-full flex-col border-b md:w-2/5 md:border-b-0 md:border-r">
@@ -114,7 +116,7 @@ export function HistoryPanel({ projectId }: { projectId: string | null }) {
                   <div className="break-all font-medium text-gray-700">{file.path}</div>
                   <div className="mt-2 text-gray-400">{file.history_count} 条 History · 最新 {file.updated_at?.slice(0, 16).replace('T', ' ')}</div>
                 </button>)}
-                {(selectedFile || mode === 'conversation') && items.map(item => <button key={item.history_id} type="button" onClick={() => void select(item.history_id)} className={`w-full rounded-xl border p-3 text-left text-xs transition ${selected?.history_id === item.history_id ? 'border-purple-300 bg-purple-50' : 'border-gray-100 hover:border-purple-200 hover:bg-gray-50'}`}>
+                {(selectedFile || mode !== 'files') && items.map(item => <button key={item.history_id} type="button" onClick={() => void select(item.history_id)} className={`w-full rounded-xl border p-3 text-left text-xs transition ${selected?.history_id === item.history_id ? 'border-purple-300 bg-purple-50' : 'border-gray-100 hover:border-purple-200 hover:bg-gray-50'}`}>
                   <div className="flex items-center gap-2 text-[11px] text-gray-400">
                     <span className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-600">{labels[item.kind]}</span>
                     <span>{item.created_at?.slice(0, 16).replace('T', ' ')}</span>
@@ -128,13 +130,13 @@ export function HistoryPanel({ projectId }: { projectId: string | null }) {
                   {!item.path && <div className="mt-1 truncate font-mono text-[10px] text-gray-400">{item.history_id}</div>}
                   {item.path && item.previous_history_id && <div className="mt-1 truncate font-mono text-[10px] text-gray-400">上一条 {item.previous_history_id}</div>}
                 </button>)}
-                {!busy && !error && !(selectedFile || mode === 'conversation' ? items : files).length && <p className="py-12 text-center text-sm text-gray-400">当前项目还没有 History。</p>}
+                {!busy && !error && !(selectedFile || mode !== 'files' ? items : files).length && <p className="py-12 text-center text-sm text-gray-400">当前项目还没有 History。</p>}
               </div>
               <footer className="flex shrink-0 items-center justify-between border-t px-4 py-3 text-xs text-gray-500">
                 <span>共 {total} 条 · {total ? offset + 1 : 0}–{Math.min(offset + PAGE_SIZE, total)}</span>
                 <div className="flex gap-2">
-                  <button type="button" disabled={offset === 0 || busy} onClick={() => void (selectedFile ? loadHistory('document', selectedFile, offset - PAGE_SIZE) : mode === 'files' ? loadFiles(offset - PAGE_SIZE) : loadHistory('conversation', '', offset - PAGE_SIZE))} className="rounded border px-2 py-1 disabled:opacity-40">上一页</button>
-                  <button type="button" disabled={offset + PAGE_SIZE >= total || busy} onClick={() => void (selectedFile ? loadHistory('document', selectedFile, offset + PAGE_SIZE) : mode === 'files' ? loadFiles(offset + PAGE_SIZE) : loadHistory('conversation', '', offset + PAGE_SIZE))} className="rounded border px-2 py-1 disabled:opacity-40">下一页</button>
+                  <button type="button" disabled={offset === 0 || busy} onClick={() => void (selectedFile ? loadHistory('document', selectedFile, offset - PAGE_SIZE) : mode === 'files' ? loadFiles(offset - PAGE_SIZE) : loadHistory(mode, '', offset - PAGE_SIZE))} className="rounded border px-2 py-1 disabled:opacity-40">上一页</button>
+                  <button type="button" disabled={offset + PAGE_SIZE >= total || busy} onClick={() => void (selectedFile ? loadHistory('document', selectedFile, offset + PAGE_SIZE) : mode === 'files' ? loadFiles(offset + PAGE_SIZE) : loadHistory(mode, '', offset + PAGE_SIZE))} className="rounded border px-2 py-1 disabled:opacity-40">下一页</button>
                 </div>
               </footer>
             </section>
@@ -152,9 +154,10 @@ export function HistoryPanel({ projectId }: { projectId: string | null }) {
   </>;
 }
 
-function HistoryDetail({ unit, onSelectHistory }: { unit: HistoryUnit; onSelectHistory: (historyId: string) => Promise<void> }) {
+export function HistoryDetail({ unit, onSelectHistory }: { unit: HistoryUnit; onSelectHistory: (historyId: string) => void | Promise<void> }) {
   const finalRevision = (unit.revisions || []).find(revision => revision?.revision_id === unit.final_revision_id);
   const intermediateCount = unit.events.filter(event => event.kind === 'revision' && event.revision_id !== unit.final_revision_id).length;
+  const reviewRetelling = unit.kind === 'review' && unit.events.some(event => event.kind === 'review_retelling');
   return <div className="space-y-5">
     <div>
       <div className="flex flex-wrap items-center gap-2 text-xs text-gray-500">
@@ -162,19 +165,31 @@ function HistoryDetail({ unit, onSelectHistory }: { unit: HistoryUnit; onSelectH
       </div>
       <h3 className="mt-2 break-all text-base font-semibold text-gray-800">{unit.path || unit.events.find(event => event.kind === 'user_input')?.content.slice(0, 200) || '对话记录'}</h3>
       <p className="mt-1 break-all font-mono text-[10px] text-gray-400">History {unit.history_id}</p>
+      {reviewRetelling && <p className="mt-2 rounded-lg bg-amber-50 p-3 text-xs text-amber-700">此节点保存主 Agent 的审阅转述，不是审阅 Agent 的原始报告；原始审阅报告和被审版本未核验。不作为一次新的独立审阅支持。</p>}
+      {unit.requirement_history_id && unit.requirement_history_id !== unit.history_id && <button type="button" onClick={() => void onSelectHistory(unit.requirement_history_id!)} className="mt-1 break-all text-left font-mono text-[11px] text-purple-600 hover:underline">需求 History {unit.requirement_history_id}</button>}
       {unit.previous_history_id && <button type="button" onClick={() => void onSelectHistory(unit.previous_history_id)} className="mt-1 break-all text-left font-mono text-[11px] text-purple-600 hover:underline">← 上一次 History {unit.previous_history_id}</button>}
+      {unit.review_history_id && <button type="button" onClick={() => void onSelectHistory(unit.review_history_id!)} className="mt-1 block break-all text-left text-xs text-purple-600 hover:underline">来源审阅 History {unit.review_history_id}</button>}
+      {unit.target_history_id && <button type="button" onClick={() => void onSelectHistory(unit.target_history_id!)} className="mt-1 block break-all text-left text-xs text-purple-600 hover:underline">被审文件 History {unit.target_history_id}</button>}
       {unit.path && <p className="mt-1 break-all text-xs text-gray-500">基于 {unit.base_revision_id || '无'} · 最终 {unit.final_revision_id || '未保存完整版本'}</p>}
     </div>
+    {!!unit.affected_files?.length && <section><h4 className="mb-2 text-xs font-medium text-gray-500">落实到文件 · {unit.affected_files.length} 条 History</h4><div className="space-y-2">{unit.affected_files.map(file => <button key={file.history_id} type="button" onClick={() => void onSelectHistory(file.history_id)} className="block w-full break-all rounded-lg border border-gray-100 p-3 text-left text-xs text-purple-700 hover:bg-purple-50">{file.path} · {file.status}<span className="mt-1 block font-mono text-[10px]">{file.history_id}</span></button>)}</div></section>}
+    {!!unit.reviews?.length && <section><h4 className="mb-2 text-xs text-gray-500">独立审阅节点（可直接作为记忆来源）</h4>{unit.reviews.map(review => <button key={review.history_id} type="button" onClick={() => void onSelectHistory(review.history_id)} className="block break-all py-2 text-left text-xs text-purple-700">{review.path} · {review.status} · {review.history_id}</button>)}</section>}
+    {!!unit.result_histories?.length && <section><h4 className="mb-2 text-xs text-gray-500">审阅后的落实 History</h4>{unit.result_histories.map(file => <button key={file.history_id} type="button" onClick={() => void onSelectHistory(file.history_id)} className="block break-all py-2 text-left text-xs text-purple-700">{file.path} · {file.status} · {file.history_id}</button>)}</section>}
     {unit.assistant_response && <section><h4 className="mb-2 text-xs font-medium text-gray-500">最终回复</h4><pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-gray-50 p-3 text-xs leading-5 text-gray-700">{unit.assistant_response}</pre></section>}
     <section>
       <h4 className="mb-2 text-xs font-medium text-gray-500">过程证据 · {unit.events.length} 条</h4>
       <div className="space-y-2">
         {unit.events.map(event => <details key={event.event_id} className="rounded-lg border border-gray-100 px-3 py-2">
-          <summary className="cursor-pointer text-xs text-gray-700">{event.kind} <span className="ml-2 text-gray-400">{event.content.slice(0, 90).replace(/\s+/g, ' ')}</span></summary>
+          <summary className="cursor-pointer text-xs text-gray-700">{event.kind}{event.inherited_requirement ? ' · 引用的需求' : ''}{event.inherited_review ? ' · 引用的审阅' : ''} <span className="ml-2 text-gray-400">{event.content.slice(0, 90).replace(/\s+/g, ' ')}</span></summary>
+          <p className="mt-2 break-all font-mono text-[10px] text-gray-400">{event.event_id}</p>
+          {event.order_status && <p className="mt-1 text-[11px] text-gray-500">{event.order_status === 'unverified' ? '顺序未核验' : event.occurred_at ? `发生于 ${new Date(event.occurred_at).toLocaleString()}` : '已按原始事件顺序还原 · 时间缺失'}</p>}
+          {(event.scope?.path || event.scope?.run_id) && <p className="mt-1 break-all text-[11px] text-gray-500">作用范围：{event.scope.path || event.scope.preset || event.scope.run_id}</p>}
+          {event.scope?.evidence_scope === 'run' && <p className="mt-1 text-[11px] text-gray-500">本次 Agent 运行的共享上下文，不代表专门针对此文件。</p>}
           <pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap break-words text-xs leading-5 text-gray-600">{event.content}</pre>
         </details>)}
       </div>
     </section>
+    {!!unit.archived_events?.length && <details className="text-xs text-gray-600"><summary className="cursor-pointer">原始聚合／重复证据 · {unit.archived_events.length} 条（保留原 ID，不作为新的过程事件）</summary><div className="mt-2 space-y-2">{unit.archived_events.map(event => <details key={event.event_id} className="rounded-lg border border-gray-100 p-3"><summary className="cursor-pointer">{event.kind} · {event.order_status === 'duplicate' ? '重复记录' : '已拆分为顺序证据'}</summary><p className="mt-2 break-all font-mono text-[10px]">{event.event_id}</p><pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words">{event.content}</pre></details>)}</div></details>}
     {unit.kind === 'document' && <section>
       <h4 className="mb-2 text-xs font-medium text-gray-500">本次修改的最终正文</h4>
       {intermediateCount > 0 && <p className="mb-2 text-xs text-gray-400">本次 Agent 运行另有 {intermediateCount} 次中间写入，已保留在过程证据中。</p>}
@@ -187,6 +202,7 @@ function HistoryDetail({ unit, onSelectHistory }: { unit: HistoryUnit; onSelectH
           <details className="mt-3 text-xs text-gray-600"><summary className="cursor-pointer">依赖版本与修订证据</summary><pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-gray-50 p-3">{JSON.stringify({ dependencies: finalRevision.dependencies, evidence: finalRevision.evidence, no_change: finalRevision.no_change }, null, 2)}</pre></details>}
       </details>}
     </section>}
+    {unit.kind === 'review' && <section><h4 className="mb-2 text-xs text-gray-500">被审阅的正文版本 · {unit.base_revision_id || '未定位'}</h4>{unit.revisions?.map(revision => revision && <details key={revision.revision_id} className="text-xs"><summary className="cursor-pointer">查看被审正文（审阅不创建新版本）</summary><pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap">{revision.body_md}</pre></details>)}</section>}
     {!!unit.previous_attempt_events?.length && <details className="text-xs text-gray-600"><summary className="cursor-pointer">上一次失败或中断的证据</summary><pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap">{JSON.stringify(unit.previous_attempt_events, null, 2)}</pre></details>}
     {!!unit.context?.length && <details className="text-xs text-gray-600"><summary className="cursor-pointer">模型上下文</summary><pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap">{JSON.stringify(unit.context, null, 2)}</pre></details>}
     {JSON.stringify(unit.selected_turns || []).length > 2 && <details className="text-xs text-gray-600"><summary className="cursor-pointer">对话回合选择</summary><pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap">{JSON.stringify(unit.selected_turns, null, 2)}</pre></details>}

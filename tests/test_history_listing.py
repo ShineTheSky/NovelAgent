@@ -18,11 +18,12 @@ def test_project_history_list_is_paginated_and_omits_full_revision_body(tmp_path
 
     first = store.list_units(limit=1)
     second = store.list_units(limit=1, offset=1)
-    assert first["total"] == second["total"] == 2
+    assert first["total"] == second["total"] == 3
     assert first["items"][0]["kind"] == "document"
     assert first["items"][0]["user_input"] == long_request[:240]
     assert "body_md" not in first["items"][0]
-    assert second["items"][0]["kind"] == "conversation"
+    assert second["items"][0]["kind"] == "requirement"
+    assert store.list_units(kind="requirement")["total"] == 1
     assert store.list_units(kind="document")["total"] == 1
     assert store.list_units(kind="conversation")["total"] == 1
     assert store.list_files()["items"] == [{

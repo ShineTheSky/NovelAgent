@@ -203,7 +203,7 @@ def _check_saved(store: DocumentHistoryStore, request: dict,
             or int(request_unit["session_turn_no"]) != request["turn_no"]):
         problems.append("request metadata differs from Trace")
     expected_global = Counter([("user_input", request["user_input"]), *global_events])
-    actual_global = Counter((e["kind"], e["content"]) for e in request_unit["events"])
+    actual_global = Counter((e["kind"], e["content"]) for e in [*request_unit["events"], *request_unit.get("archived_events", [])])
     if expected_global - actual_global:
         problems.append("request evidence missing or changed")
     run_documents = None
@@ -223,8 +223,8 @@ def _check_saved(store: DocumentHistoryStore, request: dict,
                 if not child:
                     problems.append(f"Agent run unit missing: {run_id}:{path}")
                     continue
-                actual = Counter((e["kind"], e["content"]) for e in child["events"]
-                                 if e["history_id"] == child["history_id"])
+                actual = Counter((e["kind"], e["content"]) for e in [*child["events"], *child.get("archived_events", [])]
+                                 if e["history_id"] == child["history_id"] or e["kind"] == "user_answer")
                 if Counter(details["events"]) - actual:
                     problems.append(f"Agent run evidence missing: {run_id}:{path}")
                 if details["refs"] and child["final_revision_id"] != details["refs"][-1]["revision_id"]:
@@ -236,7 +236,7 @@ def _check_saved(store: DocumentHistoryStore, request: dict,
                     if not revision or revision["body_md"] != info.body:
                         problems.append(f"verified current revision differs: {path}")
             continue
-        actual = Counter((e["kind"], e["content"]) for e in unit["events"]
+        actual = Counter((e["kind"], e["content"]) for e in [*unit["events"], *unit.get("archived_events", [])]
                          if e["history_id"] == unit["history_id"])
         if Counter(expected) - actual:
             problems.append(f"document evidence missing or changed: {path}")
@@ -282,13 +282,33 @@ def _run_documents(request: dict, project_dir: Path) -> dict[tuple[str, str], di
     runs: dict[str, dict] = defaultdict(lambda: {
         "task": "", "preset": "", "parent_run_id": "", "thinking": [],
         "output": "", "user_input": "", "trace_ids": [], "created_at": "",
-        "targets": defaultdict(lambda: {"events": [], "refs": []}),
+        "answers": [], "start_index": -1,
+        "targets": defaultdict(lambda: {"events": [], "refs": [], "answers": []}),
     })
+    main_answers = []
     pending: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    for event in request["events"]:
+    for index, event in enumerate(request["events"]):
         kind, payload = event["event_type"], event["payload"]
         run_id = str(payload.get("run_id") or "main")
         run = runs[run_id]
+        if run["start_index"] < 0:
+            run["start_index"] = index
+            run["answers"] = list(main_answers)
+        if kind == "user_answer" and not str(payload.get("source") or "").startswith(("subagent:", "workflow:")):
+            answer = (index, event["event_id"], json.dumps(payload.get("answers", payload), ensure_ascii=False))
+            if run_id == "main":
+                main_answers.append(answer)
+                run["answers"] = list(main_answers)
+            else:
+                run["answers"].append(answer)
+        if kind in {"subagent_tool_result", "workflow_tool_result"} and payload.get("tool") == "AskUserQuestion" and payload.get("success"):
+            answers = payload.get("data", [])
+            if isinstance(answers, str):
+                try:
+                    answers = json.loads(answers)
+                except ValueError:
+                    pass
+            run["answers"].append((index, event["event_id"], json.dumps(answers, ensure_ascii=False)))
         if run_id != "main" or kind in {"tool_call", "tool_result"}:
             if event["trace_id"] not in run["trace_ids"]:
                 run["trace_ids"].append(event["trace_id"])
@@ -298,6 +318,8 @@ def _run_documents(request: dict, project_dir: Path) -> dict[tuple[str, str], di
             run["task"] = str(payload.get("task_prompt") or payload.get("task_summary") or "")
             run["preset"] = str(payload.get("preset") or "")
             run["parent_run_id"] = str(payload.get("parent_run_id") or "")
+            if run["parent_run_id"] in runs:
+                run["answers"].extend(runs[run["parent_run_id"]]["answers"])
         elif kind in {"subagent_thinking", "workflow_thinking"}:
             run["thinking"].append(str(payload.get("content") or ""))
         elif kind in {"subagent_subagent_done", "workflow_subagent_done"}:
@@ -347,6 +369,8 @@ def _run_documents(request: dict, project_dir: Path) -> dict[tuple[str, str], di
             for path, target in polisher["targets"].items():
                 if reviewer_paths and path not in reviewer_paths:
                     continue
+                target["answers"].extend(answer for answer in reviewer["answers"]
+                                         if answer[0] < polisher["start_index"])
                 if reviewer["thinking"]:
                     target["events"].append(("reviewer_thinking", "".join(reviewer["thinking"])))
                 target["events"].append(("reviewer_output", reviewer["output"]))
@@ -362,11 +386,15 @@ def _run_documents(request: dict, project_dir: Path) -> dict[tuple[str, str], di
                 if path:
                     run["targets"][path]["events"].append(("evaluation_no_change", run["output"]))
         for path, target in run["targets"].items():
+            answers = {answer[1]: answer for answer in [*run["answers"], *target["answers"]]}
+            target["events"][0:0] = [("user_answer", answer[2])
+                                      for answer in sorted(answers.values())]
             if run["thinking"]:
                 target["events"].append((f"{run['preset'] or 'main_agent'}_thinking", "".join(run["thinking"])))
             if run["output"]:
                 target["events"].append((f"{run['preset'] or 'main_agent'}_output", run["output"]))
             documents[(run_id, path)] = {**target, "task": run["task"], "preset": run["preset"],
+                                          "answer_source_event_ids": [answer[1] for answer in sorted(answers.values())],
                                           "user_input": run["user_input"] or request["user_input"],
                                           "trace_ids": run["trace_ids"] or request["trace_ids"],
                                           "created_at": run["created_at"] or request["started_at"]}
@@ -418,7 +446,7 @@ def reorganize(trace_db: Path, workspace: Path, *, apply: bool = False,
                                 f"{store._unit_id(child_id, 'request')}:input"))
                         present = Counter((event["kind"], event["content"])
                                           for event in store.get_unit(history_id)["events"]
-                                          if event["history_id"] == history_id)
+                                          if event["history_id"] == history_id or event["kind"] == "user_answer")
                         for kind, content in details["events"]:
                             if present[(kind, content)]:
                                 present[(kind, content)] -= 1

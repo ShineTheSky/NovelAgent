@@ -1,5 +1,6 @@
 import asyncio
 import json
+import pytest
 
 from novelagent.history import DocumentHistoryStore
 from novelagent.history.analyzer import HistoryAnalyzer
@@ -25,17 +26,17 @@ def test_document_history_unit_collects_prewrite_feedback_and_versions(tmp_path)
                               "reviewer_output": "情绪说明太直白",
                           })
     ids = store.close_request(request_id, "completed", "已完成", ["trace-a", "trace-b"], 4)
-    assert len(ids) == 1
+    assert len(ids) == 2
     unit = store.get_unit(ids[0])
     assert unit["kind"] == "document"
     assert unit["session_turn_no"] == 4
     assert [row["revision_id"] for row in unit["revisions"]] == ["rev-1", "rev-2"]
     assert [e["kind"] for e in unit["events"]].count("user_answer") == 1
     assert unit["trace_ids"] == ["trace-a", "trace-b"]
-    assert store.list_analyzable() == ids
+    assert set(store.list_analyzable()) == set(ids)
     assert [unit["history_id"] for unit in store.list_document_units(
         "chapters/content_1.1.1.md",
-    )] == ids
+    )] == ids[:-1]
 
     class NoMemoryLLM:
         calls = 0
@@ -58,8 +59,8 @@ def test_one_request_with_two_files_creates_two_units_after_all_asks(tmp_path):
         store.record_revision(store.project_dir / path, revision, None, path, path,
                               evidence={"history_request_id": "trace-many"})
     ids = store.close_request("trace-many", "completed", "都已修改", ["trace-many"], 3)
-    assert len(ids) == 2
-    assert {store.get_unit(history_id)["path"] for history_id in ids} == {
+    assert len(ids) == 3
+    assert {store.get_unit(history_id)["path"] for history_id in ids[:-1]} == {
         "outlines/outline_1.0.0.md", "outlines/outline_1.1.0.md",
     }
     assert all(any(event["kind"] == "user_answer" for event in store.get_unit(history_id)["events"])
@@ -82,13 +83,75 @@ def test_agent_runs_on_same_file_form_separate_history_units(tmp_path):
         store.close_request(request_id, "completed", "完成", ["root"])
     ids = store.close_request("root", "completed", "完成", ["root"])
     units = store.list_document_units("chapters/content_1.1.1.md")
-    assert [unit["history_id"] for unit in units] == ids
+    assert [unit["history_id"] for unit in units] == ids[:-1]
     assert [(unit["base_revision_id"], unit["final_revision_id"]) for unit in units] == [
         ("", "rev-2"), ("rev-2", "rev-3")]
     assert len(units[0]["revisions"]) == 2
     assert units[0]["previous_history_id"] == ""
     assert units[1]["previous_history_id"] == units[0]["history_id"]
-    assert store.get_unit(store._unit_id("root", "request"))["kind"] == "request"
+    assert store.get_unit(store._unit_id("root", "request"))["kind"] == "requirement"
+
+
+@pytest.mark.parametrize("shared_requirements", [False, True])
+def test_subagent_keeps_inherited_and_local_ask_answers_in_file_history(tmp_path, monkeypatch, shared_requirements):
+    from novelagent.core.session import Session
+    from novelagent.core.subagent import SubAgentRunner
+    from novelagent.tools.registry import ToolRegistry
+    from novelagent.tools.write import WriteTool
+
+    async def run():
+        project = tmp_path / "project-a"
+        store = DocumentHistoryStore(project)
+        store.start_request("root", "session-a", "写正文")
+        session = Session("session-a", "project-a")
+        inherited = [{"question": "语气如何？", "selected_options": [
+            {"label": "克制", "description": "通过动作表达情绪"}]}]
+        questions = [{"header": "细节", "question": "保留哪种细节？", "options": [
+            {"label": "杯子", "description": "保留握杯动作"}]}]
+
+        async def fake_query(*_args, **kwargs):
+            answer_task = asyncio.create_task(kwargs["execute_tool"](
+                "AskUserQuestion", {"questions": questions}, "ask-1"))
+            await asyncio.sleep(0)
+            session.question_answers = [["杯子", "还要保留停顿"]]
+            session.question_event.set()
+            assert (await answer_task)[0]
+            success, _, error = await kwargs["execute_tool"]("Write", {
+                "path": "chapters/content_1.1.1.md", "content": "他握着杯子，停了片刻。",
+                "expected_revision_id": "new"}, "write-1")
+            assert success, error
+            yield {"type": "result", "final_text": "已完成"}
+
+        monkeypatch.setattr("novelagent.core.subagent.query", fake_query)
+        registry = ToolRegistry()
+        registry.register(WriteTool())
+        runner = SubAgentRunner(None, registry, None, None, working_dir=str(tmp_path))
+        runner.presets_tool.get_preset = lambda _name: {
+            "system_prompt": "", "tools": [], "inherit_history": False, "max_turns": 1}
+        evidence = {"history_request_id": "root", "user_input": "写正文", "user_answers": [inherited]}
+        if shared_requirements:
+            root = store._unit_id("root", "request")
+            initial_answer = store.append_request_event("root", "user_answer", json.dumps(inherited, ensure_ascii=False))
+            evidence.update(requirement_history_id=root, requirement_event_ids=[f"{root}:input", initial_answer])
+        chunks = [chunk async for chunk in runner.spawn_and_run(
+            "chapter_writer", "写 chapters/content_1.1.1.md", session,
+            run_id="writer", history_evidence=evidence)]
+        unit = store.list_document_units("chapters/content_1.1.1.md")[0]
+        answers = [json.loads(e["content"]) for e in unit["events"] if e["kind"] == "user_answer"]
+        assert len(answers) == 2
+        assert answers[0] == inherited
+        assert answers[1][0]["selected_options"] == [{"label": "杯子", "description": "保留握杯动作"}]
+        assert answers[1][0]["custom_input"] == "还要保留停顿"
+        assert chunks[-1].data["history_user_answers"] == answers
+        assert evidence["user_answers"] == [inherited]
+        if shared_requirements:
+            assert all(e.get("inherited_requirement") for e in unit["events"] if e["kind"] == "user_answer")
+            assert evidence["requirement_event_ids"] == [f"{root}:input", initial_answer]
+            assert len(chunks[-1].data["requirement_event_ids"]) == 3
+            with store._connect() as db:
+                assert db.execute("SELECT count(*) FROM history_events WHERE kind = 'user_answer'").fetchone()[0] == 2
+
+    asyncio.run(run())
 
 
 def test_no_change_and_unwritten_failure_do_not_advance_file_history(tmp_path):

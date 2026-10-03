@@ -172,6 +172,25 @@ def test_same_memory_only_creates_one_pattern(tmp_path):
     assert second["support_count"] == 4
 
 
+def test_pattern_promotion_and_downgrade_preserve_history_sources(tmp_path):
+    store = FileLifecycleStore(str(tmp_path), "project-a")
+    sources = {
+        "history_ids": ["requirement-history"], "history_event_ids": ["user-answer"],
+        "history_revision_ids": ["revision-a"], "related_history_ids": ["file-context"],
+        "history_source_links": [{"history_id": "requirement-history", "history_event_ids": ["user-answer"], "match": "evidence"}],
+        "semantic_evidence": [{"history_id": "requirement-history", "why": "用户反馈"}],
+        "support_sources": ["requirement-history"],
+    }
+    memory = store.write("memory", _feedback(weight=220, support_count=3, **sources))
+    pattern = store.promote_memory_to_pattern(memory, [])
+    assert {field: pattern[field] for field in sources} == sources
+    repeated = store.promote_memory_to_pattern(memory, [])
+    assert repeated["id"] == pattern["id"]
+    assert {field: repeated[field] for field in sources} == sources
+    downgraded = store.downgrade("pattern", pattern["id"])
+    assert {field: downgraded[field] for field in sources} == sources
+
+
 def test_review_issue_keeps_writing_domain_and_kind_when_promoted(tmp_path):
     store = FileLifecycleStore(str(tmp_path), "project-a")
     memory = store.write("memory", {

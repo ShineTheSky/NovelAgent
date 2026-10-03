@@ -27,6 +27,7 @@ web/dist/
 Thumbs.db
 
 # 文件
+/docs/
 待办事项.md
 需求文档.md
 项目计划.md
