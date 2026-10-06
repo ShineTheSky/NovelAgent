@@ -2,7 +2,8 @@
 
 The reviewer forks the writer's finished model messages and receives its phase
 instructions at the end. Missing latest artifacts are appended, not replayed.
-The polisher receives current artifacts and the resulting two-part report.
+The polisher continues the completed review messages. Memory extraction continues
+the completed polish messages after their History has been durably finalized.
 """
 
 import re
@@ -13,15 +14,38 @@ from novelagent.core.session import ResponseChunk
 from novelagent.trace.file_lifecycle import FileLifecycleStore
 from novelagent.history import DocumentHistoryStore
 from novelagent.versioning import RevisionManager
+from novelagent.trace.agent_run import AgentTraceTaskManager
 
 
 _CHAPTER_PATH = re.compile(r"^chapters/content_(\d+)\.(\d+)\.(\d+)\.md$", re.IGNORECASE)
 
 
 class ReviewPolishWorkflow:
-    def __init__(self, runner, working_dir: str):
+    def __init__(self, runner, working_dir: str, history_analyzer=None, background_tasks=None):
         self.runner = runner
         self.working_dir = Path(working_dir)
+        self.history_analyzer = history_analyzer
+        self.background_tasks = background_tasks or getattr(runner, "trace_tasks", None) or AgentTraceTaskManager()
+
+    async def _analyze_review(self, parent_session, review_history_id: str, source_trace_id: str):
+        try:
+            await self.history_analyzer.analyze(parent_session.project_id, review_history_id)
+        except Exception as exc:
+            await self._capture_failure(parent_session, review_history_id, source_trace_id,
+                                        exc, "history_analysis_failure")
+            raise
+
+    async def _capture_failure(self, session, review_id: str, trace_id: str, error: str, kind: str):
+        if review_id and kind != "history_analysis_failure":
+            DocumentHistoryStore(self.working_dir / session.project_id).set_analysis_status(review_id, "deferred", error)
+        recorder = getattr(self.runner, "bad_cases", None)
+        if recorder:
+            await recorder.capture(
+                source_trace_id=trace_id or review_id,
+                session_id=session.session_id, project_id=session.project_id,
+                failure_kind=kind, actor="history:reviewer", error=error,
+                tool="HistoryAnalysis", params={"history_id": review_id},
+            )
 
     @staticmethod
     def is_chapter(path: str) -> bool:
@@ -59,6 +83,9 @@ class ReviewPolishWorkflow:
         return "\n\n".join(lines)
 
     def _memory_context(self, project_id: str) -> str:
+        knowledge = getattr(self.runner, "knowledge", None)
+        if knowledge:
+            return knowledge.index(project_id)
         project_dir = self.working_dir / project_id
         store = FileLifecycleStore(str(self.working_dir), project_id)
         parts = [f"## 项目记忆（按需遵守）\n{self._read_if_exists(project_dir, '.memory/memory.md')}"]
@@ -109,7 +136,7 @@ class ReviewPolishWorkflow:
             heading, separator, body = block.partition("\n")
             info = RevisionManager.parse(body)
             if separator and not info.legacy and info.body.strip() and any(info.body.strip() in content for content in contents):
-                missing.append(f"{heading}\n当前修订：{info.revision_id}（正文已在继承的写作上下文中，不重复附带）")
+                missing.append(f"{heading}\n当前修订：{info.revision_id}（正文已在继承的上下文中，不重复附带）")
                 continue
             if separator and body.strip() and not any(body.strip() in content for content in contents):
                 missing.append(block.strip())
@@ -186,6 +213,7 @@ class ReviewPolishWorkflow:
         reviewer_user_input = str((history_evidence or {}).get("user_input") or "")
         reviewer_user_answers = list((history_evidence or {}).get("user_answers") or [])
         requirement_event_ids = list((history_evidence or {}).get("requirement_event_ids") or [])
+        reviewer_context = []
         async for chunk in self.runner.spawn_and_run(
             "reviewer", reviewer_task, parent_session, False,
             extra_context=reviewer_memory, artifact_context=reviewer_artifact,
@@ -193,6 +221,7 @@ class ReviewPolishWorkflow:
             parent_run_id=parent_run_id, workflow="auto_review",
             context_as_user_message=True,
             fork_context=fork_context,
+            context_snapshot=reviewer_context,
             source_trace_id=source_trace_id,
             history_evidence={**(history_evidence or {}), "dependencies": dependencies,
                               "target_path": chapter_path},
@@ -216,22 +245,39 @@ class ReviewPolishWorkflow:
             })
             return
 
+        if not reviewer_context:
+            await self._capture_failure(parent_session, review_history_id, source_trace_id,
+                                        "审阅完整上下文缺失", "history_context_failure")
+            yield ResponseChunk(type="error", data={
+                "message": "审阅完整上下文缺失，已停止自动润色，不能以报告替代上下文。",
+                "workflow": "auto_review", "failure_kind": "missing_context",
+            })
+            return
+
         # Re-read after review so the second specialist receives the actual latest header/body.
         artifact_context, memory_context = self._artifact_context(parent_session.project_id, chapter_path)
         dependencies = self.dependency_versions(parent_session.project_id, chapter_path)
         polisher_task = (
-            f"根据以下审阅报告润色 `{chapter_path}`。必须只修改该章节；使用固定正文中的当前修订作为 "
-            "expected_revision_id。完成写入后简述修改内容。\n\n"
-            f"## 审阅报告\n{reviewer_result}\n\n## 原写作任务（仅作意图参考）\n{writer_task}"
+            f"审阅阶段已完成，现在落实以上审阅思考与最终报告，润色 `{chapter_path}`。"
+            "不要重新生成审阅报告，也不要继续原写作任务。必须只修改该章节；"
+            "使用下方最新工件的当前修订作为 expected_revision_id。"
+            "完成写入后简述修改内容；确实无需修改时，以‘无需修改：’开头说明理由。"
         )
+        polisher_artifact = self._missing_context(artifact_context, reviewer_context)
+        polisher_memory = self._missing_context(memory_context, reviewer_context)
         polisher_result = ""
         polisher_completed = False
         polisher_empty = False
+        polisher_context = []
+        polish_request_id = ""
+        history_error = ""
         async for chunk in self.runner.spawn_and_run(
             "chapter_polisher", polisher_task, parent_session, False,
-            extra_context=memory_context, artifact_context=artifact_context,
+            extra_context=polisher_memory, artifact_context=polisher_artifact,
             actor="polisher", operation_id=f"{operation_id}:polish",
             parent_run_id=parent_run_id, workflow="auto_polish",
+            context_as_user_message=True, fork_context=reviewer_context,
+            context_snapshot=polisher_context,
             source_trace_id=source_trace_id,
             history_evidence={
                 **(history_evidence or {}), "main_delegation": writer_task,
@@ -247,9 +293,24 @@ class ReviewPolishWorkflow:
             },
         ):
             if chunk.type == "subagent_done":
+                polish_request_id = chunk.data.get("history_request_id", "")
                 polisher_result = chunk.data.get("result", "")
                 polisher_empty = bool(chunk.data.get("empty_result")) or not polisher_result.strip()
                 polisher_completed = not polisher_empty and not polisher_result.startswith("Error:")
+                if polisher_completed and review_history_id:
+                    store = DocumentHistoryStore(self.working_dir / parent_session.project_id)
+                    try:
+                        store.complete_review_workflow(review_history_id, polish_request_id, polisher_context)
+                    except ValueError as exc:
+                        history_error = str(exc)
+                        await self._capture_failure(parent_session, review_history_id, source_trace_id,
+                                                    history_error, "history_completion_failure")
+                    if not history_error and self.history_analyzer:
+                        self.background_tasks.submit(
+                            self._analyze_review(parent_session, review_history_id, source_trace_id),
+                            label=f"history-review:{review_history_id}",
+                        )
+                chunk.data["history_complete"] = polisher_completed and not history_error
             yield ResponseChunk(type=chunk.type, data={**chunk.data, "workflow": "auto_polish"})
 
         if not polisher_completed:
@@ -258,3 +319,11 @@ class ReviewPolishWorkflow:
                 "workflow": "auto_polish",
                 "failure_kind": "empty_response" if polisher_empty else "subagent_failure",
             })
+            return
+
+        if history_error:
+            yield ResponseChunk(type="error", data={
+                "message": f"润色结果缺少完整 History 证据，未触发审阅记忆提取：{history_error}",
+                "workflow": "auto_polish", "failure_kind": "incomplete_history",
+            })
+            return

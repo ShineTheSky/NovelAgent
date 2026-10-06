@@ -108,4 +108,4 @@ def test_history_analysis_can_read_exact_file_evidence_after_root_normalization(
     assert [tag for _, tag in calls] == [":history/extract", ":history/reconcile"]
     insight = lifecycle.list("insight")[0]
     assert insight["history_ids"] == [roots[0]]
-    assert insight["semantic_evidence"][0]["history_id"] == files[1]
+    assert insight["semantic_evidence"][0]["history_id"] == roots[0]

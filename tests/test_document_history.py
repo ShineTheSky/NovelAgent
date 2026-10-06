@@ -179,6 +179,8 @@ class DocumentHistoryTests(unittest.IsolatedAsyncioTestCase):
             async def spawn_and_run(self, preset, task, *args, **kwargs):
                 self.calls.append((preset, task, kwargs))
                 if preset == "reviewer":
+                    kwargs["context_snapshot"][:] = [{"role": "assistant", "content": "人物动机不明",
+                                                       "reasoning_content": "检查了动机链"}]
                     yield ResponseChunk(type="subagent_done", data={
                         "result": "人物动机不明", "history_thinking": "检查了动机链",
                         "history_user_input": "用户原话\n\n澄清后的完整选项",

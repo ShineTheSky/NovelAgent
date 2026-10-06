@@ -26,6 +26,10 @@ from novelagent.tools.search_rag import SearchRagTool
 from novelagent.security.permission_checker import PermissionChecker
 from novelagent.context.builder import ContextBuilder
 from novelagent.memory.memory_manager import MemoryManager
+from novelagent.memory.consolidation import KnowledgePipeline
+from novelagent.memory.runtime import KnowledgeRuntime
+from novelagent.memory.knowledge_store import fingerprint
+from novelagent.tools.search_memory import SearchMemoryTool, ReadHistoryTool
 from novelagent.core.agent_loop import AgentLoop
 from novelagent.core.subagent import SubAgentRunner
 from novelagent.trace.store import TraceStore
@@ -106,6 +110,7 @@ def create_app() -> FastAPI:
         llm_client, working_dir, case_analysis_cfg, trace_store,
     )
     bad_case_recorder = AgentBadCaseRecorder(trace_store, working_dir, bad_case_analyzer)
+    llm_client.bad_case_recorder = bad_case_recorder
     bash_case_analyzer.bad_case_recorder = bad_case_recorder
     embedding_gate = EmbeddingGate(
         str(get_project_root() / embedding_cfg.get("model_path", "models/bge-base-zh-v1.5")),
@@ -118,7 +123,21 @@ def create_app() -> FastAPI:
         llm_client, working_dir, trace_store, embedding_gate, rag_store, bad_case_recorder,
         agent_trace_tasks,
     )
-    history_analyzer = HistoryAnalyzer(llm_client, working_dir, trace_store)
+    knowledge_cfg = cfg.get("memory", {}).get("knowledge", {})
+    knowledge_pipeline = None
+    knowledge_runtime = None
+    if knowledge_cfg.get("enabled", True):
+        model_path = embedding_model.model_path.resolve()
+        model_files = [(str(p.relative_to(model_path)), p.stat().st_size, p.stat().st_mtime_ns) for p in sorted(model_path.rglob("*"))
+                       if p.is_file() and p.suffix in {".json", ".safetensors", ".bin"}]
+        model_id = fingerprint({"path": str(model_path), "files": model_files})
+        knowledge_pipeline = KnowledgePipeline(llm_client, working_dir, embedding_model, model_id,
+                                               bad_cases=bad_case_recorder, config=knowledge_cfg, trace_store=trace_store)
+        knowledge_runtime = KnowledgeRuntime(knowledge_pipeline, knowledge_cfg)
+        registry.register(SearchMemoryTool(knowledge_pipeline))
+        registry.register(ReadHistoryTool(knowledge_pipeline))
+    history_analyzer = HistoryAnalyzer(llm_client, working_dir, trace_store, knowledge_pipeline=knowledge_pipeline)
+    history_analyzer.knowledge_runtime = knowledge_runtime
     preference_context_provider = FilePatternContextProvider(working_dir)
 
     agent_config = {
@@ -132,6 +151,7 @@ def create_app() -> FastAPI:
     subagent_runner = SubAgentRunner(
         llm_client, registry, permission_checker, context_builder, working_dir, bad_case_recorder,
         agent_trace_tasks,
+        knowledge_runtime=knowledge_runtime,
     )
     # 注入已解析的预设路径
     for tool in registry.list_all():
@@ -153,6 +173,7 @@ def create_app() -> FastAPI:
     app.state.config = cfg
     app.state.llm_config_path = llm_config_path
     app.state.rag_store = rag_store
+    app.state.knowledge_runtime = knowledge_runtime
 
     # Register routes
     app.include_router(projects.router)
@@ -167,10 +188,12 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup():
         await db_init()
-        agent_trace_tasks.submit(
-            post_turn_analyzer.recover_pending_windows(), label="trace-window-recovery",
-        )
-        agent_trace_tasks.submit(history_analyzer.recover(), label="history-analysis-recovery")
+        history_analyzer.interrupt_collecting()
+        if knowledge_cfg.get("recover_on_startup", False):
+            agent_trace_tasks.submit(
+                post_turn_analyzer.recover_pending_windows(), label="trace-window-recovery",
+            )
+            agent_trace_tasks.submit(history_analyzer.recover(), label="history-analysis-recovery")
 
     @app.on_event("shutdown")
     async def shutdown():

@@ -33,6 +33,7 @@ export interface HistoryEvent {
   canonical_event_id?: string;
   inherited_requirement?: boolean;
   inherited_review?: boolean;
+  inherited_process?: boolean;
   scope?: { path?: string; run_id?: string; preset?: string; source?: string; trace_id?: string; sequence_no?: number; evidence_scope?: string; review_section?: string };
 }
 
@@ -48,6 +49,10 @@ export interface HistoryRevision {
 }
 
 export interface HistoryUnit extends Omit<HistorySummary, 'user_input'> {
+  canonical_history_id?: string;
+  requested_history_id?: string;
+  canonical_requirement_history_id?: string;
+  attempts?: { history_id: string; request_id: string; session_id: string; status: string; created_at: string; reason?: string }[];
   request_id: string;
   session_id: string;
   assistant_response: string;
@@ -57,6 +62,8 @@ export interface HistoryUnit extends Omit<HistorySummary, 'user_input'> {
   events: HistoryEvent[];
   archived_events?: HistoryEvent[];
   revisions?: (HistoryRevision | null)[];
+  body_versions?: { revision_id: string; path: string; status: 'available' | 'missing';
+    previous_revision_id?: string | null; total_lines?: number; body_sha256?: string }[];
   previous_attempt_events: HistoryEvent[];
   requirement_event_ids?: string[];
   affected_files?: { history_id: string; path: string; status: string; previous_history_id: string }[];

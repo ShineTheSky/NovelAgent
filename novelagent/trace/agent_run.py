@@ -150,5 +150,9 @@ class AgentRunTrace:
         await self.store.append_event(self.trace_id, self.sequence, "agent_finished", "system", {
             "status": status, "error": str(error)[:16_000],
         })
-        await self.store.finish_trace(self.trace_id, status, final_answer, 0)
+        usages = [event["payload"] for event in self.events if event["event_type"] == "llm_usage"]
+        tokens = sum(int(u.get("total_tokens") or
+                         int(u.get("prompt_tokens", u.get("input_tokens", 0))) +
+                         int(u.get("completion_tokens", u.get("output_tokens", 0)))) for u in usages)
+        await self.store.finish_trace(self.trace_id, status, final_answer, tokens)
         self.finished = True

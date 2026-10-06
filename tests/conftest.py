@@ -3,6 +3,21 @@ import tempfile
 import os
 from pathlib import Path
 
+
+@pytest.fixture(autouse=True)
+def block_external_http(monkeypatch):
+    """Model tests must use mocks; ASGI/TestClient transports remain available."""
+    import httpx
+
+    def blocked(*args, **kwargs):
+        raise AssertionError("External HTTP is disabled in tests")
+
+    async def blocked_async(*args, **kwargs):
+        raise AssertionError("External HTTP is disabled in tests")
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", blocked)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", blocked_async)
+
 @pytest.fixture
 def temp_dir():
     with tempfile.TemporaryDirectory() as d:

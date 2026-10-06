@@ -97,7 +97,7 @@ def test_file_analysis_cannot_repeat_shared_preferences_and_mixed_evidence_has_c
     }]})
     mixed = next(m for m in files.list("memory") if m["claim"] == "用动作落实克制需求")
     assert mixed["history_ids"] == [root]
-    assert {e["history_id"]: e["history_event_ids"] for e in mixed["semantic_evidence"]} == {root: [original], first: [local]}
+    assert {e["history_id"]: e["history_event_ids"] for e in mixed["semantic_evidence"]} == {root: [original, local]}
 
 
 def test_same_requirement_cannot_add_multiple_supports(tmp_path):

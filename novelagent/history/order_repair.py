@@ -9,6 +9,7 @@ from contextlib import closing
 from pathlib import Path
 
 from novelagent.history.backfill import _requests
+from novelagent.history.legacy_tools import normalize_tool_events
 from novelagent.history.store import DocumentHistoryStore
 
 
@@ -38,7 +39,7 @@ def _source_evidence(request):
         candidates.append(row)
         return row
 
-    for index, source in enumerate(request["events"]):
+    for index, source in enumerate(normalize_tool_events(request["events"])):
         kind, payload = source["event_type"], source["payload"]
         run = str(payload.get("run_id") or "main")
         if kind.endswith("subagent_start"):
@@ -47,10 +48,8 @@ def _source_evidence(request):
             add("main_delegation", task, index, source, run)
             add("reviewer_delegation", task, index, source, run)
             add("subagent_task", task, index, source, run)
-            summary = payload.get("task_summary") or ""
-            if summary and summary != task:
-                add("main_delegation", summary, index, source, run)
-                add("subagent_task", summary, index, source, run)
+            # task_summary is a UI abbreviation of this same invocation, not
+            # another demand/event. Prefer its full task_prompt when available.
         if kind == "user_message":
             add("user_input", payload.get("content") or "", index, source)
         elif kind == "assistant_turn":
@@ -74,7 +73,13 @@ def _source_evidence(request):
         if kind.endswith("tool_call"):
             pending[(run, payload.get("tool"))].append((index, source))
             if payload.get("tool") == "SubAgent":
-                add("main_delegation", (payload.get("params") or {}).get("task") or "", index, source)
+                params = payload.get("params") or {}
+                add("main_delegation", params.get("task") or "", index, source, run)
+                for offset, attachment in enumerate(params.get("attachments") or []):
+                    if isinstance(attachment, dict) and attachment.get("path") and attachment.get("content"):
+                        reference = add("document_reference", json.dumps({"params": {"path": attachment["path"]},
+                                        "content": attachment["content"]}, ensure_ascii=False), index, source, run)
+                        reference["order"] += 10 + offset
         if kind == "question_ask" or (kind.endswith("tool_call") and payload.get("tool") == "AskUserQuestion"):
             content = json.dumps(payload.get("questions", (payload.get("params") or {}).get("questions", [])), ensure_ascii=False)
             previous = questions.get(run)
@@ -95,7 +100,20 @@ def _source_evidence(request):
         if kind.endswith("tool_result"):
             tool = payload.get("tool")
             queue = pending[(run, tool)]
-            call = queue.pop(0) if queue else None
+            if payload.get("call_source_event_id"):
+                call = next((item for item in queue if item[1]["event_id"] == payload["call_source_event_id"]
+                             and item[1]["payload"].get("params") == payload.get("call_params")), None)
+                if call:
+                    queue.remove(call)
+            else:
+                call = queue.pop(0) if queue else None
+            if not tool and payload.get("data"):
+                add("unattributed_tool_result", json.dumps(payload, ensure_ascii=False), index, source, run)
+            if tool == "SubAgent" and payload.get("call_params") and payload.get("data"):
+                if not any(e["event_type"].endswith("subagent_done")
+                           and e["payload"].get("result") == payload["data"] for e in request["events"]):
+                    preset = payload["call_params"].get("preset") or "subagent"
+                    add(f"{preset}_output", str(payload["data"]), index, source, run)
             if tool == "AskUserQuestion" and payload.get("success"):
                 content = json.dumps(_json(payload.get("data")), ensure_ascii=False)
                 previous = next((c for c in reversed(candidates) if c["kind"] == "user_answer" and c["run"] == run), None)
@@ -153,7 +171,7 @@ def repair_history_order(trace_db: Path, project: Path, *, apply=False) -> dict:
               "ordered": 0, "split_parts": 0, "duplicates": 0, "unverified": [], "changed": 0}
     with closing(sqlite3.connect(f"file:{Path(trace_db).resolve().as_posix()}?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
-        requests = [r for r in _requests(db) if r["project_id"] == project.name and r["status"] in {"completed", "failed", "interrupted"}]
+        requests = [r for r in _requests(db, project.name) if r["status"] in {"completed", "failed", "interrupted"}]
     if not store.db_path.exists():
         return report
     # Dry runs do not initialize schemas or write to either database.
@@ -177,20 +195,28 @@ def repair_history_order(trace_db: Path, project: Path, *, apply=False) -> dict:
         report["requests"] += 1
         report["histories"] += len(owned)
         candidates = _source_evidence(request)
-        by_source = {sid: c for c in candidates for sid in c["sources"]}
+        by_source = defaultdict(list)
+        for candidate in candidates:
+            for sid in candidate["sources"]:
+                by_source[sid].append(candidate)
         consumed, canonical = defaultdict(set), {}
         # Prefer already-canonical provenance IDs over archived requirement copies.
         for event in sorted(events, key=lambda event: not bool(sources[event["event_id"]])):
+            if not event["content"] and old_order.get(event["event_id"], {}).get("canonical_event_id"):
+                continue  # Storage aliases must not become visible unverified evidence.
             if event["history_id"] not in owned or event["event_id"] in old_order and old_order[event["event_id"]].get("original_event_id"):
                 continue
             unit = owned[event["history_id"]]
-            run = unit["request_id"].split(":run:", 1)[1] if ":run:" in unit["request_id"] else "main"
-            mapped = [by_source[sid] for sid in sources[event["event_id"]] if sid in by_source and by_source[sid]["kind"] == event["kind"]]
+            scope = json.loads(event.get("scope_json") or "{}")
+            run = scope.get("run_id") or (unit["request_id"].split(":run:", 1)[1] if ":run:" in unit["request_id"] else "main")
+            mapped = [c for sid in sources[event["event_id"]] for c in by_source[sid] if _matches(event, c)]
             matches = [c for c in candidates if _matches(event, c) and
                        (c["run"] == run or event["kind"].startswith("reviewer_") or event["kind"] in {"user_input", "user_answer", "question_ask"})]
             if event["kind"].startswith("reviewer_") and len({c["run"] for c in matches}) > 1:
                 matches = [c for c in matches if c["run"] == run]
-            candidate = mapped[0] if mapped else next((c for c in matches if c["order"] not in consumed[(event["history_id"], event["kind"])]), None)
+            candidate = (mapped[0] if mapped and len({c["order"] for c in mapped}) == 1 else
+                         next((c for c in mapped or matches
+                               if c["order"] not in consumed[(event["history_id"], event["kind"])]), None))
             if candidate is None and len({c["order"] for c in matches}) == 1:
                 candidate = matches[0]  # A copied delegation/answer, not a new occurrence.
             if not candidate:

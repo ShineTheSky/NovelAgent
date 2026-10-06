@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 
 from novelagent.core.llm_turn import build_assistant_message
+from novelagent.llm.failures import llm_failure_context
 from novelagent.trace.file_lifecycle import FileLifecycleStore, PATTERN_PROMOTION_WEIGHT
 from novelagent.trace.store import TraceStore
 from novelagent.trace.agent_run import AgentRunTrace
@@ -86,7 +87,7 @@ class FileTraceAnalyzer:
         await self.bad_cases.capture(
             source_trace_id=agent_trace.trace_id if agent_trace else trace_id,
             session_id=session_id, project_id=project_id,
-            failure_kind=failure_kind, actor="memory_analyzer", error=str(error),
+            failure_kind=failure_kind, actor="memory_analyzer", error=error,
             messages=messages,
         )
 
@@ -111,6 +112,8 @@ class FileTraceAnalyzer:
                 title=f"[memory_analyzer] {trace_id}",
             )
         execution_events = agent_trace.events if agent_trace else []
+        context_token = llm_failure_context.set({"project_id": project_id, "session_id": session_id,
+                                                "source_trace_id": agent_trace.trace_id if agent_trace else trace_id})
         try:
             window_summary = await self._analyze_impl(
                 trace_id, project_id, branch_messages, _tools,
@@ -134,6 +137,8 @@ class FileTraceAnalyzer:
                 failure_kind="memory_analysis_failure",
             )
             raise
+        finally:
+            llm_failure_context.reset(context_token)
 
     async def _analyze_impl(self, trace_id: str, project_id: str, branch_messages=None, _tools=None, *,
                             events_override: list[dict] | None = None,
@@ -986,8 +991,9 @@ class FileTraceAnalyzer:
             "tool": call.tool_name, "success": result.success,
             "data": result.data if result.success else "", "error": result.error,
         })
-        tool_call_id = getattr(call, "tool_call_id", "") or "trace-context-call"
-        messages.append(build_assistant_message(text, "", [call], 0))
+        assistant = build_assistant_message(text, "", [call], 0)
+        tool_call_id = assistant["tool_calls"][0]["id"]
+        messages.append(assistant)
         tool_content = result.data if isinstance(result.data, str) else json.dumps(result.data, ensure_ascii=False)
         messages.append({
             "role": "tool_result", "tool_call_id": tool_call_id,

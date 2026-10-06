@@ -158,6 +158,7 @@ export function HistoryDetail({ unit, onSelectHistory }: { unit: HistoryUnit; on
   const finalRevision = (unit.revisions || []).find(revision => revision?.revision_id === unit.final_revision_id);
   const intermediateCount = unit.events.filter(event => event.kind === 'revision' && event.revision_id !== unit.final_revision_id).length;
   const reviewRetelling = unit.kind === 'review' && unit.events.some(event => event.kind === 'review_retelling');
+  const requirementId = unit.canonical_requirement_history_id || unit.requirement_history_id;
   return <div className="space-y-5">
     <div>
       <div className="flex flex-wrap items-center gap-2 text-xs text-gray-500">
@@ -166,22 +167,31 @@ export function HistoryDetail({ unit, onSelectHistory }: { unit: HistoryUnit; on
       <h3 className="mt-2 break-all text-base font-semibold text-gray-800">{unit.path || unit.events.find(event => event.kind === 'user_input')?.content.slice(0, 200) || '对话记录'}</h3>
       <p className="mt-1 break-all font-mono text-[10px] text-gray-400">History {unit.history_id}</p>
       {reviewRetelling && <p className="mt-2 rounded-lg bg-amber-50 p-3 text-xs text-amber-700">此节点保存主 Agent 的审阅转述，不是审阅 Agent 的原始报告；原始审阅报告和被审版本未核验。不作为一次新的独立审阅支持。</p>}
-      {unit.requirement_history_id && unit.requirement_history_id !== unit.history_id && <button type="button" onClick={() => void onSelectHistory(unit.requirement_history_id!)} className="mt-1 break-all text-left font-mono text-[11px] text-purple-600 hover:underline">需求 History {unit.requirement_history_id}</button>}
+      {requirementId && requirementId !== unit.history_id && <button type="button" onClick={() => void onSelectHistory(requirementId)} className="mt-1 break-all text-left font-mono text-[11px] text-purple-600 hover:underline">需求 History {requirementId}</button>}
       {unit.previous_history_id && <button type="button" onClick={() => void onSelectHistory(unit.previous_history_id)} className="mt-1 break-all text-left font-mono text-[11px] text-purple-600 hover:underline">← 上一次 History {unit.previous_history_id}</button>}
       {unit.review_history_id && <button type="button" onClick={() => void onSelectHistory(unit.review_history_id!)} className="mt-1 block break-all text-left text-xs text-purple-600 hover:underline">来源审阅 History {unit.review_history_id}</button>}
       {unit.target_history_id && <button type="button" onClick={() => void onSelectHistory(unit.target_history_id!)} className="mt-1 block break-all text-left text-xs text-purple-600 hover:underline">被审文件 History {unit.target_history_id}</button>}
       {unit.path && <p className="mt-1 break-all text-xs text-gray-500">基于 {unit.base_revision_id || '无'} · 最终 {unit.final_revision_id || '未保存完整版本'}</p>}
     </div>
+    {!!unit.attempts?.length && <section><h4 className="mb-2 text-xs font-medium text-gray-500">同一需求的中断与续接 · {unit.attempts.length} 次</h4><p className="mb-2 text-xs text-gray-500">合并需求身份，保留每次执行的原始事件与文件版本。下方证据按执行顺序展示。</p>{unit.attempts.map((attempt, index) => <p key={attempt.history_id} className="break-all py-1 font-mono text-[11px] text-gray-600">{index + 1}. {attempt.history_id} · {attempt.status}{attempt.reason ? ` · ${attempt.reason}` : ''}</p>)}</section>}
     {!!unit.affected_files?.length && <section><h4 className="mb-2 text-xs font-medium text-gray-500">落实到文件 · {unit.affected_files.length} 条 History</h4><div className="space-y-2">{unit.affected_files.map(file => <button key={file.history_id} type="button" onClick={() => void onSelectHistory(file.history_id)} className="block w-full break-all rounded-lg border border-gray-100 p-3 text-left text-xs text-purple-700 hover:bg-purple-50">{file.path} · {file.status}<span className="mt-1 block font-mono text-[10px]">{file.history_id}</span></button>)}</div></section>}
     {!!unit.reviews?.length && <section><h4 className="mb-2 text-xs text-gray-500">独立审阅节点（可直接作为记忆来源）</h4>{unit.reviews.map(review => <button key={review.history_id} type="button" onClick={() => void onSelectHistory(review.history_id)} className="block break-all py-2 text-left text-xs text-purple-700">{review.path} · {review.status} · {review.history_id}</button>)}</section>}
     {!!unit.result_histories?.length && <section><h4 className="mb-2 text-xs text-gray-500">审阅后的落实 History</h4>{unit.result_histories.map(file => <button key={file.history_id} type="button" onClick={() => void onSelectHistory(file.history_id)} className="block break-all py-2 text-left text-xs text-purple-700">{file.path} · {file.status} · {file.history_id}</button>)}</section>}
     {unit.assistant_response && <section><h4 className="mb-2 text-xs font-medium text-gray-500">最终回复</h4><pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-gray-50 p-3 text-xs leading-5 text-gray-700">{unit.assistant_response}</pre></section>}
+    {!!unit.body_versions?.length && <section>
+      <h4 className="mb-2 text-xs font-medium text-gray-500">正文版本引用</h4>
+      <p className="mb-2 text-xs text-gray-400">Read／Write 过程只显示版本引用。正文按版本按需读取；无法定位的记录标为 unresolved，原始证据仍保留。</p>
+      {unit.body_versions.map(version => <p key={version.revision_id} className="break-all py-1 font-mono text-[11px] text-gray-600">
+        {version.path} · {version.revision_id} · {version.status === 'missing' ? '正文版本缺失' : `存档可读取 · ${version.total_lines} 行`}
+      </p>)}
+    </section>}
     <section>
       <h4 className="mb-2 text-xs font-medium text-gray-500">过程证据 · {unit.events.length} 条</h4>
       <div className="space-y-2">
         {unit.events.map(event => <details key={event.event_id} className="rounded-lg border border-gray-100 px-3 py-2">
-          <summary className="cursor-pointer text-xs text-gray-700">{event.kind}{event.inherited_requirement ? ' · 引用的需求' : ''}{event.inherited_review ? ' · 引用的审阅' : ''} <span className="ml-2 text-gray-400">{event.content.slice(0, 90).replace(/\s+/g, ' ')}</span></summary>
+          <summary className="cursor-pointer text-xs text-gray-700">{event.kind}{event.inherited_requirement ? ' · 引用的需求' : ''}{event.inherited_review ? ' · 引用的审阅' : event.inherited_process ? ' · 引用的过程' : ''} <span className="ml-2 text-gray-400">{event.content.slice(0, 90).replace(/\s+/g, ' ')}</span></summary>
           <p className="mt-2 break-all font-mono text-[10px] text-gray-400">{event.event_id}</p>
+          {event.inherited_process && event.evidence_history_id && <button type="button" onClick={() => void onSelectHistory(event.evidence_history_id!)} className="mt-1 break-all text-left font-mono text-[11px] text-purple-600 hover:underline">过程所属 History {event.evidence_history_id}</button>}
           {event.order_status && <p className="mt-1 text-[11px] text-gray-500">{event.order_status === 'unverified' ? '顺序未核验' : event.occurred_at ? `发生于 ${new Date(event.occurred_at).toLocaleString()}` : '已按原始事件顺序还原 · 时间缺失'}</p>}
           {(event.scope?.path || event.scope?.run_id) && <p className="mt-1 break-all text-[11px] text-gray-500">作用范围：{event.scope.path || event.scope.preset || event.scope.run_id}</p>}
           {event.scope?.evidence_scope === 'run' && <p className="mt-1 text-[11px] text-gray-500">本次 Agent 运行的共享上下文，不代表专门针对此文件。</p>}

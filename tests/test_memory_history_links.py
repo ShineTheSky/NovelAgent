@@ -271,7 +271,7 @@ def test_main_agent_evidence_maps_root_and_actual_subagent_run(evidence):
     assert {link["history_id"] for link in links["main-turn"]} == {histories["trace-a"]}
     assert len(links["main-turn"][0]["history_event_ids"]) == 2
     assert {link["history_id"] for link in links["main-spawn"]} == {histories["trace-a"]}
-    assert {link["history_id"] for link in links["main-result"]} == {histories[("after", "chapters/a.md")]}
+    assert {link["history_id"] for link in links["main-result"]} == {histories["trace-a"]}
     assert all(link["match"] == "evidence" for group in links.values() for link in group)
 
 

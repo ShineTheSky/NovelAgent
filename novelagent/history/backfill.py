@@ -11,6 +11,7 @@ from contextlib import closing
 from pathlib import Path
 
 from novelagent.history import DocumentHistoryStore
+from novelagent.history.legacy_tools import normalize_tool_events
 from novelagent.versioning import revision_manager
 
 
@@ -28,15 +29,16 @@ def _payload(row: sqlite3.Row) -> dict:
 
 
 def _events(db: sqlite3.Connection, trace_id: str) -> list[dict]:
-    return [{**dict(row), "payload": _payload(row)} for row in db.execute(
+    return normalize_tool_events([{**dict(row), "payload": _payload(row)} for row in db.execute(
         "SELECT * FROM trace_events WHERE trace_id = ? ORDER BY sequence_no", (trace_id,),
-    )]
+    )])
 
 
-def _requests(db: sqlite3.Connection) -> list[dict]:
+def _requests(db: sqlite3.Connection, project_id: str = "") -> list[dict]:
     traces = [dict(row) for row in db.execute(
         "SELECT * FROM traces WHERE source_agent = 'main_agent' "
-        "AND source IN ('live', 'historical') ORDER BY started_at, rowid",
+        "AND source IN ('live', 'historical') AND (? = '' OR project_id = ?) ORDER BY started_at, rowid",
+        (project_id, project_id),
     )]
     groups: dict[tuple, list[tuple[dict, dict]]] = defaultdict(list)
     for trace in traces:
@@ -116,9 +118,24 @@ def _extract(request: dict, project_dir: Path) -> tuple[list[tuple[str, str]], d
             if payload.get("content"):
                 global_events.append(("main_agent_output", str(payload["content"])))
         elif kind == "tool_call" and payload.get("tool") == "SubAgent":
-            task = str((payload.get("params") or {}).get("task") or "")
+            params = payload.get("params") or {}
+            task = str(params.get("task") or "")
             if task:
                 global_events.append(("main_delegation", task))
+            for attachment in params.get("attachments") or []:
+                if isinstance(attachment, dict) and attachment.get("path") and attachment.get("content"):
+                    global_events.append(("document_reference", json.dumps({"params": {"path": attachment["path"]},
+                                          "content": attachment["content"]}, ensure_ascii=False)))
+        elif kind == "tool_result" and payload.get("tool") == "SubAgent" and payload.get("call_params"):
+            preset = payload["call_params"].get("preset") or "subagent"
+            if payload.get("data") and not any(e["event_type"].endswith("subagent_done")
+                    and e["payload"].get("result") == payload["data"] for e in request["events"]):
+                global_events.append((f"{preset}_output", str(payload["data"])))
+        elif kind == "tool_result" and payload.get("tool") == "Read" and payload.get("success") and payload.get("call_params"):
+            global_events.append(("document_reference", json.dumps({"params": payload["call_params"],
+                                  "content": payload.get("data")}, ensure_ascii=False)))
+        elif kind == "tool_result" and not payload.get("tool") and payload.get("data"):
+            global_events.append(("unattributed_tool_result", json.dumps(payload, ensure_ascii=False)))
         elif kind == "subagent_subagent_start" and run_id:
             run = runs[run_id]
             run["preset"] = str(payload.get("preset") or "")
@@ -224,7 +241,7 @@ def _check_saved(store: DocumentHistoryStore, request: dict,
                     problems.append(f"Agent run unit missing: {run_id}:{path}")
                     continue
                 actual = Counter((e["kind"], e["content"]) for e in [*child["events"], *child.get("archived_events", [])]
-                                 if e["history_id"] == child["history_id"] or e["kind"] == "user_answer")
+                                 if e["history_id"] == child["history_id"] or e["kind"] == "user_answer" or e.get("inherited_process"))
                 if Counter(details["events"]) - actual:
                     problems.append(f"Agent run evidence missing: {run_id}:{path}")
                 if details["refs"] and child["final_revision_id"] != details["refs"][-1]["revision_id"]:
@@ -237,7 +254,8 @@ def _check_saved(store: DocumentHistoryStore, request: dict,
                         problems.append(f"verified current revision differs: {path}")
             continue
         actual = Counter((e["kind"], e["content"]) for e in [*unit["events"], *unit.get("archived_events", [])]
-                         if e["history_id"] == unit["history_id"])
+                         if e["history_id"] == unit["history_id"] or e.get("inherited_process")
+                         or e["history_id"] == store._unit_id(request["request_id"], "request"))
         if Counter(expected) - actual:
             problems.append(f"document evidence missing or changed: {path}")
         if path in verified:
@@ -267,7 +285,8 @@ def _append_missing(store: DocumentHistoryStore, request_id: str,
         if not unit:
             continue
         present = Counter((e["kind"], e["content"]) for e in unit["events"]
-                          if e["history_id"] == unit["history_id"])
+                          if e["history_id"] == unit["history_id"] or e.get("inherited_process")
+                          or e["history_id"] == store._unit_id(request_id, "request"))
         for item in entries:
             if present[item]:
                 present[item] -= 1
@@ -412,7 +431,7 @@ def reorganize(trace_db: Path, workspace: Path, *, apply: bool = False,
               "repaired_events": 0, "removed_legacy_aggregates": 0, "errors": []}
     created_backups: set[Path] = set()
     try:
-        for request in _requests(db):
+        for request in _requests(db, project_id):
             if project_id and request["project_id"] != project_id:
                 continue
             project_dir = workspace / request["project_id"]
@@ -446,7 +465,8 @@ def reorganize(trace_db: Path, workspace: Path, *, apply: bool = False,
                                 f"{store._unit_id(child_id, 'request')}:input"))
                         present = Counter((event["kind"], event["content"])
                                           for event in store.get_unit(history_id)["events"]
-                                          if event["history_id"] == history_id or event["kind"] == "user_answer")
+                                          if event["history_id"] == history_id or event["kind"] == "user_answer"
+                                          or event.get("inherited_process"))
                         for kind, content in details["events"]:
                             if present[(kind, content)]:
                                 present[(kind, content)] -= 1
@@ -477,6 +497,9 @@ def reorganize(trace_db: Path, workspace: Path, *, apply: bool = False,
                         WHERE request_id = ? AND kind IN ('document', 'legacy_aggregate')""",
                         (request["request_id"],))]
                     for old_id in old_ids:
+                        history_db.execute("DELETE FROM history_requirement_refs WHERE history_id=? OR event_id IN (SELECT event_id FROM history_events WHERE history_id=?)", (old_id, old_id))
+                        history_db.execute("DELETE FROM history_source_events WHERE event_id IN (SELECT event_id FROM history_events WHERE history_id=?)", (old_id,))
+                        history_db.execute("DELETE FROM history_event_order WHERE event_id IN (SELECT event_id FROM history_events WHERE history_id=?)", (old_id,))
                         history_db.execute("DELETE FROM history_events WHERE history_id = ?", (old_id,))
                         history_db.execute("DELETE FROM history_units WHERE history_id = ?", (old_id,))
                     report["removed_legacy_aggregates"] += len(old_ids)
@@ -506,7 +529,7 @@ def backfill(trace_db: Path, workspace: Path, *, apply: bool = False, check: boo
               "unverified_revision_references": 0, "truncated_events": 0,
               "checked": 0, "errors": []}
     try:
-        for request in _requests(db):
+        for request in _requests(db, project_id):
             if project_id and request["project_id"] != project_id:
                 continue
             report["requests"] += 1
@@ -620,6 +643,11 @@ def rebuild_project_history(trace_db: Path, workspace: Path, project_id: str,
         source.backup(destination)
     try:
         with store._connect() as history_db:
+            history_db.execute("DELETE FROM history_requirement_refs")
+            history_db.execute("DELETE FROM history_source_events")
+            history_db.execute("DELETE FROM history_event_order")
+            history_db.execute("DELETE FROM history_root_attempts")
+            history_db.execute("DELETE FROM history_resume_decisions")
             history_db.execute("DELETE FROM history_events")
             history_db.execute("DELETE FROM history_units")
         imported = backfill(trace_db, workspace, apply=True, project_id=project_id)

@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
-import { cancelLifecycleManualReview, downgradeLifecycleRecord, fetchInsights, fetchMemories, fetchPatterns, fetchTrace } from '../api/client';
+import { cancelLifecycleManualReview, downgradeLifecycleRecord, fetchInsights, fetchMemories, fetchPatterns, fetchTrace, fetchKnowledgeVersion } from '../api/client';
 import type { LifecycleRecord, TraceEvidence } from '../types/insights';
 import { LifecycleRecordDetailDialog } from './LifecycleRecordDetailDialog';
 import { TraceDetailDialog } from './TraceDetailDialog';
@@ -75,6 +75,14 @@ export function FileInsightsPanel({ projectId }: { projectId: string | null }) {
     await downgradeLifecycleRecord(projectId, record.layer, record.id);
     await load();
   };
+  const openKnowledge = async (id: string, version: number) => {
+    if (!projectId) return;
+    try {
+      setSelectedRecord(await fetchKnowledgeVersion(projectId, id, version));
+    } catch (requestError) {
+      setError(errorText(requestError));
+    }
+  };
   const cancelManualReview = async (record: LifecycleRecord) => {
     if (!projectId || record.layer === 'pattern' || !confirm(`取消“${record.title || record.claim}”的自动晋级锁定？取消后不会立即升级，但后续满足条件时可以自动晋级。`)) return;
     await cancelLifecycleManualReview(projectId, record.layer, record.id);
@@ -111,7 +119,7 @@ export function FileInsightsPanel({ projectId }: { projectId: string | null }) {
             {data[tab].map(record => <RecordCard key={record.id} record={record} tab={tab} onOpen={() => setSelectedRecord(record)} onOpenTrace={traceId => void openTrace(traceId)} onOpenHistory={setSelectedHistoryId} onDowngrade={() => void downgrade(record)} onCancelManualReview={() => void cancelManualReview(record)} />)}
             {!busy && data[tab].length === 0 && <p className="py-16 text-center text-sm text-gray-400">暂无 {label[tab]}。</p>}
           </main>
-          {selectedRecord && <LifecycleRecordDetailDialog record={selectedRecord} onClose={() => setSelectedRecord(null)} onOpenTrace={traceId => void openTrace(traceId)} onOpenHistory={setSelectedHistoryId} />}
+          {selectedRecord && <LifecycleRecordDetailDialog record={selectedRecord} onClose={() => setSelectedRecord(null)} onOpenTrace={traceId => void openTrace(traceId)} onOpenHistory={setSelectedHistoryId} onOpenKnowledge={(id, version) => void openKnowledge(id, version)} />}
           {selectedTraceId && <TraceDetailDialog trace={selectedTrace} loading={traceLoading} error={traceError} onClose={() => { setSelectedTraceId(null); setTraceError(null); }} />}
           {selectedHistoryId && projectId && <HistoryDetailDialog key={`${projectId}:${selectedHistoryId}`} projectId={projectId} historyId={selectedHistoryId} onClose={() => setSelectedHistoryId(null)} onSelectHistory={setSelectedHistoryId} />}
         </div>
@@ -137,7 +145,7 @@ function RecordCard({ record, tab, onOpen, onOpenTrace, onOpenHistory, onDowngra
       <span>类别 {record.category}</span>
       <span>领域 {record.domain}</span>
       {record.kind && <span className="rounded-full bg-rose-50 px-2 py-0.5 text-rose-600">类型 {kindLabel(record.kind)}</span>}
-      <span>权重 {Math.round(record.weight)}</span>
+      {record.schema === 'knowledge_v1' ? <span>事实体系 v{record.version} · {record.status}{record.layer !== 'memory' ? ` · 成熟分 ${Math.round(record.weight)}` : ''}</span> : <span>旧体系 · 权重 {Math.round(record.weight)}</span>}
       {record.promotion_status === 'manual_review' && <span title={record.downgrade_reason} className="rounded-full bg-amber-50 px-2 py-0.5 font-medium text-amber-700">自动晋级已锁定</span>}
       <span className="ml-auto">{record.updated.slice(0, 16).replace('T', ' ')}</span>
     </div>
@@ -149,10 +157,10 @@ function RecordCard({ record, tab, onOpen, onOpenTrace, onOpenHistory, onDowngra
       {!!record.related_history_ids?.length && !record.history_ids?.length && <button type="button" onClick={onOpen} className="text-amber-700 hover:underline">相关 History {record.related_history_ids.length} 条（非直接来源）</button>}
       {!record.history_ids?.length && traceRefs.length > 0 && <button type="button" onClick={() => onOpenTrace(traceRefs[0].trace_id)} className="text-gray-400 hover:underline">原始 Trace（诊断）</button>}
       <span>History 证据 {record.history_event_ids?.length || 0}</span>
-      {record.support_count && <span>支持 {record.support_count}</span>}
+      {record.support_count && <span>{record.schema === 'knowledge_v1' ? '历史使用任务' : '支持'} {record.support_count}</span>}
       <span className="ml-auto flex gap-3">
         {record.promotion_status === 'manual_review' && <button type="button" onClick={onCancelManualReview} className="text-purple-600 hover:text-purple-800">取消锁定</button>}
-        {tab !== 'insight' && <button type="button" onClick={onDowngrade} className="text-amber-700 hover:text-amber-900">降低层级</button>}
+        {tab !== 'insight' && record.schema !== 'knowledge_v1' && <button type="button" onClick={onDowngrade} className="text-amber-700 hover:text-amber-900">降低层级</button>}
       </span>
     </div>
   </article>;

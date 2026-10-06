@@ -5,6 +5,21 @@ working_dir: "./workspace"
 
 memory:
   global_dir: "global_memory"
+  knowledge:
+    enabled: true
+    recover_on_startup: false  # 旧 History 迁移与失败重试需显式触发，重载服务不发起付费分析
+    recall_timeout: 30          # 同步等待；失败记 bad case 后继续当前任务
+    candidate_limit: 40
+    graph_depth: 3
+    graph_nodes: 128
+    insight_limit: 12
+    insight_tokens: 8000
+    pattern_tokens: 8000
+    pattern_promotion_weight: 200 # 初始65，实际使用+15，上限300；合并保留最高分而不累加
+    analysis_input_tokens: 480000 # 包含 History、正文工具结果和校验纠错消息的本地输入预算
+    analysis_output_tokens: 16384
+    analysis_max_turns: 12       # 工具调用与校验纠错共用轮数，不额外无限重试
+    analysis_timeout: 120
 
 # 安全配置
 security:

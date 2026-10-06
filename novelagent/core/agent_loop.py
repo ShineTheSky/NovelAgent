@@ -57,14 +57,17 @@ class AgentLoop:
         self.bash_cases = bash_case_recorder
         self.post_turn_analyzer = post_turn_analyzer
         self.history_analyzer = history_analyzer
+        self.knowledge = getattr(history_analyzer, "knowledge_runtime", None)
         self.preference_context_provider = preference_context_provider
         self.rag_store = rag_store
-        self.review_workflow = ReviewPolishWorkflow(subagent_runner, self.working_dir) if subagent_runner else None
+        self.review_workflow = ReviewPolishWorkflow(
+            subagent_runner, self.working_dir, history_analyzer, background_tasks,
+        ) if subagent_runner else None
         self.background_tasks = background_tasks
         self._trace_capture_locks: dict[str, asyncio.Lock] = {}
 
     async def _stream_main_turn(self, messages: list[dict], tools: list[dict] | None,
-                                tag: str, result: MainTurnResult):
+                                tag: str, result: MainTurnResult, bad_case_context=None):
         """Run one main-agent LLM turn and stream user-visible chunks."""
         print(f"[LLM:main] 请求: messages={len(messages)}", flush=True)
         for index, message in enumerate(messages):
@@ -73,6 +76,7 @@ class AgentLoop:
         async for chunk in self.llm.chat(
             position="main_loop", messages=messages,
             tools=tools, stream=True, tag=tag,
+            bad_case_context=bad_case_context,
         ):
             if chunk.type == "thinking":
                 result.reasoning += chunk.content
@@ -178,8 +182,16 @@ class AgentLoop:
         )
 
         # 1. Read memory.md once and start relevance prefetch from that same snapshot.
-        memory_md, memory_prefetch = project_memory.prepare_context(request.content)
-        prefetch_task = asyncio.create_task(memory_prefetch)
+        knowledge_context = None
+        if self.knowledge:
+            query = "\n".join([*(str(m.get("content") or "") for m in session.messages[-4:] if m.get("role") == "user"), request.content])
+            knowledge_context = await self.knowledge.assemble(session.project_id, query, session_id=session.session_id, trace_id=trace_id)
+            memory_md = self.knowledge.index(session.project_id)
+            await record("memory_recall", "memory", knowledge_context["recall"])
+            prefetch_task = None
+        else:
+            memory_md, memory_prefetch = project_memory.prepare_context(request.content)
+            prefetch_task = asyncio.create_task(memory_prefetch)
         main_tool_names = [tool.name for tool in self.tools.list_all() if tool.name != "SearchRag"]
         tools_prompt = self.tools.get_tools_prompt(main_tool_names)
         main_tool_schemas = self.tools.get_schemas(main_tool_names)
@@ -305,7 +317,10 @@ class AgentLoop:
                 unit_ids = history_store.close_request(
                     history_request_id, status, answer, ids, current_turn,
                 )
-                if status == "completed" and self.history_analyzer:
+                if status != "completed" and self.knowledge:
+                    unit_ids = [hid for hid in history_store.list_analyzable(include_partial=True)
+                                if (history_store.get_unit(hid) or {}).get("request_id") == history_request_id]
+                if self.history_analyzer:
                     unit_ids.sort(key=lambda value: {"requirement": 0, "review": 1}.get((history_store.get_unit(value) or {}).get("kind"), 2))
                     for unit_id in unit_ids:
                         try:
@@ -328,7 +343,7 @@ class AgentLoop:
         # 3. Wait for memory prefetch (1.5s timeout)
         memory_injection = []
         try:
-            memories = await prefetch_task
+            memories = ([knowledge_context["text"]] if knowledge_context and knowledge_context["text"] else []) if self.knowledge else await prefetch_task
             if memories:
                 memory_injection = memories
                 injection_text = "[相关记忆附件]\n" + "\n---\n".join(memories)
@@ -387,7 +402,7 @@ class AgentLoop:
                 )
             except Exception as exc:
                 capture_bad_case(
-                    "context_compression_failure", "context_compression", str(exc),
+                    "context_compression_failure", "context_compression", exc,
                     params={"token_count": pre_check_tokens},
                     source_agent_trace_id="",
                 )
@@ -469,17 +484,24 @@ class AgentLoop:
             })
 
             turn_result = MainTurnResult()
+            knowledge_used = False
             try:
                 async for response_chunk in self._stream_main_turn(
                     llm_messages, tool_schemas, ":main", turn_result,
+                    bad_case_context={"source_trace_id": trace_id, "session_id": session.session_id,
+                                      "project_id": session.project_id, "history_id": history_request_id},
                 ):
+                    if self.knowledge and not knowledge_used and response_chunk.type != "error":
+                        self.knowledge.mark_used(session.project_id, knowledge_context["attachments"], llm_messages,
+                                                 history_request_id, "main")
+                        knowledge_used = True
                     yield response_chunk
             except Exception as exc:
                 import traceback
                 print(f"[LLM] 调用异常: {exc}", flush=True)
                 traceback.print_exc()
                 await record("error", "main_agent", {"message": str(exc), "turn": turn})
-                capture_bad_case("main_agent_failure", "main_agent", str(exc))
+                capture_bad_case("main_agent_failure", "main_agent", exc)
                 await finish("failed")
                 schedule_trace_capture(turn_result.text, status="failed")
                 yield ResponseChunk(type="error", data={
@@ -747,6 +769,7 @@ class AgentLoop:
                                     workflow_chunk.type == "subagent_done"
                                     and workflow_chunk.data.get("workflow") == "auto_polish"
                                     and not workflow_chunk.data.get("empty_result")
+                                    and workflow_chunk.data.get("history_complete", True)
                                 ):
                                     workflow_summaries.append(workflow_chunk.data.get("result", ""))
                                 await workflow_trace_stream.add(

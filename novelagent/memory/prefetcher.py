@@ -81,7 +81,7 @@ class Prefetcher:
             if agent_trace:
                 await agent_trace.finish("failed", error=str(exc))
             await self._capture_bad_case(
-                "memory_prefetch_failure", str(exc),
+                "memory_prefetch_failure", exc,
                 [{"role": "user", "content": user_message}], agent_trace,
             )
             raise
@@ -118,6 +118,8 @@ class Prefetcher:
             )
         async for chunk in self.llm_client.chat(
             position="memory_prefetch",
+            bad_case_context={"project_id": self.project_id, "session_id": self.session_id,
+                              "source_trace_id": agent_trace.trace_id if agent_trace else self.source_trace_id},
             messages=messages,
             tools=None,
             stream=False,

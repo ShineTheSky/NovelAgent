@@ -18,7 +18,7 @@ class SubAgentRunner:
 
     def __init__(self, llm_client, tool_registry, permission_checker, context_builder,
                  working_dir: str = "./workspace", bad_case_recorder=None,
-                 trace_tasks: AgentTraceTaskManager | None = None):
+                 trace_tasks: AgentTraceTaskManager | None = None, knowledge_runtime=None):
         self.llm = llm_client
         self.tools = tool_registry
         self.security = permission_checker
@@ -27,6 +27,7 @@ class SubAgentRunner:
         self.working_dir = working_dir
         self.bad_cases = bad_case_recorder
         self.trace_tasks = trace_tasks
+        self.knowledge = knowledge_runtime
         from novelagent.context.prompt_manager import PromptManager
         self.prompt_manager = PromptManager("prompts")
 
@@ -81,13 +82,21 @@ class SubAgentRunner:
         inherit = inherit_history if inherit_history is not None else preset.get("inherit_history", True)
         max_turns = preset.get("max_turns", 20)
         tool_names = preset.get("tools", [])
-        if preset_name == "reviewer":
-            tool_names = [name for name in tool_names if name in {"Read", "Glob", "Grep", "TextStats", "CheckContent", "AskUserQuestion"}]
+        if self.knowledge:
+            evidence_tools = [t.name for t in self.tools.list_all() if t.name in {"SearchMemory", "ReadHistory"}]
+            tool_names = list(dict.fromkeys([*tool_names, *evidence_tools]))
             preset = {**preset, "tools": tool_names}
-        if fork_context and preset_name != "reviewer":
-            raise ValueError("Only reviewer can fork writing context")
+        if preset_name == "reviewer":
+            tool_names = [name for name in tool_names if name in {"Read", "Glob", "Grep", "TextStats", "CheckContent", "AskUserQuestion", "SearchMemory", "ReadHistory"}]
+            preset = {**preset, "tools": tool_names}
+        if fork_context and preset_name not in {"reviewer", "chapter_polisher"}:
+            raise ValueError("Only reviewer and chapter_polisher can continue writing context")
 
         current_run_id = run_id or uuid.uuid4().hex
+        knowledge_context = None
+        if self.knowledge:
+            knowledge_context = await self.knowledge.assemble(parent_session.project_id, task, role=preset_name,
+                paths=[p for p in [str((history_evidence or {}).get("target_path") or "")] if p], session_id=parent_session.session_id, trace_id=source_trace_id)
         history = dict(history_evidence or {})
         history["dependencies"] = dict(history.get("dependencies") or {})
         history["user_answers"] = list(history.get("user_answers") or [])
@@ -109,7 +118,6 @@ class SubAgentRunner:
                 history_store.append_request_event(
                     history["history_request_id"], "user_answer", json.dumps(answers, ensure_ascii=False),
                     event_id=f"{request_history_id}:answer:{index}")
-            history_store.append_request_event(history["history_request_id"], "main_delegation", task)
             if preset_name == "reviewer":
                 if not history.get("requirement_history_id"):
                     requirement_id = history_store._unit_id(root_history_id, "request")
@@ -117,13 +125,16 @@ class SubAgentRunner:
                     history["requirement_history_id"] = requirement_id
                     history["requirement_event_ids"] = [f"{requirement_id}:input"]
                 history["review_history_id"] = history_store.start_review(history["history_request_id"], str(history.get("target_path") or ""))
+                if workflow == "auto_review":
+                    history_store.start_review_workflow(history["review_history_id"])
             elif history.get("review_history_id"):
                 history_store.link_review(history["history_request_id"], history["review_history_id"])
+            history_store.append_request_event(history["history_request_id"], "main_delegation", task)
         thinking_kind = {
             "chapter_writer": "writer_thinking",
             "chapter_polisher": "polisher_thinking",
             "reviewer": "reviewer_thinking",
-        }.get(preset_name)
+        }.get(preset_name, f"{preset_name}_thinking")
         src = {
             "source": "subagent",
             "run_id": current_run_id,
@@ -144,6 +155,8 @@ class SubAgentRunner:
             None if context_as_user_message else attachments,
             "" if context_as_user_message else artifact_context,
         )
+        if self.knowledge and not fork_context:
+            system_prompt += "\n\n" + self.knowledge.index(parent_session.project_id)
         initial_messages = []
         if inherit:
             parent_msgs = parent_session.messages[-20:] if len(parent_session.messages) > 20 else parent_session.messages
@@ -155,10 +168,14 @@ class SubAgentRunner:
         initial_messages.append({"role": "user", "content": task})
         if fork_context:
             runtime_context = "\n\n".join(part for part in (fixed_context, extra_context) if part)
+            phase = "审阅" if preset_name == "reviewer" else "润色"
             initial_messages = [*deepcopy(fork_context), {"role": "user", "content":
-                "【服务端阶段切换：审阅】\n写作阶段已结束。保留以上上下文作为证据，以下是本阶段的审阅要求（不取消安全约束）：\n"
+                f"【服务端阶段切换：{phase}】\n上一阶段已结束。保留以上任务、思考、工具结果及最终回复作为证据，"
+                f"此前角色职责不再执行。以下是本阶段的{phase}要求（不取消安全约束）：\n"
                 + system_prompt + "\n\n" + runtime_context + "\n\n" + task}]
             system_prompt = ""
+        if knowledge_context and knowledge_context["text"]:
+            initial_messages.append({"role": "user", "content": knowledge_context["text"]})
         if history_store:
             history_store.update_request_context(history["history_request_id"],
                 ([{"role": "system", "content": system_prompt}] if system_prompt else []) + initial_messages)
@@ -195,6 +212,8 @@ class SubAgentRunner:
         def record_agent_event(event_type: str, payload: dict) -> None:
             if agent_trace:
                 agent_trace.add(event_type, payload, actor=f"subagent:{preset_name}")
+        if knowledge_context:
+            record_agent_event("memory_recall", knowledge_context["recall"])
 
         async def capture_bad_case(failure_kind: str, error: str, *, messages=None,
                                    tool: str = "SubAgent", params: dict | None = None) -> None:
@@ -228,17 +247,24 @@ class SubAgentRunner:
                     store.append_document_event(request_id, target, thinking_kind,
                                                 str(history[thinking_kind]))
                 for kind in ("reviewer_thinking", "reviewer_output", "reviewer_delegation"):
-                    if kind != thinking_kind and history.get(kind):
+                    if kind != thinking_kind and history.get(kind) and not history.get("review_history_id"):
                         store.append_document_event(request_id, target, kind, str(history[kind]))
                 store.append_document_event(request_id, target, "tool_failure", error)
             else:
+                if history.get(thinking_kind):
+                    store.append_request_event(request_id, thinking_kind, str(history[thinking_kind]))
                 store.append_request_event(request_id, "tool_failure", f"{preset_name}: {error}")
             store.close_request(request_id, "failed", error,
                                 [source_trace_id, agent_trace.trace_id if agent_trace else ""])
 
         async def execute_tool(tool_name, params, tool_call_id):
-            if preset_name == "reviewer" and tool_name not in tool_names:
-                return False, "", f"审阅阶段禁止调用 {tool_name}；只能使用只读工具和 AskUserQuestion"
+            if (preset_name == "reviewer" or fork_context) and tool_name not in tool_names:
+                return False, "", f"当前 {preset_name} 阶段禁止调用 {tool_name}；只能使用本阶段提供的工具"
+            if fork_context and preset_name == "chapter_polisher" and tool_name in {"Write", "Edit"}:
+                project_dir = Path(self.working_dir) / parent_session.project_id
+                target = str(history.get("target_path") or "")
+                if not target or (project_dir / str(params.get("path") or "")).resolve() != (project_dir / target).resolve():
+                    return False, "", "润色阶段禁止修改指定正文以外的文件"
             if tool_name == "AskUserQuestion":
                 import asyncio
                 if history_store and history.get("requirement_history_id"):
@@ -298,6 +324,10 @@ class SubAgentRunner:
 
         result_text = ""
         empty_result = True
+        async def on_model_response(messages):
+            if knowledge_context:
+                self.knowledge.mark_used(parent_session.project_id, knowledge_context["attachments"], messages,
+                                         root_history_id or current_run_id, preset_name)
         try:
             async for ev in query(
                 self.llm, position="sub_agent", messages=initial_messages,
@@ -305,6 +335,10 @@ class SubAgentRunner:
                 max_turns=max_turns, tag=f":sub/{preset_name}",
                 execute_tool=execute_tool, sub_type=preset_name,
                 context_snapshot=context_snapshot,
+                on_model_response=on_model_response if self.knowledge else None,
+                bad_case_context={"source_trace_id": agent_trace.trace_id if agent_trace else source_trace_id,
+                                  "session_id": parent_session.session_id, "project_id": parent_session.project_id,
+                                  "history_id": history.get("history_request_id", "")},
             ):
                 if ev["type"] in {"thinking", "text_delta"}:
                     record_agent_event(ev["type"], {"content": ev["content"]})
@@ -357,7 +391,7 @@ class SubAgentRunner:
             record_agent_event("error", {"message": str(e)})
             if agent_trace:
                 await agent_trace.finish("failed", error=str(e))
-            await capture_bad_case("subagent_failure", str(e))
+            await capture_bad_case("subagent_failure", e)
             retain_failed_attempt(str(e))
             yield ResponseChunk(type="error", data={**src, "message": f"子Agent执行失败: {e}"})
             return
@@ -391,7 +425,7 @@ class SubAgentRunner:
                     ("reviewer_output", history.get("reviewer_output")),
                     ("reviewer_delegation", history.get("reviewer_delegation")),
                 ):
-                    if kind and value:
+                    if kind and value and not (kind.startswith("reviewer_") and kind != thinking_kind and history.get("review_history_id")):
                         store.append_document_event(history["history_request_id"], target, kind, str(value))
         elif preset_name == "chapter_polisher" and not empty_result and result_text.startswith("无需修改："):
             rationale = result_text.partition("：")[2].strip()
@@ -417,10 +451,15 @@ class SubAgentRunner:
                         ("reviewer_output", history.get("reviewer_output")),
                         ("reviewer_delegation", history.get("reviewer_delegation")),
                     ):
-                        if kind and value and kind not in recorded_kinds:
+                        if kind and value and kind not in recorded_kinds and not (kind.startswith("reviewer_") and kind != thinking_kind and history.get("review_history_id")):
                             store.append_document_event(request_id, target_path, kind, str(value))
                             recorded_kinds.add(kind)
         if history_store:
+            if history.get(thinking_kind):
+                history_store.append_request_event(history["history_request_id"], thinking_kind,
+                                                   str(history[thinking_kind]))
+            if result_text:
+                history_store.append_request_event(history["history_request_id"], f"{preset_name}_output", result_text)
             history_store.close_request(history["history_request_id"],
                                         "failed" if empty_result else "completed", result_text,
                                         [value for value in (source_trace_id, agent_trace.trace_id if agent_trace else "") if value])
@@ -433,4 +472,5 @@ class SubAgentRunner:
             "history_user_answers": history["user_answers"],
             "requirement_event_ids": history["requirement_event_ids"],
             "review_history_id": history.get("review_history_id", ""),
+            "history_request_id": history.get("history_request_id", ""),
         })

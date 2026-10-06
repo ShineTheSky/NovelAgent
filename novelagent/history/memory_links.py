@@ -103,7 +103,8 @@ def map_trace_sources(trace_db: Path, project: Path, source_ids: set[str]) -> di
                         if matched and event["event_id"] in event_orders:
                             matched = event_orders[event["event_id"]] == source_index * 1000
                     elif kind == "tool_result" and tool == "SubAgent" and result_runs.get(sid):
-                        matched = (unit["request_id"] == DocumentHistoryStore.run_request_id(request["request_id"], result_runs[sid])
+                        matched = ((json.loads(event.get("scope_json") or "{}").get("run_id") == result_runs[sid]
+                                    or unit["request_id"] == DocumentHistoryStore.run_request_id(request["request_id"], result_runs[sid]))
                                    and ek.endswith("_output") and content == payload.get("data"))
                     elif tool in {"Edit", "Write"} and ek == "file_change_attempt":
                         change = _json(content)

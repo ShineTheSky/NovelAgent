@@ -1,6 +1,7 @@
 """本地 LLM 设置 API。浏览器永远无法读取已保存的 API Key。"""
 
 import os
+import re
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -42,6 +43,10 @@ class ProviderUpdate(BaseModel):
     api_key: str | None = None
     models: list[str] | None = None
     storage: Literal["persistent", "temporary"] = "persistent"
+    wire_api: Literal["chat_completions", "responses"] | None = None
+    requires_api_key: bool | None = None
+    disable_response_storage: bool | None = None
+    headers: dict[str, str] | None = None
 
 
 class ProviderSettingsUpdate(BaseModel):
@@ -105,6 +110,15 @@ def _provider_model_names(provider: dict) -> list[str]:
     return [model.strip() for model in models if isinstance(model, str) and model.strip()]
 
 
+def _validate_headers(headers: dict[str, str]) -> dict[str, str]:
+    for name, value in headers.items():
+        if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name) or "\r" in value or "\n" in value:
+            raise HTTPException(status_code=400, detail="自定义请求头的名称或内容无效")
+        if name.lower() in {"authorization", "x-api-key", "x-goog-api-key", "cookie", "proxy-authorization"}:
+            raise HTTPException(status_code=400, detail="认证密钥请使用 API Key 输入框，不要放入自定义请求头")
+    return headers
+
+
 def _position_response(loader: LLMConfigLoader, label: str, position_key: str, sub_type: str | None) -> dict:
     resolved = loader.get_config(position_key, sub_type)
     return {
@@ -137,14 +151,20 @@ async def get_llm_settings(request: Request):
                 "key": key,
                 "name": value.get("name", key),
                 "base_url": llm_client.get_runtime_provider_base_url(key) or value.get("base_url", ""),
-                "is_configured": bool(os.environ.get(value.get("api_key_env", ""))),
+                "is_configured": bool(effective.get("api_key", os.environ.get(value.get("api_key_env", "")))),
                 "has_temporary_key": llm_client.has_runtime_provider_settings(key),
+                "wire_api": effective.get("wire_api", "chat_completions"),
+                "requires_api_key": effective.get("requires_api_key", True),
+                "disable_response_storage": effective.get("disable_response_storage", False),
+                "headers": {name: content for name, content in effective.get("headers", {}).items()
+                            if name.lower() not in {"authorization", "x-api-key", "x-goog-api-key", "cookie", "proxy-authorization"}},
                 "models": [
                     {"model": model, "label": model}
                     for model in (llm_client.get_runtime_provider_models(key) or _provider_model_names(value))
                 ],
             }
             for key, value in providers.items()
+            for effective in [llm_client.loader.get_provider_settings(key)]
         ],
     }
 
@@ -169,19 +189,25 @@ async def update_provider_settings(body: ProviderSettingsUpdate, request: Reques
         base_url = _validate_base_url(setting.base_url)
         models = _validate_model_names(setting.models) if setting.models is not None else _provider_model_names(providers[key])
         api_key = setting.api_key.strip() if setting.api_key is not None else ""
+        options = {name: getattr(setting, name) for name in
+                   ("wire_api", "requires_api_key", "disable_response_storage", "headers")
+                   if getattr(setting, name) is not None}
+        if "headers" in options:
+            _validate_headers(options["headers"])
+        requires_key = options.get("requires_api_key", providers[key].get("requires_api_key", True))
+        if setting.api_key is not None and (not api_key or len(api_key) > 512 or "\n" in api_key or "\r" in api_key):
+            raise HTTPException(status_code=400, detail=f"{providers[key].get('name', key)} 的 API Key 无效")
         if setting.storage == "temporary":
-            if not api_key or len(api_key) > 512 or "\n" in api_key or "\r" in api_key:
+            if requires_key and not api_key:
                 raise HTTPException(status_code=400, detail=f"{providers[key].get('name', key)} 的 API Key 无效")
-            llm_client.set_runtime_provider_settings(key, base_url, api_key, models)
+            llm_client.set_runtime_provider_settings(key, base_url, api_key, models, **options)
             temporary_providers.append(providers[key].get("name", key))
             continue
 
-        provider_overrides[key] = {"base_url": base_url, "models": models}
+        provider_overrides[key] = {**provider_overrides.get(key, {}), "base_url": base_url, "models": models, **options}
         has_persistent_update = True
         llm_client.clear_runtime_provider_settings(key)
         if setting.api_key is not None:
-            if not api_key or len(api_key) > 512 or "\n" in api_key or "\r" in api_key:
-                raise HTTPException(status_code=400, detail=f"{providers[key].get('name', key)} 的 API Key 无效")
             env_key = providers[key].get("api_key_env", "")
             if not env_key:
                 raise HTTPException(status_code=400, detail=f"{providers[key].get('name', key)} 未配置 API Key 环境变量")
@@ -191,7 +217,7 @@ async def update_provider_settings(body: ProviderSettingsUpdate, request: Reques
     if has_persistent_update or override_path.exists():
         _save_yaml(override_path, overrides)
     if temporary_providers:
-        return {"status": "ok", "message": f"{', '.join(temporary_providers)} 的 API Key 已临时保存，仅在本次服务运行期间有效。"}
+        return {"status": "ok", "message": f"{', '.join(temporary_providers)} 的 API 设置已临时保存，仅在本次服务运行期间有效。"}
     return {"status": "ok", "message": "公司 API 设置已保存到本机，将在下一次模型调用时生效。"}
 
 

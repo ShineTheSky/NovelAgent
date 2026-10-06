@@ -11,6 +11,7 @@ from pathlib import Path
 
 import yaml
 from novelagent.trace.agent_run import AgentRunTrace
+from novelagent.llm.json_output import json_object
 
 
 class BashCaseAnalyzer:
@@ -45,7 +46,7 @@ class BashCaseAnalyzer:
                 source_trace_id=agent_trace.trace_id if agent_trace else "",
                 session_id=session_id, project_id=project_id,
                 failure_kind="bash_case_analysis_failure", actor=actor,
-                error=str(error), messages=[{"role": "user", "content": prompt}],
+                error=error, messages=[{"role": "user", "content": prompt}],
             )
 
     @staticmethod
@@ -98,7 +99,9 @@ class BashCaseAnalyzer:
                 )
             async for chunk in self.llm.chat(
                 position="case_analysis", messages=[{"role": "user", "content": prompt}],
-                tools=None, stream=False, tag=":bash-case-annotation",
+                tools=None, stream=False, tag=":bash-case-annotation", json_mode=True, max_tokens=1024,
+                bad_case_context={"project_id": project_id, "session_id": session_id,
+                                  "source_trace_id": agent_trace.trace_id if agent_trace else str(payload.get("source_trace_id") or "")},
             ):
                 if chunk.type == "text_delta":
                     text += chunk.content
@@ -191,7 +194,9 @@ class BashCaseAnalyzer:
                 )
             async for chunk in self.llm.chat(
                 position="case_analysis", messages=[{"role": "user", "content": prompt}],
-                tools=None, stream=False, tag=":bash-case-analysis",
+                tools=None, stream=False, tag=":bash-case-analysis", json_mode=True, max_tokens=4096,
+                bad_case_context={"project_id": "__agent_bad_cases__", "session_id": "bash-case-analysis",
+                                  "source_trace_id": agent_trace.trace_id if agent_trace else ""},
             ):
                 if chunk.type == "text_delta":
                     text += chunk.content
@@ -216,10 +221,8 @@ class BashCaseAnalyzer:
 
     @staticmethod
     def _json(text: str) -> dict:
-        clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I)
         try:
-            value = json.loads(clean[clean.find("{"):clean.rfind("}") + 1])
-            return value if isinstance(value, dict) else {}
+            return json_object(text)
         except (ValueError, json.JSONDecodeError):
             return {}
 

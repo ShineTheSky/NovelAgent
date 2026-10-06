@@ -12,6 +12,7 @@ class _Runner:
 
     async def spawn_and_run(self, preset, *_args, **_kwargs):
         self.calls.append(preset)
+        _kwargs["context_snapshot"][:] = [{"role": "assistant", "content": self.results[preset]["result"]}]
         yield ResponseChunk(type="subagent_done", data=self.results[preset])
 
 

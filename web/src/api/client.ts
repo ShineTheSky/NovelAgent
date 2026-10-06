@@ -382,6 +382,10 @@ export function downgradeLifecycleRecord(projectId: string, layer: 'memory' | 'p
   return requestJson<LifecycleRecord>(`/projects/${resourceId(projectId)}/${layer}/${resourceId(recordId)}/downgrade`, { method: 'POST' });
 }
 
+export function fetchKnowledgeVersion(projectId: string, recordId: string, version: number) {
+  return requestJson<LifecycleRecord>(`/projects/${resourceId(projectId)}/knowledge/${resourceId(recordId)}?version=${version}`);
+}
+
 export function cancelLifecycleManualReview(projectId: string, layer: 'insight' | 'memory', recordId: string) {
   return requestJson<LifecycleRecord>(`/projects/${resourceId(projectId)}/${layer}/${resourceId(recordId)}/cancel-manual-review`, { method: 'POST' });
 }
@@ -440,7 +444,7 @@ export function fetchProjectHistory(projectId: string, kind: HistoryKind | '', o
 }
 
 export function fetchHistoryUnit(projectId: string, historyId: string) {
-  return requestJson<HistoryUnit>(`/projects/${resourceId(projectId)}/history/${resourceId(historyId)}`);
+  return requestJson<HistoryUnit>(`/projects/${resourceId(projectId)}/history/${resourceId(historyId)}?body_references=true`);
 }
 
 export type { Message };

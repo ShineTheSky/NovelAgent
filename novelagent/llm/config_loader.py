@@ -18,6 +18,9 @@ class LLMConfig:
     api_key: str = ""
     headers: dict = field(default_factory=dict)
     retry: dict = field(default_factory=dict)
+    wire_api: str = "chat_completions"
+    requires_api_key: bool = True
+    disable_response_storage: bool = False
 
     @property
     def is_anthropic(self) -> bool:
@@ -38,13 +41,18 @@ class LLMConfigLoader:
                         key, _, value = line.partition("=")
                         os.environ[key.strip()] = value.strip().strip("\"'")
 
-    def set_runtime_provider_settings(self, provider: str, base_url: str, api_key: str, models: list[str]) -> None:
+    def set_runtime_provider_settings(self, provider: str, base_url: str, api_key: str, models: list[str], **options) -> None:
         """设置仅存于当前进程内存的 provider 凭据、地址和模型列表。"""
         self._runtime_provider_settings[provider] = {
             "base_url": base_url,
             "api_key": api_key,
             "models": models,
+            **options,
         }
+
+    def get_provider_settings(self, provider: str) -> dict:
+        return {**self.load().get("providers", {}).get(provider, {}),
+                **self._runtime_provider_settings.get(provider, {})}
 
     def clear_runtime_provider_settings(self, provider: str) -> None:
         self._runtime_provider_settings.pop(provider, None)
@@ -91,9 +99,13 @@ class LLMConfigLoader:
                 if name in providers and isinstance(override, dict):
                     safe_override = {
                         field: override[field]
-                        for field in ("base_url", "models")
+                        for field, expected_type in {
+                            "base_url": str, "models": list, "headers": dict,
+                            "wire_api": str, "requires_api_key": bool,
+                            "disable_response_storage": bool,
+                        }.items()
                         if field in override
-                        and (isinstance(override[field], str) if field == "base_url" else isinstance(override[field], list))
+                        and isinstance(override[field], expected_type)
                     }
                     providers[name] = {**providers[name], **safe_override}
 
@@ -120,6 +132,7 @@ class LLMConfigLoader:
         base_url = runtime_settings.get("base_url", provider_info.get("base_url", ""))
         api_key_env = provider_info.get("api_key_env", "")
         api_key = runtime_settings.get("api_key", os.environ.get(api_key_env, ""))
+        provider_info = {**provider_info, **runtime_settings}
         headers = provider_info.get("headers", {})
 
         return LLMConfig(
@@ -133,4 +146,7 @@ class LLMConfigLoader:
             api_key=api_key,
             headers=headers,
             retry=pos.get("retry", {"max_retries": 3, "backoff": "exponential"}),
+            wire_api=provider_info.get("wire_api", "chat_completions"),
+            requires_api_key=provider_info.get("requires_api_key", True),
+            disable_response_storage=provider_info.get("disable_response_storage", False),
         )

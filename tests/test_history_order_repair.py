@@ -84,7 +84,8 @@ def test_offline_repair_orders_cross_trace_questions_and_splits_thinking_between
     unit = store.get_unit(root)
     assert [e["kind"] for e in unit["events"]] == [
         "user_input", "main_agent_thinking", "main_agent_output", "question_ask", "user_answer",
-        "main_agent_thinking", "main_delegation", "main_agent_thinking", "main_agent_output"]
+        "main_agent_thinking", "main_delegation", "main_delegation", "chapter_polisher_thinking",
+        "chapter_polisher_thinking", "chapter_polisher_output", "main_agent_thinking", "main_agent_output"]
     assert unit["events"][-1]["content"] == "最终回复"
     assert len([e for e in unit["archived_events"] if e["kind"] == "question_ask"]) == 1
     unit = store.get_unit(document)
@@ -146,8 +147,8 @@ def test_copied_delegation_is_archived_but_a_real_repeated_ask_remains(tmp_path)
     assert len(questions) == len(answers) == 2
     assert questions[0]["event_order"] < answers[0]["event_order"] < questions[1]["event_order"] < answers[1]["event_order"]
     unit = store.get_unit(document)
-    assert duplicate not in {e["event_id"] for e in unit["events"]}
-    assert duplicate in {e["event_id"] for e in unit["archived_events"]}
+    # The same run task appended twice is already one canonical process event.
+    assert sum(e["event_id"] == duplicate for e in unit["events"]) == 1
     assert repair_history_order(trace, project)["changed"] == 0
 
 

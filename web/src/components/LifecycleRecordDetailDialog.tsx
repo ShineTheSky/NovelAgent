@@ -5,9 +5,10 @@ interface LifecycleRecordDetailDialogProps {
   onClose: () => void;
   onOpenTrace: (traceId: string) => void;
   onOpenHistory: (historyId: string) => void;
+  onOpenKnowledge?: (id: string, version: number) => void;
 }
 
-export function LifecycleRecordDetailDialog({ record, onClose, onOpenTrace, onOpenHistory }: LifecycleRecordDetailDialogProps) {
+export function LifecycleRecordDetailDialog({ record, onClose, onOpenTrace, onOpenHistory, onOpenKnowledge }: LifecycleRecordDetailDialogProps) {
   const traceRefs = relatedTraceRefs(record);
   const metadata = Object.entries(record).filter(([key]) => !['content', 'claim', 'title'].includes(key));
   return <div className="absolute inset-0 z-30 flex flex-col bg-white" role="dialog" aria-modal="true" aria-labelledby="lifecycle-record-title">
@@ -21,6 +22,12 @@ export function LifecycleRecordDetailDialog({ record, onClose, onOpenTrace, onOp
     <main className="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-5">
       <section><h4 className="mb-2 text-sm font-semibold text-gray-700">标题</h4><p className="rounded-xl bg-gray-50 p-4 text-sm leading-6 text-gray-700">{record.title || record.claim}</p></section>
       <section><h4 className="mb-2 text-sm font-semibold text-gray-700">完整正文</h4><pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words rounded-xl bg-gray-50 p-4 font-sans text-sm leading-6 text-gray-700">{record.content || record.claim}</pre></section>
+      {record.schema === 'knowledge_v1' && <section className="space-y-2 text-xs">
+        <p>版本 v{record.version} · {record.status}</p>
+        {!!record.previous_version && <button type="button" onClick={() => onOpenKnowledge?.(record.id, record.previous_version!)} className="text-purple-600 hover:underline">查看上一版本 v{record.previous_version}</button>}
+        {!!record.replacements?.length && <div><p className="mb-2 text-amber-700">此版本已被以下知识替代，原始内容和来源仍保留：</p>{record.replacements.map(next => <button type="button" key={`${next.new_id}:${next.new_version}`} onClick={() => onOpenKnowledge?.(next.new_id, next.new_version)} className="mr-2 break-all text-purple-600 hover:underline">{next.new_id}@v{next.new_version}{next.reason ? ` · ${next.reason}` : ''}</button>)}</div>}
+        {!!record.memory_sources?.length && <div className="flex flex-wrap gap-2">{record.memory_sources.map(source => <button type="button" key={`${source.memory_id}:${source.version}:${source.role}`} onClick={() => onOpenKnowledge?.(source.memory_id, source.version)} className="break-all rounded-md bg-purple-50 px-2 py-1 font-mono text-purple-700">{source.role}: {source.memory_id}@v{source.version}</button>)}</div>}
+      </section>}
       {!!record.provenance_notes?.length && <section><h4 className="mb-2 text-sm font-semibold text-gray-700">来源核验说明</h4><div className="space-y-2 rounded-xl bg-amber-50 p-4 text-xs leading-5 text-amber-800">{record.provenance_notes.map(note => <p key={note}>{note}</p>)}</div></section>}
       <section>
         <h4 className="mb-2 text-sm font-semibold text-gray-700">来源 History（需求根或独立审阅节点）</h4>

@@ -6,9 +6,12 @@ import asyncio
 import json
 import re
 import uuid
+from copy import deepcopy
 from pathlib import Path
 
 from novelagent.history.store import DocumentHistoryStore
+from novelagent.llm.json_output import json_object
+from novelagent.llm.failures import llm_failure_context
 from novelagent.trace.file_lifecycle import FileLifecycleStore, PATTERN_PROMOTION_WEIGHT
 from novelagent.trace.semantic_extraction import (
     build_semantic_extraction_section,
@@ -33,31 +36,26 @@ class HistoryAnalyzer:
                 "reviewer" if any(kind.startswith("reviewer_") for kind in kinds) else
                 "agent" if any(kind.endswith("_thinking") or kind.endswith("_output") for kind in kinds) else "history")
 
-    def __init__(self, llm_client, workspace_dir: str, trace_store):
+    def __init__(self, llm_client, workspace_dir: str, trace_store, knowledge_pipeline=None):
         self.llm = llm_client
         self.workspace_dir = Path(workspace_dir)
         self.trace_store = trace_store
+        self.knowledge_pipeline = knowledge_pipeline
         self._locks: dict[str, asyncio.Lock] = {}
 
-    async def _chat_json(self, prompt: str, tag: str) -> dict:
+    async def _chat_json(self, prompt: str, tag: str, context: list[dict] | None = None) -> dict:
         chunks = []
         async for chunk in self.llm.chat(
             position="memory_summary_fallback",
-            messages=[{"role": "user", "content": prompt}], tools=None,
-            stream=False, tag=tag,
+            messages=[*deepcopy(context or []), {"role": "user", "content": prompt}], tools=None,
+            stream=False, tag=tag, json_mode=True,
         ):
             if chunk.type == "text_delta":
                 chunks.append(chunk.content)
             elif chunk.type == "error":
                 raise RuntimeError(chunk.error or "History analysis failed")
         raw = "".join(chunks).strip()
-        match = re.search(r"\{[\s\S]*\}", raw)
-        if not match:
-            raise ValueError("History analyzer did not return JSON")
-        result = json.loads(match.group())
-        if not isinstance(result, dict):
-            raise ValueError("History analyzer returned non-object JSON")
-        return result
+        return json_object(raw)
 
     async def _select_conversation_turns(self, unit: dict, store: DocumentHistoryStore) -> dict:
         turns = await self.trace_store.list_session_turns(unit["session_id"]) if self.trace_store else []
@@ -146,21 +144,60 @@ class HistoryAnalyzer:
             "assistant_response": unit["assistant_response"],
         }
 
-    async def analyze(self, project_id: str, history_id: str) -> None:
+    async def analyze(self, project_id: str, history_id: str, *, force: bool = False) -> None:
         store = DocumentHistoryStore(self.workspace_dir / project_id)
         lock = self._locks.setdefault(project_id, asyncio.Lock())
         async with lock:
+            history_id = store.canonical_root(history_id)
             unit = store.get_unit(history_id)
-            if not unit or unit["status"] != "completed" or unit["analysis_status"] == "complete":
+            partial = bool(unit and self.knowledge_pipeline and unit["status"] in {"failed", "interrupted"}
+                           and unit["kind"] in {"requirement", "conversation"})
+            if not unit or (unit["status"] != "completed" and not partial):
+                return
+            if not force and unit["analysis_status"] == "complete" and not (
+                self.knowledge_pipeline and self.knowledge_pipeline.store(project_id).has_input(history_id)
+            ):
+                return
+            workflow = unit.get("review_workflow") if unit["kind"] == "review" else {}
+            if workflow and workflow.get("status") != "completed":
                 return
             if unit["kind"] in {"document", "review"} and unit.get("requirement_history_id"):
                 requirement = store.get_unit(unit["requirement_history_id"])
-                if not requirement or requirement["status"] != "completed":
+                if not workflow and (not requirement or requirement["status"] != "completed"):
                     return
+            context_token = llm_failure_context.set({"project_id": project_id, "history_id": history_id,
+                "session_id": unit["session_id"], "source_trace_id": (unit.get("trace_ids") or [""])[0]})
             try:
+                if self.knowledge_pipeline and unit["kind"] in {"requirement", "conversation"}:
+                    if not unit["selected_turns"]:
+                        await self._select_conversation_turns(unit, store)
+                        unit = store.get_unit(history_id)
+                    unit = await self.knowledge_pipeline.resume_history(project_id, unit)
+                    history_id = unit["history_id"]
+                if self.knowledge_pipeline and unit["kind"] == "document" and unit.get("requirement_history_id"):
+                    requirement = store.get_unit(unit["requirement_history_id"])
+                    if requirement and requirement["kind"] == "requirement":
+                        store.set_analysis_status(history_id, "routed")
+                        return
+                if workflow:
+                    # Resolve provenance, not a second model-context reconstruction.
+                    for result_id in workflow["result_history_ids"]:
+                        result = store.get_unit(result_id)
+                        if not result or result["status"] != "completed" or result["review_history_id"] != history_id:
+                            raise ValueError("Completed polish History is unavailable")
+                        unit["events"].extend(e for e in result["events"]
+                                              if not e.get("inherited_requirement") and not e.get("inherited_review"))
+                        known = {r["revision_id"] for r in unit["revisions"] if r}
+                        unit["revisions"].extend(r for r in result["revisions"] if r and r["revision_id"] not in known)
                 if unit["kind"] in {"conversation", "requirement"} and not unit["selected_turns"]:
                     await self._select_conversation_turns(unit, store)
                     unit = store.get_unit(history_id)
+                if self.knowledge_pipeline:
+                    if await self.knowledge_pipeline.process(project_id, unit, retry_failed=force) is False:
+                        store.set_analysis_status(history_id, "deferred", "Memory direction requires clarification")
+                        return
+                    store.set_analysis_status(history_id, "complete")
+                    return
                 prepared = unit["prepared"]
                 if not prepared:
                     profiles = select_extraction_profiles(self._event_view(unit))
@@ -178,9 +215,21 @@ class HistoryAnalyzer:
                                  "history_revision_ids": item.get("history_revision_ids", [])}
                                 for layer in ("insight", "memory", "pattern")
                                 for item in files.list(layer)[:80]]
-                    evidence = self._evidence_view(unit)
+                    if workflow:
+                        evidence = {"history_id": history_id, "kind": "review", "path": unit["path"],
+                                    "result_history_ids": workflow["result_history_ids"],
+                                    "events": [{key: event.get(key, "") for key in
+                                                ("event_id", "kind", "revision_id", "evidence_history_id", "scope")}
+                                               for event in self._extraction_events(unit)]}
+                    else:
+                        evidence = self._evidence_view(unit)
                     response = await self._chat_json(
-                        "[History 记忆提取]\nHistory 是证据根源；Trace 仅用于诊断和上下文摘要。"
+                        ("【服务端阶段切换：审阅记忆提取】\n写作、审阅和润色已经结束。"
+                         "以上完整上下文是本次证据，只分析、不再审阅或修改文件，不得调用工具。"
+                         "下面 History 仅提供真实证据 ID 和归属索引，不重复拼装正文、思考或报告。"
+                         "区分审阅提出的问题与润色实际落实的结果；没有实际工具写入或明确无需修改的证据，"
+                         "不能把最终回复中的完成宣称当作已落实。\n" if workflow else "")
+                        + "[History 记忆提取]\nHistory 是证据根源；Trace 仅用于诊断和上下文摘要。"
                         "只保留未来值得复用的事实；无需记忆时 records=[]。不得把模型推测当用户意见，"
                         "不得把审阅建议当已确认的用户偏好。修订 ID 仅用于定位版本，不能作为记忆事实或引用证据。"
                         "针对文件的修改，比较本单元全部版本和评价，"
@@ -208,6 +257,7 @@ class HistoryAnalyzer:
                         f"\nHistory:{json.dumps(evidence, ensure_ascii=False)}"
                         f"\nExisting:{json.dumps(existing, ensure_ascii=False)}",
                         ":history/extract",
+                        **({"context": workflow["context"]} if workflow else {}),
                     )
                     requested_ids = [str(value) for value in response.get("needs_history_ids", [])]
                     allowed_ids = {str(value) for row in existing
@@ -230,6 +280,7 @@ class HistoryAnalyzer:
                             f"\nExisting:{json.dumps(existing, ensure_ascii=False)}"
                             f"\nOriginal History:{json.dumps(originals, ensure_ascii=False, default=str)}",
                             ":history/reconcile",
+                            **({"context": workflow["context"]} if workflow else {}),
                         )
                         for decision in decisions.get("decisions", []):
                             try:
@@ -246,6 +297,8 @@ class HistoryAnalyzer:
             except Exception as exc:
                 store.set_analysis_status(history_id, "failed", str(exc))
                 raise
+            finally:
+                llm_failure_context.reset(context_token)
 
     def _apply(self, project_id: str, unit: dict, prepared: dict) -> None:
         files = FileLifecycleStore(str(self.workspace_dir), project_id)
@@ -393,6 +446,11 @@ class HistoryAnalyzer:
             files.write(layer, record)
         files.rebuild_indexes()
 
+    def interrupt_collecting(self) -> int:
+        """Local crash recovery does not authorize any model request."""
+        return sum(DocumentHistoryStore(path.parent.parent).interrupt_collecting()
+                   for path in self.workspace_dir.glob("*/.history/history.sqlite3"))
+
     async def recover(self) -> int:
         count = 0
         if not self.workspace_dir.exists():
@@ -402,10 +460,21 @@ class HistoryAnalyzer:
                 continue
             store = DocumentHistoryStore(project_dir)
             store.interrupt_collecting()
-            for history_id in store.list_analyzable():
+            for history_id in store.list_analyzable(include_partial=bool(self.knowledge_pipeline)):
+                unit = store.get_unit(history_id)
+                if (self.knowledge_pipeline
+                    and not self.knowledge_pipeline.store(project_dir.name).has_input(history_id)):
+                    # Legacy History needs explicit opt-in, not paid bulk re-extraction on startup.
+                    continue
                 try:
                     await self.analyze(project_dir.name, history_id)
                 except Exception as exc:
                     print(f"[history] recovery failed: {history_id}: {exc}", flush=True)
                 count += 1
+        if self.knowledge_pipeline:
+            await self.knowledge_pipeline.recover()
+            from novelagent.memory.migration import KnowledgeMigration
+            for project in self.workspace_dir.iterdir():
+                if project.is_dir() and (project / '.knowledge/knowledge.sqlite3').exists():
+                    await KnowledgeMigration(self).recover(project.name)
         return count

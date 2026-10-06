@@ -1,7 +1,7 @@
 import { useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { getLLMSettings, saveLLMSettings, saveProviderSettings } from '../api/client';
-import type { LLMPositionSetting, LLMSettings } from '../types/llm';
+import type { LLMPositionSetting, LLMProviderOption, LLMSettings } from '../types/llm';
 
 type SettingsTab = 'providers' | 'agents';
 
@@ -10,6 +10,22 @@ interface ProviderDraft {
   apiKey: string;
   modelsText: string;
   storage: 'persistent' | 'temporary';
+  wireApi: 'chat_completions' | 'responses';
+  requiresApiKey: boolean;
+  disableResponseStorage: boolean;
+  headersText: string;
+}
+
+function providerDraft(provider: LLMProviderOption): ProviderDraft {
+  return {
+    baseUrl: provider.base_url, apiKey: '',
+    modelsText: provider.models.map(model => model.model).join('\n'),
+    storage: provider.has_temporary_key ? 'temporary' : 'persistent',
+    wireApi: provider.wire_api ?? 'chat_completions',
+    requiresApiKey: provider.requires_api_key ?? true,
+    disableResponseStorage: provider.disable_response_storage ?? false,
+    headersText: JSON.stringify(provider.headers ?? {}, null, 2),
+  };
 }
 
 function parseModelNames(value: string) {
@@ -39,12 +55,7 @@ export function LLMSettingsPanel() {
     try {
       const data = await getLLMSettings();
       setSettings(data);
-      setProviderDrafts(Object.fromEntries(data.providers.map(provider => [provider.key, {
-        baseUrl: provider.base_url,
-        apiKey: '',
-        modelsText: provider.models.map(model => model.model).join('\n'),
-        storage: provider.has_temporary_key ? 'temporary' : 'persistent',
-      }])));
+      setProviderDrafts(Object.fromEntries(data.providers.map(provider => [provider.key, providerDraft(provider)])));
     } catch (requestError) {
       setError(errorText(requestError));
     } finally {
@@ -95,8 +106,15 @@ export function LLMSettingsPanel() {
     setMessage(null);
     try {
       const apiKey = draft.apiKey.trim();
+      const headers: unknown = JSON.parse(draft.headersText || '{}');
+      if (!headers || typeof headers !== 'object' || Array.isArray(headers) || Object.values(headers).some(value => typeof value !== 'string')) {
+        throw new Error('自定义请求头必须是 JSON 对象，名称和内容都使用字符串');
+      }
       const result = await saveProviderSettings({
-        [key]: { base_url: draft.baseUrl, models: parseModelNames(draft.modelsText), storage: draft.storage, ...(apiKey ? { api_key: apiKey } : {}) },
+        [key]: { base_url: draft.baseUrl, models: parseModelNames(draft.modelsText), storage: draft.storage,
+          wire_api: draft.wireApi, requires_api_key: draft.requiresApiKey,
+          disable_response_storage: draft.disableResponseStorage, headers: headers as Record<string, string>,
+          ...(apiKey ? { api_key: apiKey } : {}) },
       });
       setMessage(result.message);
       await loadSettings();
@@ -160,13 +178,36 @@ export function LLMSettingsPanel() {
               <div className="space-y-3" role="tabpanel">
                 <p className="text-xs leading-relaxed text-gray-500">在这里一起配置 API 地址、密钥和该 API 可调用的模型。模型名会用于下一个“Agent 模型路由”页；页面不会回显已保存的密钥。</p>
                 {settings.providers.map(provider => {
-                  const draft = providerDrafts[provider.key] ?? { baseUrl: provider.base_url, apiKey: '', modelsText: provider.models.map(model => model.model).join('\n'), storage: provider.has_temporary_key ? 'temporary' : 'persistent' };
+                  const draft = providerDrafts[provider.key] ?? providerDraft(provider);
                   return (
                     <div key={provider.key} className="rounded-xl border border-gray-100 bg-gray-50 p-3">
                       <div className="mb-2 flex items-center justify-between gap-3">
                         <span className="text-sm font-medium text-gray-700">{provider.name}</span>
-                        <span className={`rounded-full px-2 py-0.5 text-[11px] ${provider.has_temporary_key || provider.is_configured ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>{provider.has_temporary_key ? '临时 Key 已配置' : provider.is_configured ? '本机 Key 已配置' : '尚未配置 Key'}</span>
+                        <span className={`rounded-full px-2 py-0.5 text-[11px] ${provider.has_temporary_key || provider.is_configured || !provider.requires_api_key ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>{provider.has_temporary_key ? '临时设置已配置' : provider.is_configured ? '本机 Key 已配置' : !provider.requires_api_key ? 'Key 可选（未验证连通）' : '尚未配置 Key'}</span>
                       </div>
+                      <details className="mt-3 text-xs text-gray-500" open={draft.wireApi === 'responses'}>
+                        <summary className="cursor-pointer">协议与高级设置</summary>
+                        <label className="mt-2 block">
+                          请求协议（Anthropic 仍按其原有协议发送）
+                          <select value={draft.wireApi} onChange={event => updateProviderDraft(provider.key, { wireApi: event.target.value as ProviderDraft['wireApi'] })} className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-sm">
+                            <option value="chat_completions">Chat Completions</option>
+                            <option value="responses">Responses</option>
+                          </select>
+                        </label>
+                        <label className="mt-2 flex items-center gap-2">
+                          <input type="checkbox" checked={draft.requiresApiKey} onChange={event => updateProviderDraft(provider.key, { requiresApiKey: event.target.checked })} />
+                          需要 API Key（关闭后可留空；已配置的 Key 仍会发送）
+                        </label>
+                        {draft.wireApi === 'responses' && <label className="mt-2 flex items-center gap-2">
+                          <input type="checkbox" checked={draft.disableResponseStorage} onChange={event => updateProviderDraft(provider.key, { disableResponseStorage: event.target.checked })} />
+                          禁用服务端响应存储（store: false）
+                        </label>}
+                        <label className="mt-2 block">
+                          自定义请求头（JSON，仅填写非密钥内容）
+                          <textarea rows={3} value={draft.headersText} onChange={event => updateProviderDraft(provider.key, { headersText: event.target.value })} className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-2 py-1.5 font-mono text-xs" />
+                        </label>
+                        {draft.wireApi === 'responses' && <p className="mt-2">Responses 使用独立的推理强度字段，不发送温度参数。</p>}
+                      </details>
                       <div className="grid gap-2 sm:grid-cols-[1fr_1fr_10rem_auto]">
                         <label className="text-xs text-gray-500">
                           API 地址
@@ -175,8 +216,8 @@ export function LLMSettingsPanel() {
                         <label className="text-xs text-gray-500">
                           API Key
                           <div className="relative mt-1">
-                            <input type="password" autoComplete="new-password" value={draft.apiKey} onChange={event => updateProviderDraft(provider.key, { apiKey: event.target.value })} placeholder={provider.has_temporary_key || provider.is_configured ? '' : '输入 API Key'} className="w-full rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-sm text-gray-700 outline-none focus:border-purple-400" />
-                            {!draft.apiKey && (provider.has_temporary_key || provider.is_configured) && <span aria-hidden="true" className="pointer-events-none absolute inset-y-0 left-2 flex items-center text-sm tracking-widest text-gray-400">••••••••</span>}
+                            <input type="password" autoComplete="new-password" value={draft.apiKey} onChange={event => updateProviderDraft(provider.key, { apiKey: event.target.value })} placeholder={provider.is_configured ? '' : draft.requiresApiKey ? '输入 API Key' : '可留空（网关仍可能要求 Key）'} className="w-full rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-sm text-gray-700 outline-none focus:border-purple-400" />
+                            {!draft.apiKey && provider.is_configured && <span aria-hidden="true" className="pointer-events-none absolute inset-y-0 left-2 flex items-center text-sm tracking-widest text-gray-400">••••••••</span>}
                           </div>
                         </label>
                         <label className="text-xs text-gray-500">

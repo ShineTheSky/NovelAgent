@@ -10,6 +10,10 @@ export interface LLMProviderOption {
   is_configured: boolean;
   has_temporary_key: boolean;
   models: LLMModelOption[];
+  wire_api: 'chat_completions' | 'responses';
+  requires_api_key: boolean;
+  disable_response_storage: boolean;
+  headers: Record<string, string>;
 }
 
 export interface LLMPositionSetting {
@@ -32,4 +36,8 @@ export interface ProviderSettingsUpdate {
   api_key?: string;
   models: string[];
   storage: 'persistent' | 'temporary';
+  wire_api: 'chat_completions' | 'responses';
+  requires_api_key: boolean;
+  disable_response_storage: boolean;
+  headers: Record<string, string>;
 }

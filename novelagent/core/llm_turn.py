@@ -25,6 +25,8 @@ async def query(
     stop_check=None,   # fn() -> bool
     sub_type=None,
     context_snapshot: list[dict] | None = None,
+    on_model_response=None,
+    bad_case_context=None,
 ):
     """
     执行一次完整的 ReAct query（async generator）。
@@ -50,11 +52,16 @@ async def query(
             break
 
         turn_result = _TurnResult()
+        response_recorded = False
         async for chunk in llm_client.chat(
             position=position, messages=full_messages,
             tools=tools if tools else None,
             stream=True, sub_type=sub_type, tag=tag,
+            bad_case_context=bad_case_context,
         ):
+            if on_model_response and not response_recorded and chunk.type != "error":
+                await on_model_response(full_messages)
+                response_recorded = True
             if chunk.type == "thinking":
                 turn_result.full_reasoning += chunk.content
                 yield {"type": "thinking", "content": chunk.content}
@@ -86,12 +93,13 @@ async def query(
             yield {"type": "result", "final_text": turn_result.full_response}
             return
 
-        full_messages.append(build_assistant_message(
+        assistant = build_assistant_message(
             turn_result.full_response, turn_result.full_reasoning,
-            turn_result.tool_calls, turn))
+            turn_result.tool_calls, turn)
+        full_messages.append(assistant)
 
-        for tc in turn_result.tool_calls:
-            tid = getattr(tc, 'tool_call_id', '') or tc.tool_name
+        for index, tc in enumerate(turn_result.tool_calls):
+            tid = assistant["tool_calls"][index]["id"]
             if tc.tool_name == "AskUserQuestion":
                 yield {"type": "question_ask", "questions": tc.tool_input.get("questions", [])}
             success, data, error = await execute_tool(tc.tool_name, tc.tool_input, tid)
@@ -105,10 +113,15 @@ async def query(
         yield {"type": "max_turns_exhausted", "turns": max_turns, "messages": list(full_messages)}
         full_messages.append({"role": "user", "content": FINALIZATION_PROMPT})
         final_result = _TurnResult()
+        response_recorded = False
         async for chunk in llm_client.chat(
             position=position, messages=full_messages, tools=None,
             stream=True, sub_type=sub_type, tag=f"{tag}:finalize",
+            bad_case_context=bad_case_context,
         ):
+            if on_model_response and not response_recorded and chunk.type != "error":
+                await on_model_response(full_messages)
+                response_recorded = True
             if chunk.type == "thinking":
                 final_result.full_reasoning += chunk.content
                 yield {"type": "thinking", "content": chunk.content}

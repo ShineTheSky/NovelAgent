@@ -19,6 +19,9 @@ def root_history_ids(project: Path, history_ids: list[str]) -> list[str]:
             FROM history_units h LEFT JOIN history_units r
                 ON r.history_id = h.requirement_history_id
             WHERE h.history_id IN ({','.join('?' for _ in ids)})""", ids))
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_root_attempts'").fetchone():
+            aliases = dict(db.execute("SELECT attempt_id,root_id FROM history_root_attempts"))
+            roots = {hid: aliases.get(root, root) for hid, root in roots.items()}
     # Reviews are independent sources even when owned by a requirement root.
     # Do not guess a parent for missing/legacy units or unrelated conversations.
     return list(dict.fromkeys(roots.get(hid, hid) for hid in ids))

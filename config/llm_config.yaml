@@ -14,6 +14,19 @@ providers:
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
 
+  local_openai:
+    name: 本地 OpenAI (Responses)
+    base_url: http://localhost:6780/v1
+    api_key_env: LOCAL_OPENAI_API_KEY
+    wire_api: responses
+    requires_api_key: false
+    disable_response_storage: true
+    headers:
+      x-openai-actor-authorization: local-image-extension
+    models:
+      - gpt-5.6
+      - gpt-5.6-luna
+
   deepseek:
     name: DeepSeek
     base_url: https://api.deepseek.com

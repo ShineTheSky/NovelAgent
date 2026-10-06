@@ -92,11 +92,12 @@ async def load_session(session_id: str) -> Session | None:
 async def save_messages(session_id: str, messages: list[dict], token_count: int = 0, llm_client=None):
     messages_json = json.dumps(messages, ensure_ascii=True)
     conn = await get_connection()
-    cursor = await conn.execute("SELECT title FROM sessions WHERE session_id = ?", (session_id,))
+    cursor = await conn.execute("SELECT title, project_id FROM sessions WHERE session_id = ?", (session_id,))
     row = await cursor.fetchone()
     title = row[0] if row else ''
     if not title:
-        title = await _generate_title(llm_client, messages)
+        title = await _generate_title(llm_client, messages, bad_case_context={
+            "session_id": session_id, "project_id": row[1] if row else ""})
     await conn.execute(
         "UPDATE sessions SET messages_json = ?, token_count = ?, title = ?, updated_at = datetime('now') WHERE session_id = ?",
         (messages_json, token_count, title or '', session_id)
@@ -142,7 +143,7 @@ async def load_display_events(session_id: str) -> list[dict]:
     return events
 
 
-async def _generate_title(llm_client, messages: list[dict]) -> str:
+async def _generate_title(llm_client, messages: list[dict], *, bad_case_context=None) -> str:
     """用轻量LLM根据用户消息生成10字以内的会话标题"""
     if llm_client is None:
         # 回退：取第一条用户消息前30字
@@ -159,6 +160,7 @@ async def _generate_title(llm_client, messages: list[dict]) -> str:
         response_text = ''
         async for chunk in llm_client.chat(
             position='session_title',
+            bad_case_context=bad_case_context,
             messages=[{'role': 'user', 'content': prompt}],
             stream=False,
         ):

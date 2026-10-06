@@ -13,7 +13,9 @@ from novelagent.history.sources import root_history_ids
 from novelagent.llm.client import LLMResponse
 from novelagent.tools.registry import ToolRegistry
 from novelagent.tools.write import WriteTool
+from novelagent.tools.read import ReadTool
 from novelagent.trace.file_lifecycle import FileLifecycleStore
+from novelagent.trace.agent_run import AgentTraceTaskManager
 
 
 PATH = "chapters/content_1.1.1.md"
@@ -65,7 +67,8 @@ async def test_writer_fork_review_polish_preserves_prefix_and_independent_histor
             tool_input={"path": PATH, "content": "他握着杯子。", "expected_revision_id": "new"}), LLMResponse(type="done")],
         [LLMResponse(type="text_delta", content="已完成写作"), LLMResponse(type="done")],
         [LLMResponse(type="thinking", content="需求已落实，但规则口径仍冲突。"), LLMResponse(type="text_delta", content=REPORT), LLMResponse(type="done")],
-        [LLMResponse(type="text_delta", content="无需修改：待确认规则，不贸然改正文。"), LLMResponse(type="done")],
+        [LLMResponse(type="thinking", content="继承审阅的规则疑点，尚未确认不能擅改。"),
+         LLMResponse(type="text_delta", content="无需修改：待确认规则，不贸然改正文。"), LLMResponse(type="done")],
     ])
     runner = SubAgentRunner(model, registry, None, None, working_dir=str(tmp_path))
     presets = {
@@ -103,7 +106,14 @@ async def test_writer_fork_review_polish_preserves_prefix_and_independent_histor
     assert not review["final_revision_id"]
     assert review["context"][:-1] == prefix
     assert {e["scope"].get("review_section") for e in review["events"]} >= {"requirement", "general"}
-    assert review_id not in store.list_analyzable()  # parent is still collecting
+    polish_call = model.calls[3]
+    assert polish_call["messages"][:-1] == [*review_call["messages"], {
+        "role": "assistant", "content": REPORT, "reasoning_content": "需求已落实，但规则口径仍冲突。"}]
+    assert "【服务端阶段切换：润色】" in polish_call["messages"][-1]["content"]
+    assert REPORT not in polish_call["messages"][-1]["content"]
+    assert review["review_workflow"]["context"][:-1] == polish_call["messages"]
+    assert review["review_workflow"]["context"][-1]["reasoning_content"] == "继承审阅的规则疑点，尚未确认不能擅改。"
+    assert review_id in store.list_analyzable()  # completed polish, even while parent is collecting
     closed = store.close_request("root", "completed", "完成", session_turn_no=1)
     assert review_id in closed and review_id in store.list_analyzable()
     assert store.get_unit(root)["reviews"][0]["history_id"] == review_id
@@ -123,6 +133,182 @@ async def test_writer_fork_review_polish_preserves_prefix_and_independent_histor
         "layer": "insight", "claim": "重复的审阅意见", "source_event_ids": [inherited_report["event_id"], delegation["event_id"]],
     }]})
     assert not FileLifecycleStore(str(tmp_path), "project").list("insight")
+
+    # Extraction continues the frozen messages, even after reopening the store.
+    class MemoryModel:
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, **kwargs):
+            self.calls.append(deepcopy(kwargs))
+            current = store.get_unit(review_id)
+            source = next(e for e in current["events"] if e["kind"] == "reviewer_general_report")
+            yield LLMResponse(type="text_delta", content=json.dumps({"records": [{
+                "layer": "memory", "signal": "strong", "claim": "机制口径疑点需要确认，不能贸然改正文",
+                "category": "project", "kind": "review_issue", "source_event_ids": [source["event_id"]],
+            }]}, ensure_ascii=False))
+
+    memory_model = MemoryModel()
+    analyzer = HistoryAnalyzer(memory_model, str(tmp_path), None)
+    await analyzer.analyze("project", review_id)
+    assert memory_model.calls[0]["messages"][:-1] == review["review_workflow"]["context"]
+    assert "【服务端阶段切换：审阅记忆提取】" in memory_model.calls[0]["messages"][-1]["content"]
+    assert "actual_model_context" not in memory_model.calls[0]["messages"][-1]["content"]
+    assert REPORT not in memory_model.calls[0]["messages"][-1]["content"]
+    assert memory_model.calls[0]["tools"] is None
+    records = FileLifecycleStore(str(tmp_path), "project").list("memory")
+    assert len(records) == 1 and records[0]["history_ids"] == [review_id]
+    await analyzer.analyze("project", review_id)
+    assert len(memory_model.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["write", "no_change", "failed", "unverified", "recover"])
+async def test_review_memory_runs_after_durable_polish_without_waiting_for_main_request(tmp_path, outcome):
+    store = DocumentHistoryStore(tmp_path / "project")
+    root = store.start_request("root", "session", "克制语气")
+    target = tmp_path / "project" / PATH
+    target.parent.mkdir(parents=True)
+    target.write_text("他握着杯子。", encoding="utf-8")
+    before = store.ensure_baseline(target)
+    registry = ToolRegistry()
+    registry.register(WriteTool())
+    registry.register(ReadTool())
+    polish = {
+        "write": [LLMResponse(type="thinking", content="据审阅统一退出口径"),
+                  LLMResponse(type="tool_use", tool_name="Write", tool_call_id="polish", tool_input={
+                      "path": PATH, "content": "他完成任务，握杯退出。", "expected_revision_id": before}),
+                  LLMResponse(type="done")],
+        "no_change": [LLMResponse(type="thinking", content="口径仍需确认"),
+                      LLMResponse(type="text_delta", content="无需修改：不能擅自确定退出条件。"), LLMResponse(type="done")],
+        "failed": [LLMResponse(type="error", error="服务中断")],
+        "unverified": [LLMResponse(type="text_delta", content="已修改"), LLMResponse(type="done")],
+        "recover": [LLMResponse(type="text_delta", content="无需修改：先确认口径。"), LLMResponse(type="done")],
+    }[outcome]
+    turns = [[LLMResponse(type="thinking", content="对照广播发现矛盾"),
+              LLMResponse(type="text_delta", content=REPORT), LLMResponse(type="done")], polish]
+    if outcome == "write":
+        turns.insert(0, [LLMResponse(type="thinking", content="读取正文核验广播口径"),
+                         LLMResponse(type="tool_use", tool_name="Read", tool_call_id="review_read", tool_input={"path": PATH}),
+                         LLMResponse(type="done")])
+        turns.append([LLMResponse(type="text_delta", content="已统一退出条件。"), LLMResponse(type="done")])
+    model = Model(turns)
+    runner = SubAgentRunner(model, registry, None, None, working_dir=str(tmp_path))
+    runner.presets_tool.get_preset = lambda name: {
+        "system_prompt": name, "tools": ["Write"] if name == "chapter_polisher" else ["Read"],
+        "inherit_history": False, "max_turns": 3,
+    }
+
+    class MemoryModel:
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, **kwargs):
+            self.calls.append(deepcopy(kwargs))
+            assert store.get_unit(root)["status"] in {"collecting", "interrupted"}
+            review = store.list_units(kind="review")["items"][0]
+            review = store.get_unit(review["history_id"])
+            result_id = review["review_workflow"]["result_history_ids"][0]
+            result = store.get_unit(result_id)
+            assert result["status"] == "completed"
+            assert kwargs["messages"][:-1] == review["review_workflow"]["context"]
+            report = next(e for e in review["events"] if e["kind"] == "reviewer_general_report")
+            execution = next(e for e in result["events"] if e["kind"] in {"chapter_polisher_output", "evaluation_no_change"})
+            yield LLMResponse(type="text_delta", content=json.dumps({"records": [{
+                "layer": "memory", "signal": "strong", "claim": "统一退出机制口径，歧义时先确认",
+                "kind": "review_issue", "source_event_ids": [report["event_id"], execution["event_id"]],
+            }]}, ensure_ascii=False))
+
+    memory_model = MemoryModel()
+    analyzer = HistoryAnalyzer(memory_model, str(tmp_path), None)
+    tasks = AgentTraceTaskManager()
+    workflow = ReviewPolishWorkflow(runner, str(tmp_path), None if outcome == "recover" else analyzer, tasks)
+    prefix = [{"role": "system", "content": "写作角色"},
+              {"role": "assistant", "content": "他握着杯子。", "reasoning_content": "用动作表达克制"}]
+    frozen = deepcopy(prefix)
+    chunks = [c async for c in workflow.run(Session("session", "project"), PATH, "克制语气", "operation",
+        fork_context=prefix, history_evidence={"history_request_id": "root", "requirement_history_id": root,
+            "requirement_event_ids": [f"{root}:input"], "user_input": "克制语气"})]
+    await tasks.drain()
+    assert prefix == frozen
+    review_id = next(c.data["review_history_id"] for c in chunks
+                     if c.type == "subagent_done" and c.data["workflow"] == "auto_review")
+    review = store.get_unit(review_id)
+    if outcome == "recover":
+        assert not memory_model.calls
+        analyzer = HistoryAnalyzer(memory_model, str(tmp_path), None)
+        assert await analyzer.recover() == 1
+        review = store.get_unit(review_id)
+    if outcome in {"failed", "unverified"}:
+        assert not memory_model.calls
+        assert review["analysis_status"] == "deferred"
+        store.close_request("root", "completed", "需继续")
+        await analyzer.analyze("project", review_id)
+        assert not memory_model.calls  # root closure cannot bypass failed polish
+        assert review_id not in store.list_analyzable()
+        return
+    assert len(memory_model.calls) == 1
+    assert review["analysis_status"] == "complete"
+    assert review["review_workflow"]["status"] == "completed"
+    assert any(m.get("reasoning_content") == "对照广播发现矛盾" for m in memory_model.calls[0]["messages"])
+    if outcome == "write":
+        assert any(m.get("tool_call_id") == "review_read" and "他握着杯子。" in m["content"]
+                   for m in memory_model.calls[0]["messages"])
+    records = FileLifecycleStore(str(tmp_path), "project").list("memory")
+    assert len(records) == 1 and records[0]["history_ids"] == [review_id]
+    # Polish output is shared run evidence owned by the review. A no-change
+    # evaluation remains local to the file/version it evaluated.
+    owners = {review_id} if outcome == "write" else {review_id, review["result_histories"][0]["history_id"]}
+    assert {e["history_id"] for e in records[0]["semantic_evidence"]} == owners
+    assert len(store.list_versions(PATH)) == (2 if outcome == "write" else 1)
+    store.close_request("root", "completed", "完成")
+    await analyzer.analyze("project", review_id)
+    assert len(memory_model.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_polisher_cannot_reuse_writer_tools_or_modify_other_files(tmp_path):
+    registry = ToolRegistry()
+    registry.register(WriteTool())
+    model = Model([
+        [LLMResponse(type="tool_use", tool_name="Bash", tool_call_id="bash", tool_input={"command": "echo writer"}),
+         LLMResponse(type="tool_use", tool_name="Write", tool_call_id="outline", tool_input={
+             "path": "outlines/outline_1.0.0.md", "content": "不应写入", "expected_revision_id": "new"}), LLMResponse(type="done")],
+        [LLMResponse(type="text_delta", content="无需修改：已停止越界操作。"), LLMResponse(type="done")],
+    ])
+    runner = SubAgentRunner(model, registry, None, None, working_dir=str(tmp_path))
+    runner.presets_tool.get_preset = lambda _: {"system_prompt": "润色", "tools": ["Write"], "max_turns": 3}
+    chunks = [c async for c in runner.spawn_and_run("chapter_polisher", "润色", Session("session", "project"),
+        fork_context=[{"role": "system", "content": "写作可调用 Bash"}, {"role": "assistant", "content": REPORT}],
+        history_evidence={"target_path": PATH})]
+    results = [c for c in chunks if c.type == "tool_result"]
+    assert len(results) == 2 and all(not c.data["success"] and "禁止" in c.data["error"] for c in results)
+    assert not (tmp_path / "project" / "outlines/outline_1.0.0.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_review_extraction_failure_records_bad_case_without_reopening_workflow(tmp_path):
+    from types import SimpleNamespace
+
+    class Analyzer:
+        async def analyze(self, *_args):
+            raise RuntimeError("提取失败")
+
+    class Recorder:
+        def __init__(self):
+            self.calls = []
+
+        async def capture(self, **kwargs):
+            self.calls.append(kwargs)
+
+    recorder = Recorder()
+    tasks = AgentTraceTaskManager()
+    workflow = ReviewPolishWorkflow(SimpleNamespace(bad_cases=recorder), str(tmp_path), Analyzer(), tasks)
+    tasks.submit(workflow._analyze_review(Session("session", "project"), "review_id", "trace_id"))
+    await tasks.drain()
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0]["failure_kind"] == "history_analysis_failure"
+    assert recorder.calls[0]["params"]["history_id"] == "review_id"
 
 
 @pytest.mark.asyncio

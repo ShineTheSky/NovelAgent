@@ -1,6 +1,14 @@
 import pytest
+import pytest_asyncio
+from novelagent.storage import database
 from novelagent.storage.database import init, get_connection, get_db_path
 from novelagent.storage import models
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def isolated_database(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "novelagent.db"))
+    await init()
 
 
 @pytest.mark.asyncio

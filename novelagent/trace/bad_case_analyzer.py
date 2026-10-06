@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import hashlib
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 from novelagent.trace.agent_run import AgentRunTrace
+from novelagent.context.token_counter import TokenCounter
+from novelagent.llm.json_output import json_object
 
 
 class BadCaseAnalyzer:
@@ -26,6 +29,8 @@ class BadCaseAnalyzer:
         self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self.trace_store = trace_store
         self.bad_case_recorder = None
+        self.input_tokens = int(settings.get("analysis_input_tokens", 12000))
+        self._analyzed_batches = set()
 
     @staticmethod
     def classify(metadata: dict) -> str:
@@ -67,13 +72,17 @@ class BadCaseAnalyzer:
             try:
                 _, header, body = path.read_text(encoding="utf-8").split("---", 2)
                 item = yaml.safe_load(header) or {}
-                if item.get("classification") == category:
+                if item.get("classification") == category and not str(item.get("failure_kind", "")).endswith("analysis_failure"):
                     cases.append({**item, "body": body.strip()})
             except (OSError, ValueError, yaml.YAMLError):
                 continue
         return sorted(cases, key=lambda item: str(item.get("created", "")))
 
     async def _analyze(self, category: str, cases: list[dict]) -> None:
+        batch = (category, tuple(case.get("id", "") for case in cases))
+        if batch in self._analyzed_batches:
+            return
+        self._analyzed_batches.add(batch)
         evidence = [
             {
                 "case_id": case.get("id", ""),
@@ -90,6 +99,9 @@ class BadCaseAnalyzer:
                 source_trace_id = str(case.get("source_trace_id", ""))
                 item["source_trace_id"] = source_trace_id
                 item["trace_events"] = await self._load_trace_context(source_trace_id)
+        while len(evidence) > 1 and TokenCounter().count(json.dumps(evidence, ensure_ascii=False)) > self.input_tokens - 1000:
+            evidence.pop(0)
+        cases = cases[-len(evidence):]
         prompt = f'''你是 Agent 运行质量分析器。只分析以下同类 Bad Case，不要调用工具、不要修改任何 Prompt、配置或代码。
 类别：{category}
 样本：{json.dumps(evidence, ensure_ascii=False)}
@@ -98,6 +110,8 @@ class BadCaseAnalyzer:
         text = ""
         agent_trace = None
         try:
+            if TokenCounter().count(prompt) > self.input_tokens:
+                raise ValueError("Bad Case input exceeds analysis budget; evidence remains in Trace")
             if self.trace_store:
                 agent_trace = await AgentRunTrace.try_start(
                     self.trace_store, session_id="bad-case-analysis", project_id="__agent_bad_cases__",
@@ -110,7 +124,9 @@ class BadCaseAnalyzer:
                 )
             async for chunk in self.llm.chat(
                 position="case_analysis", messages=[{"role": "user", "content": prompt}],
-                tools=None, stream=False, tag=":bad-case-analysis",
+                tools=None, stream=False, tag=":bad-case-analysis", json_mode=True, max_tokens=4096,
+                bad_case_context={"project_id": "__agent_bad_cases__", "session_id": "bad-case-analysis",
+                                  "source_trace_id": agent_trace.trace_id if agent_trace else ""},
             ):
                 if chunk.type == "text_delta":
                     text += chunk.content
@@ -122,6 +138,8 @@ class BadCaseAnalyzer:
                     if agent_trace:
                         agent_trace.add("error", {"message": chunk.error})
                     raise RuntimeError(chunk.error or "Bad Case 分析调用失败")
+                elif chunk.type == "done" and agent_trace:
+                    agent_trace.add("llm_usage", getattr(chunk, "usage", {}) or {})
             data = self._json(text)
             if not data:
                 raise ValueError("Bad Case 分析未返回有效 JSON")
@@ -137,7 +155,7 @@ class BadCaseAnalyzer:
                     source_trace_id=agent_trace.trace_id if agent_trace else "",
                     session_id="bad-case-analysis", project_id="__agent_bad_cases__",
                     failure_kind="bad_case_analysis_failure", actor="bad_case_analyzer",
-                    error=str(exc), messages=[{"role": "user", "content": prompt}],
+                    error=exc, messages=[{"role": "user", "content": prompt}],
                     schedule_analysis=False,
                 )
 
@@ -146,7 +164,16 @@ class BadCaseAnalyzer:
             return []
         events = await self.trace_store.list_events(trace_id, limit=1_000)
         result = []
+        total = 0
+        requests = [event for event in events if event.get("event_type") == "agent_request_message"]
+        if requests:
+            contents = [str((e.get("payload") or {}).get("content", "")) for e in requests]
+            result.append({"type": "request_summary", "source_trace_id": trace_id,
+                           "chunks": len(requests), "characters": sum(map(len, contents)),
+                           "sha256": hashlib.sha256("".join(contents).encode()).hexdigest()})
         for event in events:
+            if event.get("event_type") in {"agent_request_message", "agent_tool_schema"}:
+                continue  # The original prompt is already saved, not nested in a new diagnosis.
             payload = event.get("payload") or {}
             item = {
                 "sequence": event.get("sequence_no", 0),
@@ -156,8 +183,15 @@ class BadCaseAnalyzer:
             for key in ("content", "message", "tool", "params", "data", "error", "success", "position", "tag"):
                 if key in payload:
                     value = payload[key]
-                    item[key] = str(value)[:2_000] if isinstance(value, str) else value
+                    item[key] = (value[:1000] if isinstance(value, str) else
+                                 json.dumps(value, ensure_ascii=False)[:1000] if isinstance(value, (list, dict)) else value)
+            size = len(json.dumps(item, ensure_ascii=False))
+            if total + size > 6000:
+                result.append({"type": "context_budget", "source_trace_id": trace_id,
+                               "note": "More evidence is retained in the source Trace"})
+                break
             result.append(item)
+            total += size
         return result
 
     @staticmethod
@@ -167,10 +201,8 @@ class BadCaseAnalyzer:
 
     @staticmethod
     def _json(text: str) -> dict:
-        clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I)
         try:
-            value = json.loads(clean[clean.find("{"):clean.rfind("}") + 1])
-            return value if isinstance(value, dict) else {}
+            return json_object(text)
         except (ValueError, json.JSONDecodeError):
             return {}
 

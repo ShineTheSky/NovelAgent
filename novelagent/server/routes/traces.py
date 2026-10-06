@@ -4,10 +4,14 @@ import asyncio
 import json
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, ConfigDict, Field
 
 from novelagent.trace.file_lifecycle import FileLifecycleStore
 from novelagent.trace.store import TraceStore
 from novelagent.history import DocumentHistoryStore
+from novelagent.memory.knowledge_store import KnowledgeStore
+from novelagent.memory.migration import KnowledgeMigration, preview as migration_preview
+from novelagent.memory.history_input import HistoryBodyReferences
 
 
 router = APIRouter(prefix="/api")
@@ -50,10 +54,16 @@ async def list_project_history(project_id: str, request: Request, kind: str = ""
 
 
 @router.get("/projects/{project_id}/history/{history_id}")
-async def get_project_history(project_id: str, history_id: str, request: Request):
-    unit = _history(request, project_id).get_unit(history_id)
+async def get_project_history(project_id: str, history_id: str, request: Request, body_references: bool = False):
+    history = _history(request, project_id)
+    unit = history.get_unit(history_id)
     if unit is None or unit["kind"] not in {"document", "conversation", "requirement", "review"}:
         raise HTTPException(status_code=404, detail="History 不存在")
+    if body_references:
+        bodies = HistoryBodyReferences(history)
+        for key in ("events", "archived_events", "previous_attempt_events"):
+            unit[key] = bodies.display_events(unit.get(key, []))
+        unit["body_versions"] = list(bodies.catalog.values())
     return unit
 
 
@@ -66,8 +76,8 @@ async def analyze_pending_history(project_id: str, request: Request):
     if not project_dir.is_relative_to(workspace):
         raise HTTPException(status_code=403, detail="项目路径越界")
     history = DocumentHistoryStore(project_dir)
-    pending = history.list_analyzable()
     analyzer = request.app.state.agent_loop.history_analyzer
+    pending = history.list_analyzable(include_partial=bool(getattr(analyzer, "knowledge_pipeline", None)))
     for history_id in pending:
         asyncio.create_task(analyzer.analyze(project_id, history_id))
     return {"scheduled": len(pending)}
@@ -75,23 +85,97 @@ async def analyze_pending_history(project_id: str, request: Request):
 
 @router.get("/projects/{project_id}/insights")
 async def list_insights(project_id: str, request: Request):
-    return _files(request, project_id).list("insight")
+    return _knowledge_records(request, project_id, "insight")
 
 
 @router.get("/projects/{project_id}/memories")
 async def list_file_memories(project_id: str, request: Request):
-    return _files(request, project_id).list("memory")
+    return _knowledge_records(request, project_id, "memory")
 
 
 @router.get("/projects/{project_id}/patterns")
 async def list_patterns(project_id: str, request: Request):
-    return _files(request, project_id).list("pattern")
+    return _knowledge_records(request, project_id, "pattern")
+
+
+def _knowledge_records(request, project_id, layer):
+    history = _history(request, project_id)
+    store = KnowledgeStore(history.project_dir)
+    fresh = [store.view(r) for r in store.list((layer,), include_inactive=True)]
+    legacy = [{**r, "schema": "legacy"} for r in _files(request, project_id).list(layer)]
+    return fresh + legacy
+
+
+@router.get("/projects/{project_id}/knowledge/{record_id}")
+async def get_knowledge_record(project_id: str, record_id: str, request: Request,
+                               version: int | None = Query(None, ge=1)):
+    store = KnowledgeStore(_history(request, project_id).project_dir)
+    record = store.get(record_id, version)
+    if not record:
+        raise HTTPException(status_code=404, detail="知识记录或版本不存在")
+    return store.view(record)
+
+
+@router.get("/projects/{project_id}/knowledge/{record_id}/facts/{fact_id}")
+async def get_fact_history(project_id: str, record_id: str, fact_id: str, request: Request):
+    store = KnowledgeStore(_history(request, project_id).project_dir)
+    record = store.get(record_id)
+    if not record or record["layer"] != "memory":
+        raise HTTPException(status_code=404, detail="事实包不存在")
+    history = store.fact_history(record_id, fact_id)
+    if not history["versions"] and not history["changes"]:
+        raise HTTPException(status_code=404, detail="事实历史不存在")
+    return history
+
+
+class MigrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    history_ids: list[str] = Field(min_length=1, max_length=5)
+    confirm_model_calls: bool = False
+
+
+@router.get("/projects/{project_id}/knowledge-migration")
+async def preview_knowledge_migration(project_id: str, request: Request):
+    return migration_preview(_history(request, project_id).project_dir)
+
+
+@router.post("/projects/{project_id}/knowledge-migration")
+async def run_knowledge_migration(project_id: str, body: MigrationRequest, request: Request):
+    _history(request, project_id)
+    analyzer = request.app.state.agent_loop.history_analyzer
+    if not getattr(analyzer, "knowledge_pipeline", None):
+        raise HTTPException(status_code=409, detail="新知识流程尚未启用")
+    if not body.confirm_model_calls:
+        raise HTTPException(status_code=422, detail="迁移会调用模型；请先预览来源并明确确认模型调用")
+    migration = KnowledgeMigration(analyzer)
+    try:
+        ids = migration.validate(project_id, body.history_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # Persist authorization before scheduling, so a restart cannot lose accepted work.
+    for hid in ids:
+        migration.pipeline.store(project_id).migration_progress(hid, {"status": "running"})
+    request.app.state.agent_trace_tasks.submit(migration.run(project_id, ids), label="knowledge-migration")
+    return {"scheduled": ids, "progress_url": f"/api/projects/{project_id}/knowledge-migration"}
+
+
+@router.post("/projects/{project_id}/knowledge/retry-pending")
+async def retry_knowledge(project_id: str, request: Request):
+    _history(request, project_id)
+    runtime = getattr(request.app.state, "knowledge_runtime", None)
+    if not runtime:
+        raise HTTPException(status_code=409, detail="新知识流程尚未启用")
+    pending = runtime.pipeline.store(project_id).jobs()
+    request.app.state.agent_trace_tasks.submit(runtime.pipeline.consolidate_pending(project_id, retry_failed=True), label="knowledge-retry")
+    return {"scheduled": len(pending)}
 
 
 @router.post("/projects/{project_id}/{layer}/{record_id}/downgrade")
 async def downgrade_file_record(project_id: str, layer: str, record_id: str, request: Request):
     if layer not in {"memory", "pattern"}:
         raise HTTPException(status_code=422, detail="只能降低 Memory 或 Pattern")
+    if KnowledgeStore(_history(request, project_id).project_dir).get(record_id):
+        raise HTTPException(status_code=409, detail="版本化知识不能通过旧层级降级接口修改")
     result = _files(request, project_id).downgrade(layer, record_id)
     if not result:
         raise HTTPException(status_code=404, detail="记录不存在")

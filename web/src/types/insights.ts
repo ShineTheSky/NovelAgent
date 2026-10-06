@@ -1,4 +1,11 @@
 export interface LifecycleRecord {
+  schema?: 'knowledge_v1' | 'legacy';
+  version?: number;
+  previous_version?: number;
+  status?: string;
+  payload?: Record<string, unknown>;
+  memory_sources?: Array<{ memory_id: string; version: number; fact_ids: string[]; role: string }>;
+  replacements?: Array<{ new_id: string; new_version: number; reason: string }>;
   id: string;
   layer: 'insight' | 'memory' | 'pattern';
   title?: string;
