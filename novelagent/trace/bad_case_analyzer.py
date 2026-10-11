@@ -14,6 +14,7 @@ import yaml
 from novelagent.trace.agent_run import AgentRunTrace
 from novelagent.context.token_counter import TokenCounter
 from novelagent.llm.json_output import json_object
+from novelagent.llm.failures import is_balance_error
 
 
 class BadCaseAnalyzer:
@@ -72,7 +73,9 @@ class BadCaseAnalyzer:
             try:
                 _, header, body = path.read_text(encoding="utf-8").split("---", 2)
                 item = yaml.safe_load(header) or {}
-                if item.get("classification") == category and not str(item.get("failure_kind", "")).endswith("analysis_failure"):
+                if (item.get("classification") == category
+                    and not str(item.get("failure_kind", "")).endswith("analysis_failure")
+                    and not is_balance_error(self._section(body, "错误", 1200))):
                     cases.append({**item, "body": body.strip()})
             except (OSError, ValueError, yaml.YAMLError):
                 continue

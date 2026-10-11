@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, replace
 import httpx
 from novelagent.llm.config_loader import LLMConfigLoader, LLMConfig
 from novelagent.llm import responses
-from novelagent.llm.failures import RecordedLLMError, recorded_bad_case_id, llm_failure_context
+from novelagent.llm.failures import RecordedLLMError, recorded_bad_case_id, llm_failure_context, is_balance_error
 
 
 @dataclass
@@ -76,7 +76,7 @@ class LLMClient:
         context = {**(llm_failure_context.get() or {}), **(bad_case_context or {})}
 
         async def record_error(error, kind, attempt=0):
-            if not self.bad_case_recorder or recorded_bad_case_id(error):
+            if is_balance_error(error) or not self.bad_case_recorder or recorded_bad_case_id(error):
                 return error
             try:
                 identity = await self.bad_case_recorder.capture(

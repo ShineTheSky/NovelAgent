@@ -10,7 +10,7 @@ import pytest
 
 from novelagent.llm.client import LLMClient, LLMResponse
 from novelagent.llm.config_loader import LLMConfig
-from novelagent.llm.failures import recorded_bad_case_id, llm_failure_context
+from novelagent.llm.failures import recorded_bad_case_id, llm_failure_context, is_balance_error
 from novelagent.memory.consolidation import KnowledgePipeline
 from novelagent.storage.models import _generate_title
 from novelagent.trace.agent_bad_cases import AgentBadCaseRecorder
@@ -66,7 +66,7 @@ async def test_every_position_records_error_without_analysis(client, monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [400, 401, 402, 403])
+@pytest.mark.parametrize("status", [400, 401, 403])
 async def test_http_errors_and_provider_short_circuit_are_recorded(client, monkeypatch, status):
     requests = []
     def respond(request):
@@ -79,6 +79,34 @@ async def test_http_errors_and_provider_short_circuit_are_recorded(client, monke
     assert len(client.bad_case_recorder.records) == 2
     assert recorded_bad_case_id(first[0].error) != recorded_bad_case_id(second[0].error)
     assert len(requests) == (2 if status == 400 else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("position", ["main_loop", "sub_agent", "memory_prefetch", "memory_summary_fallback", "session_title", "case_analysis"])
+async def test_balance_errors_propagate_without_badcase_or_repeated_requests(client, monkeypatch, position):
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(402, json={"error": {"message": "Insufficient Balance"}})
+
+    transport(monkeypatch, respond)
+    for _ in range(2):
+        chunks = await collect(client, position=position)
+        assert chunks[0].type == "error" and is_balance_error(chunks[0].error)
+        assert not recorded_bad_case_id(chunks[0].error)
+    assert len(requests) == 1 and client.bad_case_recorder.records == []
+
+
+@pytest.mark.parametrize("error", ["HTTP 402", "HTTP402: failed", "HTTP error 402", "Insufficient Balance",
+                                    "insufficient_balance", "Payment Required", "账户余额不足", "余额耗尽", "余额用完"])
+def test_balance_error_variants(error):
+    assert is_balance_error(RuntimeError(error))
+
+
+@pytest.mark.parametrize("error", ["HTTP 401", "HTTP 429", "rate limit", "quota exceeded", "timeout", "invalid JSON", "1402 tokens"])
+def test_non_billing_errors_are_not_suppressed(error):
+    assert not is_balance_error(error)
 
 
 @pytest.mark.asyncio

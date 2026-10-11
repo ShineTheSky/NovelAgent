@@ -6,7 +6,7 @@ from pathlib import Path
 
 from novelagent.trace.recorder import sanitize_payload
 from novelagent.trace.store import TraceStore
-from novelagent.llm.failures import recorded_bad_case_id
+from novelagent.llm.failures import recorded_bad_case_id, is_balance_error
 
 
 GLOBAL_PROJECT_ID = "__agent_bad_cases__"
@@ -51,6 +51,8 @@ class AgentBadCaseRecorder:
         schedule_analysis: bool = True,
     ) -> str:
         """Persist a separate bad-case trace and review file. Never raises to the caller."""
+        if is_balance_error(error):
+            return ""
         identity = recorded_bad_case_id(error)
         if identity:
             return identity
@@ -84,7 +86,7 @@ class AgentBadCaseRecorder:
             await self.store.finish_trace(trace_id, "failed", str(error)[:16_000])
             await asyncio.to_thread(self._write_file, trace_id, metadata, self._snapshot(messages))
             needs_model = not any(marker in str(error).lower() for marker in (
-                "http 402", "insufficient balance", "api key", "exceeds input budget", "exceeds analysis budget"))
+                "api key", "exceeds input budget", "exceeds analysis budget"))
             if self.analyzer and schedule_analysis and needs_model:
                 self.analyzer.schedule(trace_id, metadata)
             return trace_id

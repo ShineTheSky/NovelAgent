@@ -349,9 +349,9 @@ async def test_badcase_analysis_failures_are_not_future_diagnostic_samples(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_quota_badcase_persists_without_new_paid_diagnosis(tmp_path):
+async def test_balance_failure_does_not_persist_or_schedule_badcase(tmp_path):
     class Trace:
-        async def create_trace(self, *args, **kwargs): return "case"
+        async def create_trace(self, *args, **kwargs): raise AssertionError("balance failures must not create traces")
         async def set_trace_operation(self, *args, **kwargs): pass
         async def append_event(self, *args, **kwargs): pass
         async def finish_trace(self, *args, **kwargs): pass
@@ -363,7 +363,7 @@ async def test_quota_badcase_persists_without_new_paid_diagnosis(tmp_path):
     recorder = AgentBadCaseRecorder(Trace(), str(tmp_path / "workspace"), Analyzer())
     result = await recorder.capture(source_trace_id="trace", session_id="s", project_id="p",
         failure_kind="knowledge_retain_failure", actor="memory:retain", error="HTTP 402: Insufficient Balance")
-    assert result == "case" and list(recorder.directory.glob("*.md"))
+    assert result == "" and not recorder.directory.exists()
 
 
 @pytest.mark.asyncio
