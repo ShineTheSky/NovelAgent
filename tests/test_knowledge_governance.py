@@ -17,16 +17,16 @@ class Embedding:
 
 def save(store, **overrides):
     raw = {'title': '节奏', 'direction': '节奏', 'background': '动作场景', 'requirement': '保持节奏',
-           'facts': [{'domain': 'writing', 'claim': '保持节奏', 'source_event_ids': ['ev']}]}
+           'statements': [{'classifications': [{'domain': 'writing', 'categories': ['polishing']}], 'claim': '保持节奏', 'source_event_ids': ['ev']}]}
     raw.update(overrides)
     payload = MemoryPackage.model_validate(raw).model_dump()
     return store.save_memory(payload, [{'event_id': 'ev', 'history_id': 'h', 'kind': 'user_input', 'content': '保持节奏'}], [1, 0, 0], 'model')
 
 
 def entry(memory, **overrides):
-    payload = Insight.model_validate({'title': '节奏方法', 'claim': '保持节奏', 'kind': 'method', 'purpose': '自然承接',
+    payload = Insight.model_validate({'title': '节奏方法', 'claim': '保持节奏', 'kind': 'method', 'classifications': [{'domain': 'writing', 'categories': ['polishing']}], 'purpose': '自然承接',
         'sources': [{'memory_id': memory['id'], 'version': memory['version'],
-                     'fact_ids': [memory['payload']['facts'][0]['fact_id']]}]}).model_dump()
+                     'statement_ids': [memory['payload']['statements'][0]['statement_id']]}]}).model_dump()
     return {'payload': payload, 'evidence': memory['evidence'], 'vector': [1, 0, 0], 'model_id': 'model', **overrides}
 
 
@@ -107,7 +107,7 @@ def test_demand_merge_deduplicates_maturity_across_attempts(tmp_path):
 
 
 def person(background, new=False):
-    return {'background': background, 'facts': [{'domain': 'content', 'claim': background, 'source_event_ids': ['ev'],
+    return {'background': background, 'statements': [{'classifications': [{'domain': 'content', 'categories': ['setting']}], 'claim': background, 'source_event_ids': ['ev'],
                                                 'entities': [{'name': '林舟', 'kind': 'person', 'new_identity': new}]}]}
 
 
@@ -115,7 +115,7 @@ def test_same_name_can_have_distinct_entity_ids(tmp_path):
     store = KnowledgeStore(tmp_path)
     one = save(store, **person('林舟是主角'))
     two = save(store, **person('另一个时代的同名人物', new=True))
-    assert one['payload']['facts'][0]['entities'][0]['entity_id'] != two['payload']['facts'][0]['entities'][0]['entity_id']
+    assert one['payload']['statements'][0]['entities'][0]['entity_id'] != two['payload']['statements'][0]['entities'][0]['entity_id']
     assert len(store.entity_candidates(['林舟'], 'person')) == 2
 
 
@@ -124,7 +124,7 @@ def test_same_name_can_have_distinct_entity_ids(tmp_path):
 async def test_entity_resolution_uses_evidence_not_name_equality(tmp_path, choice):
     pipeline = KnowledgePipeline(None, tmp_path, Embedding(), 'model')
     memory = save(pipeline.store('p'), **person('主角林舟'))
-    eid = memory['payload']['facts'][0]['entities'][0]['entity_id']
+    eid = memory['payload']['statements'][0]['entities'][0]['entity_id']
     class LLM:
         async def chat(self, **kwargs):
             assert kwargs['tag'].endswith('entity-resolution')
@@ -135,7 +135,7 @@ async def test_entity_resolution_uses_evidence_not_name_equality(tmp_path, choic
     package = MemoryPackage.model_validate({'title': '人物', 'direction': '人物', 'requirement': '记录人物', **person('林舟身份待核')}).model_dump()
     await pipeline._resolve_entities('p', package, memory['evidence'])
     saved = pipeline.store('p').save_memory(package, memory['evidence'], [1, 0, 0], 'model')
-    entity = saved['payload']['facts'][0]['entities'][0]
+    entity = saved['payload']['statements'][0]['entities'][0]
     if choice == 'existing':
         assert entity['entity_id'] == eid
     elif choice == 'new':
@@ -170,11 +170,11 @@ def test_graph_frontier_keeps_pinned_old_source_version_visible(tmp_path):
 def test_multi_file_facts_get_their_own_chapter_anchor_not_the_first_file(tmp_path):
     paths = ['chapters/content_1.1.1.md', 'chapters/content_1.2.1.md']
     raw = {'title': '两个修改方向', 'direction': '节奏', 'background': '跨文件调整', 'requirement': '保持承接',
-           'artifact_paths': paths, 'facts': [
-               {'domain': 'writing', 'claim': '第二节的修改', 'source_event_ids': ['ev2']},
-               {'domain': 'writing', 'claim': '无法定位具体节的意见', 'source_event_ids': ['ev1']}]}
+           'artifact_paths': paths, 'statements': [
+               {'classifications': [{'domain': 'writing', 'categories': ['polishing']}], 'claim': '第二节的修改', 'source_event_ids': ['ev2']},
+               {'classifications': [{'domain': 'writing', 'categories': ['polishing']}], 'claim': '无法定位具体节的意见', 'source_event_ids': ['ev1']}]}
     evidence = [{'event_id': 'ev1', 'kind': 'user_input', 'content': '保持承接'},
                 {'event_id': 'ev2', 'kind': 'polisher_thinking', 'content': '第二节修改', 'scope': {'path': paths[1]}}]
     result = KnowledgePipeline._validate_package(raw, evidence)
-    assert result['facts'][0]['times'][0]['start'] == '1.2.1'
-    assert result['facts'][1]['times'] == []
+    assert result['statements'][0]['times'][0]['start'] == '1.2.1'
+    assert result['statements'][1]['times'] == []

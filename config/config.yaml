@@ -10,6 +10,10 @@ memory:
     recover_on_startup: false  # 旧 History 迁移与失败重试需显式触发，重载服务不发起付费分析
     recall_timeout: 30          # 同步等待；失败记 bad case 后继续当前任务
     candidate_limit: 40
+    memory_vector_top_k: 20
+    memory_merge_similarity: 0.97 # 严格大于才允许模型判断合并，不凭同方向更新
+    memory_time_window_hours: 24
+    memory_time_neighbors: 8
     graph_depth: 3
     graph_nodes: 128
     insight_limit: 12

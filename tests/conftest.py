@@ -1,7 +1,57 @@
 import pytest
 import tempfile
 import os
+import json
+from copy import deepcopy
 from pathlib import Path
+
+
+def quoted_memory_response(response, messages):
+    """Upgrade synthetic model fixtures to the event-quote output contract."""
+    result = deepcopy(response)
+    packages = result.get('memories', []) if isinstance(result, dict) else []
+    if isinstance(result, dict) and result.get('memory') is not None:
+        packages = [result['memory']]
+    if not packages:
+        return result
+    prompt = next(m['content'] for m in messages if isinstance(m.get('content'), str)
+                  and ('\nHistory:' in m['content'] or '\nNewEvidence:' in m['content']))
+    if '\nHistory:' in prompt:
+        events = json.loads(prompt.split('\nHistory:', 1)[1])['events']
+    else:
+        source, candidates = prompt.split('\nNewEvidence:', 1)[1].split('\nCandidates:', 1)
+        events = json.loads(source)
+        if result.get('action') == 'update':
+            events += next(c['evidence'] for c in json.loads(candidates) if c['id'] == result['memory_id'])
+    by_id = {e['event_id']: e for e in events}
+    def excerpt(event):
+        content = event.get('content', '__missing_event_quote__')
+        try:
+            value = json.loads(content)
+        except ValueError:
+            return content
+        def first_text(value):
+            if isinstance(value, str):
+                return value
+            if isinstance(value, dict):
+                params = value.get('params', {})
+                for key in ('task', 'old_string', 'new_string', 'content'):
+                    if isinstance(params.get(key), str):
+                        return params[key]
+                return next((text for item in value.values() if (text := first_text(item))), '')
+            if isinstance(value, list):
+                return next((text for item in value if (text := first_text(item))), '')
+            return ''
+        return first_text(value) or content
+    for package in packages:
+        if 'source_event_quotes' in package:
+            continue
+        ids = {eid for key in ('statements', 'relations', 'statement_changes')
+               for row in package.get(key, []) for eid in row['source_event_ids']}
+        ids.update(f['source_event_id'] for f in package.get('fragments', []))
+        package['source_event_quotes'] = [{'event_id': eid,
+            'excerpt': excerpt(by_id.get(eid, {}))} for eid in sorted(ids)]
+    return result
 
 
 @pytest.fixture(autouse=True)

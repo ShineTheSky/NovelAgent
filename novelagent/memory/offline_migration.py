@@ -12,7 +12,35 @@ import numpy as np
 import yaml
 from pydantic import ValidationError
 
-from novelagent.memory.models import Insight, MemoryPackage
+from novelagent.memory.models import Insight, MemoryPackage, knowledge_payload, normalize_statement_keys
+from novelagent.memory.evidence_text import excerpt_matches, user_excerpt_matches
+
+
+def preview_knowledge_classifications(project):
+    """Read-only classification inventory; no store initialization or model calls."""
+    path = Path(project) / ".knowledge" / "knowledge.sqlite3"
+    report = {"versions_checked": 0, "records": [], "errors": [], "pending_classification": 0}
+    if not path.exists():
+        return report
+    with _read_db(path) as db:
+        rows = db.execute("""SELECT r.layer,r.published_version,v.id,v.version,v.payload FROM records r
+            JOIN versions v ON v.id=r.id ORDER BY v.id,v.version""").fetchall()
+    for row in rows:
+        report["versions_checked"] += 1
+        try:
+            raw = json.loads(row["payload"])
+            model = MemoryPackage if row["layer"] == "memory" else Insight
+            payload = model.model_validate(raw).model_dump()
+            groups = payload.get("classifications", [])
+            pending = not groups or any(not c["categories"] for c in groups)
+            if row["version"] == row["published_version"]:
+                report["pending_classification"] += int(pending)
+                report["records"].append({"id": row["id"], "version": row["version"], "layer": row["layer"],
+                    "title": payload["title"], "classifications": groups, "pending_classification": pending,
+                    "legacy_classification": {k: raw[k] for k in ("category", "domain", "knowledge_domains") if k in raw}})
+        except (ValueError, TypeError, KeyError) as exc:
+            report["errors"].append({"id": row["id"], "version": row["version"], "error": str(exc)})
+    return report
 
 
 def _read_db(path):
@@ -125,7 +153,7 @@ def _legacy_plan(project, units, events, aliases, trace_database=None):
                        "payload": {"legacy_metadata": header, "legacy_body": body,
                                    "semantic_status": "unverified_legacy_summary", "learning_status": "not_started"},
                        "evidence": list(resolved.values()),
-                       "reason": "Exact source events can be staged; direction/facts/learning still require semantic review."
+                       "reason": "Exact source events can be staged; direction/statements/learning still require semantic review."
                            if ready else "Missing or mismatched evidence; do not activate or rename old layers."})
     sources = _trace_sources(project, trace_database, {eid for row in result for eid in row["missing_event_ids"]})
     for row in result:
@@ -165,21 +193,7 @@ def _legacy_plan(project, units, events, aliases, trace_database=None):
 
 
 def _quote_matches(quote, content):
-    if quote in content:
-        return True
-    try:
-        value = json.loads(content)
-    except ValueError:
-        return False
-    def strings(value):
-        if isinstance(value, str):
-            return [value]
-        if isinstance(value, list):
-            return [s for v in value for s in strings(v)]
-        if isinstance(value, dict):
-            return [s for v in value.values() for s in strings(v)]
-        return []
-    return any(quote in text for text in strings(value))
+    return user_excerpt_matches(quote, content)
 
 
 def _structured_plan(project, events, revisions):
@@ -192,15 +206,15 @@ def _structured_plan(project, events, revisions):
         integrity = [str(r[0]) for r in db.execute("PRAGMA integrity_check") if r[0] != "ok"]
         integrity += ["foreign_key_violation:" + str(tuple(r)) for r in db.execute("PRAGMA foreign_key_check")]
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        lineage = [dict(r) for r in db.execute("SELECT * FROM fact_changes")] if "fact_changes" in tables else []
+        lineage = [normalize_statement_keys(dict(r)) for r in db.execute("SELECT * FROM fact_changes")] if "fact_changes" in tables else []
     versions = {(r["id"], r["version"]): r for r in rows}
     result = []
     for row in rows:
         issues = []
         payload = {}
         try:
-            payload, evidence = json.loads(row["payload"]), json.loads(row["evidence"])
-            (MemoryPackage if row["layer"] == "memory" else Insight).model_validate(payload)
+            payload, evidence = knowledge_payload(json.loads(row["payload"])), json.loads(row["evidence"])
+            payload = (MemoryPackage if row["layer"] == "memory" else Insight).model_validate(payload).model_dump()
             evidence_ids = {e["event_id"] for e in evidence}
             if not evidence:
                 issues.append("missing_evidence")
@@ -209,30 +223,30 @@ def _structured_plan(project, events, revisions):
                 if not event or any(str(entry.get(k, "")) != str(event.get(k, ""))
                                     for k in ("content", "kind", "history_id", "revision_id")):
                     issues.append("unverified_event:" + entry["event_id"])
-            for fact in payload.get("facts", []):
+            for fact in payload.get("statements", []):
                 if set(fact["source_event_ids"]) - evidence_ids:
-                    issues.append("unavailable_fact_evidence:" + fact["fact_id"])
+                    issues.append("unavailable_fact_evidence:" + fact["statement_id"])
             previous = versions.get((row["id"], row["previous_version"]))
             if row["previous_version"] != row["version"] - 1 or (row["previous_version"] and not previous):
                 issues.append("broken_version_chain")
-            previous_facts = {f["fact_id"]: f for f in json.loads(previous["payload"]).get("facts", [])} if previous else {}
-            current_facts = {f["fact_id"]: f for f in payload.get("facts", [])}
-            for change in payload.get("fact_changes", []):
-                if set(change["previous_fact_ids"]) - previous_facts.keys():
+            previous_facts = {f["statement_id"]: f for f in knowledge_payload(json.loads(previous["payload"])).get("statements", [])} if previous else {}
+            current_facts = {f["statement_id"]: f for f in payload.get("statements", [])}
+            for change in payload.get("statement_changes", []):
+                if set(change["previous_statement_ids"]) - previous_facts.keys():
                     issues.append("unavailable_previous_fact_change")
-                if set(change["current_fact_ids"]) - current_facts.keys():
+                if set(change["current_statement_ids"]) - current_facts.keys():
                     issues.append("unavailable_current_fact_change")
                 if set(change["source_event_ids"]) - evidence_ids:
                     issues.append("unavailable_fact_change_evidence")
                 if change["kind"] == "withdrawn" and any(current_facts.get(fid, {}).get("status", "active") != "withdrawn"
-                                                        for fid in change["current_fact_ids"]):
+                                                        for fid in change["current_statement_ids"]):
                     issues.append("withdrawal_fact_still_active")
             for change in lineage:
                 if (change["id"], change["version"]) != (row["id"], row["version"]):
                     continue
-                if change["previous_version"] != row["previous_version"] or change["previous_fact_id"] not in previous_facts:
+                if change["previous_version"] != row["previous_version"] or change["previous_statement_id"] not in previous_facts:
                     issues.append("invalid_lineage_previous_endpoint")
-                if change["current_fact_id"] and change["current_fact_id"] not in current_facts:
+                if change["current_statement_id"] and change["current_statement_id"] not in current_facts:
                     issues.append("invalid_lineage_current_endpoint")
                 if set(json.loads(change["source_event_ids"])) - evidence_ids:
                     issues.append("invalid_lineage_evidence")
@@ -240,29 +254,29 @@ def _structured_plan(project, events, revisions):
             for source in payload.get("sources", []):
                 saved = versions.get((source["memory_id"], source["version"]))
                 if saved:
-                    owner_fact_ids.update(f["fact_id"] for f in json.loads(saved["payload"]).get("facts", [])
-                                          if not source["fact_ids"] or f["fact_id"] in source["fact_ids"])
+                    owner_fact_ids.update(f["statement_id"] for f in knowledge_payload(json.loads(saved["payload"])).get("statements", [])
+                                          if not source["statement_ids"] or f["statement_id"] in source["statement_ids"])
             for relation in payload.get("relations", []):
                 if set(relation["source_event_ids"]) - evidence_ids:
                     issues.append("unavailable_relation_evidence")
-                if relation["source_fact_id"] and relation["source_fact_id"] not in owner_fact_ids:
+                if relation["source_statement_id"] and relation["source_statement_id"] not in owner_fact_ids:
                     issues.append("unavailable_relation_source_fact")
                 target = versions.get((relation["target_id"], relation["target_version"]))
                 if not target:
                     issues.append("unavailable_relation_target")
-                elif relation.get("target_fact_id") not in {"", *(f["fact_id"] for f in json.loads(target["payload"]).get("facts", []))}:
+                elif relation.get("target_statement_id") not in {"", *(f["statement_id"] for f in knowledge_payload(json.loads(target["payload"])).get("statements", []))}:
                     issues.append("unavailable_relation_fact")
             for source in payload.get("sources", []):
                 target = versions.get((source["memory_id"], source["version"]))
                 if not target or target["layer"] != "memory":
                     issues.append("unavailable_source_memory")
-                elif set(source["fact_ids"]) - {f["fact_id"] for f in json.loads(target["payload"]).get("facts", [])}:
+                elif set(source["statement_ids"]) - {f["statement_id"] for f in knowledge_payload(json.loads(target["payload"])).get("statements", [])}:
                     issues.append("unavailable_source_fact")
                 elif source["role"] == "support":
-                    target_facts = json.loads(target["payload"])["facts"]
-                    selected = [f for f in target_facts if not source["fact_ids"] or f["fact_id"] in source["fact_ids"]]
+                    target_facts = knowledge_payload(json.loads(target["payload"]))["statements"]
+                    selected = [f for f in target_facts if not source["statement_ids"] or f["statement_id"] in source["statement_ids"]]
                     if not any(f.get("status", "active") == "active" for f in selected) or (
-                        source["fact_ids"] and any(f.get("status", "active") != "active" for f in selected)
+                        source["statement_ids"] and any(f.get("status", "active") != "active" for f in selected)
                     ):
                         issues.append("withdrawn_fact_support")
             if row["layer"] != "memory" and not any(s["role"] == "support" for s in payload["sources"]):
@@ -274,7 +288,8 @@ def _structured_plan(project, events, revisions):
                 for revision_key, quote_key in (("revision_id", "after"), ("previous_revision_id", "before")):
                     if fragment[revision_key]:
                         revision = revisions.get(fragment[revision_key])
-                        if not revision or revision["path"] != fragment["path"] or fragment[quote_key] not in revision["body_md"]:
+                        if (not revision or revision["path"] != fragment["path"]
+                                or (fragment[quote_key] and not excerpt_matches(fragment[quote_key], revision["body_md"]))):
                             issues.append("unverified_artifact_fragment")
             quote = payload.get("source_text")
             if quote and not any(e["kind"] in {"user_input", "user_answer"} and _quote_matches(quote, e["content"]) for e in evidence):
@@ -456,8 +471,6 @@ async def verify_snapshot_runtime(destination):
         role = payload["roles"][0] if payload["roles"] else "main"
         if payload["authority"] == "reviewer" and not payload["human_confirmed"]:
             role = "reviewer"
-        if payload["category"] == "agent":
-            role = "main"
         paths = list(payload["artifact_paths"])
         content_type = payload["content_types"][0] if payload["content_types"] else ""
         for anchor in payload["times"]:

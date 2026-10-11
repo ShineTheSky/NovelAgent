@@ -24,9 +24,9 @@ def fixture_project(tmp_path):
     store = KnowledgeStore(project)
     memory = store.save_memory({"title": "衔接", "direction": "段落衔接", "background": "用户提出正文要求",
         "requirement": "保持自然衔接", "source_text": "保持自然衔接",
-        "facts": [{"domain": "writing", "claim": "用户要求保持自然衔接", "source_event_ids": [eid]}]}, [event], [1., 0., 0.], "offline-vector-fixture")
-    insight = store.publish_insights([{"payload": {"title": "衔接规则", "claim": "段落要自然衔接", "kind": "rule", "purpose": "连贯",
-        "sources": [{"memory_id": memory["id"], "version": 1, "fact_ids": []}]}, "evidence": [event],
+        "statements": [{"classifications": [{"domain": "writing", "categories": ["polishing"]}], "claim": "用户要求保持自然衔接", "source_event_ids": [eid]}]}, [event], [1., 0., 0.], "offline-vector-fixture")
+    insight = store.publish_insights([{"payload": {"title": "衔接规则", "claim": "段落要自然衔接", "kind": "rule", "classifications": [{"domain": "writing", "categories": ["polishing"]}], "purpose": "连贯",
+        "sources": [{"memory_id": memory["id"], "version": 1, "statement_ids": []}]}, "evidence": [event],
         "vector": [1., 0., 0.], "model_id": "offline-vector-fixture"}], {memory["id"]: 1})[0]
     return project, store, memory, insight, event
 
@@ -71,6 +71,26 @@ def test_multiple_memory_versions_keep_insight_pinned_to_original_version(tmp_pa
     assert copied.get(memory["id"])["version"] == updated["version"] == 2
     assert copied.get(memory["id"], 1)["payload"] == memory["payload"]
     assert copied.get(insight["id"])["payload"]["sources"][0]["version"] == 1
+
+
+def test_snapshot_accepts_fragment_punctuation_without_changing_sources(tmp_path):
+    project, store, memory, insight, event = fixture_project(tmp_path)
+    history = DocumentHistoryStore(project)
+    path = project / 'world/a.md'
+    before, after = '【村庄】：“危险”……', '【村庄】：“安全”——有九叔。'
+    history.record_revision(path, 'v1', None, before, before)
+    history.record_revision(path, 'v2', 'v1', after, after)
+    payload = dict(memory['payload'])
+    payload.update(artifact_paths=['world/a.md'], fragments=[{
+        'path': 'world/a.md', 'revision_id': 'v2', 'previous_revision_id': 'v1',
+        'before': "[村庄]:'危险'...", 'after': "[村庄]:'安全'--有九叔.",
+    }])
+    updated = store.save_memory(payload, [event], [1., 0., 0.], 'offline-vector-fixture', memory['id'], expected_version=1)
+    manifest = source_manifest(project)
+    report = offline_snapshot(project, tmp_path / 'isolated')
+    assert report['counts']['verified_published'] == 2
+    assert source_manifest(project) == manifest
+    assert KnowledgeStore(tmp_path / 'isolated').get(memory['id'])['payload'] == updated['payload']
 
 
 def trace_fixture(project, event, tmp_path, *, trace_project=None, content=None):
@@ -124,7 +144,7 @@ def test_equal_content_on_different_trace_does_not_create_false_mapping(tmp_path
 def test_withdrawn_fact_cannot_support_active_insight(tmp_path):
     project, store, memory, insight, event = fixture_project(tmp_path)
     payload = dict(memory["payload"])
-    payload["facts"][0]["status"] = "withdrawn"
+    payload["statements"][0]["status"] = "withdrawn"
     with store.connect() as db:
         db.execute("UPDATE versions SET payload=? WHERE id=?", (json.dumps(payload), memory["id"]))
     row = next(r for r in offline_plan(project)["structured"] if r["id"] == insight["id"])
@@ -134,8 +154,8 @@ def test_withdrawn_fact_cannot_support_active_insight(tmp_path):
 def test_payload_fact_change_with_unknown_previous_fact_is_quarantined(tmp_path):
     project, store, memory, insight, event = fixture_project(tmp_path)
     payload = dict(memory["payload"])
-    payload["fact_changes"] = [{"kind": "corrected", "previous_fact_ids": ["unknown-previous"],
-                                "current_fact_ids": [payload["facts"][0]["fact_id"]], "reason": "修正", "source_event_ids": [event["event_id"]]}]
+    payload["statement_changes"] = [{"kind": "corrected", "previous_statement_ids": ["unknown-previous"],
+                                "current_statement_ids": [payload["statements"][0]["statement_id"]], "reason": "修正", "source_event_ids": [event["event_id"]]}]
     with store.connect() as db:
         db.execute("UPDATE versions SET payload=? WHERE id=?", (json.dumps(payload), memory["id"]))
     report = offline_snapshot(project, tmp_path / "isolated")
@@ -148,7 +168,7 @@ def test_invalid_lineage_table_endpoint_cannot_bypass_payload_validation(tmp_pat
     project, store, memory, insight, event = fixture_project(tmp_path)
     with store.connect() as db:
         db.execute("INSERT INTO fact_changes VALUES (?,?,?,?,?,?,?,?)", (memory["id"], 0, 1,
-            "unknown-previous", memory["payload"]["facts"][0]["fact_id"], "corrected", "修正", json.dumps([event["event_id"]])))
+            "unknown-previous", memory["payload"]["statements"][0]["statement_id"], "corrected", "修正", json.dumps([event["event_id"]])))
     row = next(r for r in offline_plan(project)["structured"] if r["id"] == memory["id"])
     assert "invalid_lineage_previous_endpoint" in row["issues"]
 

@@ -313,6 +313,22 @@ def test_extracted_source_text_must_occur_in_user_evidence(tmp_path):
     assert record["semantic_evidence"][0]["history_excerpts"][0]["content"] == "这句太直白：她握紧杯子。"
 
 
+def test_legacy_history_analysis_preserves_punctuation_variant_excerpt(tmp_path):
+    store = DocumentHistoryStore(tmp_path / "project-a")
+    original, copied = '这句太直白：【她说“安全”……】。', "这句太直白:[她说'安全'...]."
+    history_id = store.start_request("trace-source", "session-a", original)
+    store.close_request("trace-source", "completed", "收到", ["trace-source"], 1)
+    unit = store.get_unit(history_id)
+    HistoryAnalyzer(None, str(tmp_path), None)._apply("project-a", unit, {"records": [{
+        "layer": "memory", "signal": "strong", "title": "压抑表达",
+        "claim": "用动作表现压力", "category": "reference", "kind": "text_feedback",
+        "source_event_ids": [unit["events"][0]["event_id"]], "source_text": copied,
+    }]})
+    record = FileLifecycleStore(str(tmp_path), "project-a").list("memory")[0]
+    assert record["source_text"] == copied
+    assert record["semantic_evidence"][0]["history_excerpts"][0]["content"] == original
+
+
 def test_revision_markers_cannot_be_memory_sources(tmp_path):
     store = DocumentHistoryStore(tmp_path / "project-a")
     store.start_request("trace-revision", "session-a", "把语气改得克制")

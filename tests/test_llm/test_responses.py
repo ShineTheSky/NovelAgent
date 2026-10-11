@@ -1,6 +1,7 @@
 """Responses / 本地网关配置回归：所有 HTTP 都使用 MockTransport。"""
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
@@ -11,7 +12,11 @@ from fastapi.testclient import TestClient
 
 from novelagent.llm.client import LLMClient
 from novelagent.llm.config_loader import LLMConfig
+from novelagent.memory.consolidation import KnowledgePipeline
+from novelagent.memory.models import retrieval_text
 from novelagent.server.routes.settings import router
+from novelagent.storage import database
+from novelagent.trace.store import TraceStore
 
 
 @pytest.fixture
@@ -97,6 +102,130 @@ async def test_stream_emits_tool_once_and_preserves_call_id(client, monkeypatch)
     assert [chunk.type for chunk in chunks] == ["thinking", "text_delta", "tool_use", "done"]
     assert chunks[2].tool_call_id == "real_call_id" and chunks[2].tool_input == {"path": "a.md"}
     assert chunks[-1].finish_reason == "tool_calls"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thinking_event", ["response.reasoning_text.delta", "response.reasoning_summary_text.delta"])
+async def test_retain_stream_persists_thinking_json_and_usage(client, monkeypatch, tmp_path, thinking_event):
+    monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "traces.sqlite3"))
+    await database.init()
+    get_config = client.loader.get_config
+    monkeypatch.setattr(client.loader, "get_config", lambda *args, **kwargs:
+        replace(get_config(*args, **kwargs), reasoning_effort="high"))
+    seen = []
+    events = [
+        {"type": thinking_event, "delta": "先检查"},
+        {"type": thinking_event, "delta": "需求来源"},
+        {"type": "response.output_text.delta", "delta": '{"memories":'},
+        {"type": "response.output_text.delta", "delta": '[]}'},
+        {"type": "response.completed", "response": {"status": "completed", "output": [],
+            "usage": {"input_tokens": 40, "output_tokens": 8,
+                      "output_tokens_details": {"reasoning_tokens": 4}}}},
+    ]
+    sse = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+
+    def handler(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, text=sse, headers={"content-type": "text/event-stream"})
+
+    mock_http(monkeypatch, handler)
+    store = TraceStore()
+    pipeline = KnowledgePipeline(client, tmp_path / "workspace", None, "test", trace_store=store)
+    assert await pipeline._call("p", "提取 Memory JSON", "retain") == {"memories": []}
+    assert len(seen) == 1 and seen[0]["stream"] is True
+    assert seen[0]["reasoning"] == {"effort": "high", "summary": "auto"}
+    traces = await store.list_project_traces("p")
+    assert len(traces) == 1 and traces[0]["status"] == "completed"
+    saved = await store.list_events(traces[0]["trace_id"])
+    assert "".join(e["payload"]["content"] for e in saved if e["event_type"] == "thinking") == "先检查需求来源"
+    assert "".join(e["payload"]["content"] for e in saved if e["event_type"] == "text_delta") == '{"memories":[]}'
+    usages = [e["payload"] for e in saved if e["event_type"] == "llm_usage"]
+    assert len(usages) == 1 and usages[0]["output_tokens_details"]["reasoning_tokens"] == 4
+    assert pipeline.store("p").list() == []
+    route = next(e["payload"] for e in saved if e["event_type"] == "model_route")
+    assert route["reasoning_summary"] == "auto"
+    assert pipeline.store("p").model_result(route["request_id"])["response"] == '{"memories":[]}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_api,base_url", [
+    ("responses", "http://localhost:6780/v1"),
+    ("chat_completions", "http://localhost:6780/v1"),
+    ("responses", "https://api.anthropic.com/v1"),
+])
+async def test_summary_opt_in_is_responses_only(client, monkeypatch, wire_api, base_url):
+    config = replace(client.loader.get_config("main_loop"), wire_api=wire_api,
+                     base_url=base_url, reasoning_effort="high")
+    monkeypatch.setattr(client.loader, "get_config", lambda *args, **kwargs: config)
+    seen = []
+    async def send(config, body, stream):
+        seen.append(body)
+        from novelagent.llm.client import LLMResponse
+        yield LLMResponse(type="done")
+    monkeypatch.setattr(client, "_send_request", send)
+    _ = [chunk async for chunk in client.chat("main_loop", [{"role": "user", "content": "JSON"}],
+                                             reasoning_summary="auto")]
+    if wire_api == "responses" and not config.is_anthropic:
+        assert seen[0]["reasoning"] == {"effort": "high", "summary": "auto"}
+    else:
+        assert "reasoning" not in seen[0]
+        assert "reasoning_summary" not in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_non_retain_analysis_does_not_enable_summary(client, monkeypatch, tmp_path):
+    seen = []
+    def handler(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, text='data: {"type":"response.output_text.delta","delta":"{}"}\n\n'
+            'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+            headers={"content-type": "text/event-stream"})
+    mock_http(monkeypatch, handler)
+    pipeline = KnowledgePipeline(client, tmp_path / "workspace", None, "test")
+    assert await pipeline._call("p", "归纳 Insight", "consolidate") == {}
+    assert "summary" not in seen[0].get("reasoning", {})
+
+
+@pytest.mark.asyncio
+async def test_retain_summary_never_enters_memory_payload_index_or_identity(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "traces.sqlite3"))
+    await database.init()
+    package = {"title": "恢复舒缓", "direction": "本段节奏", "requirement": "本段恢复舒缓",
+        "background": "前段为快速动作",
+        "statements": [{"claim": "本段恢复舒缓", "source_event_ids": ["ev1"],
+            "classifications": [{"domain": "writing", "categories": ["polishing"]}]}]}
+    expected = {"memories": [package]}
+    summary = "ONLY_TRACE_NOT_MEMORY"
+    def handler(request):
+        assert json.loads(request.content)["reasoning"]["summary"] == "auto"
+        events = [{"type": "response.reasoning_summary_text.delta", "delta": summary},
+                  {"type": "response.output_text.delta", "delta": json.dumps(expected)},
+                  {"type": "response.completed", "response": {"status": "completed"}}]
+        return httpx.Response(200, text="".join(f"data: {json.dumps(e)}\n\n" for e in events),
+                              headers={"content-type": "text/event-stream"})
+    mock_http(monkeypatch, handler)
+    traces = TraceStore()
+    pipeline = KnowledgePipeline(client, tmp_path / "workspace", None, "test", trace_store=traces)
+    evidence = [{"event_id": "ev1", "history_id": "h1", "kind": "user_input", "content": "本段恢复舒缓"}]
+    records = []
+    trace_ids = set()
+    for turn in range(2):
+        result = await pipeline._call("p", f"提取 Memory {turn}", "retain")
+        assert result == expected
+        record = pipeline.store("p").save_memory(result["memories"][0], evidence, [1., 0., 0.],
+                                                  "test", operation_id="h1:stable")
+        assert summary not in json.dumps({"id": record["id"], "payload": record["payload"],
+            "evidence": record["evidence"], "index_text": retrieval_text("memory", record["payload"])})
+        records.append(record)
+        trace = next(t for t in await traces.list_project_traces("p") if t["trace_id"] not in trace_ids)
+        saved = await traces.list_events(trace["trace_id"])
+        assert "".join(e["payload"]["content"] for e in saved if e["event_type"] == "thinking") == summary
+        route = next(e["payload"] for e in saved if e["event_type"] == "model_route")
+        assert summary not in pipeline.store("p").model_result(route["request_id"])["response"]
+        trace_ids.add(trace["trace_id"])
+        summary += "_CHANGED"
+    assert records[0]["id"] == records[1]["id"]
+    assert records[0]["version"] == records[1]["version"] == 1
 
 
 @pytest.mark.asyncio

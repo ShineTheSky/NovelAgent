@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from tests.conftest import quoted_memory_response
 
 from novelagent.memory.models import MemoryPackage, Insight, chosen_solution, time_key
 from novelagent.memory.knowledge_store import KnowledgeStore
@@ -24,7 +25,7 @@ class Embedding:
 
 def package(title="自然承接", **overrides):
     raw = {"title": title, "direction": title, "background": "前段为快速动作", "requirement": "本段恢复舒缓",
-           "facts": [{"domain": "writing", "claim": title, "source_event_ids": ["ev1"]}]}
+           "statements": [{"classifications": [{"domain": "writing", "categories": ["polishing"]}], "claim": title, "source_event_ids": ["ev1"]}]}
     raw.update(overrides)
     return MemoryPackage.model_validate(raw).model_dump()
 
@@ -38,9 +39,9 @@ def save(store, title="自然承接", **overrides):
 
 
 def learned(memory, **overrides):
-    raw = {"title": "节奏转换", "claim": "依场景调整节奏", "kind": "method", "purpose": "自然承接",
+    raw = {"title": "节奏转换", "claim": "依场景调整节奏", "kind": "method", "classifications": [{"domain": "writing", "categories": ["polishing"]}], "purpose": "自然承接",
            "method": "动作之后增加感知承接", "sources": [{"memory_id": memory["id"], "version": memory["version"],
-           "fact_ids": [memory["payload"]["facts"][0]["fact_id"]]}]}
+           "statement_ids": [memory["payload"]["statements"][0]["statement_id"]]}]}
     raw.update(overrides)
     return Insight.model_validate(raw).model_dump()
 
@@ -91,11 +92,11 @@ def test_publication_keeps_old_knowledge_until_atomic_switch(tmp_path):
 async def test_four_routes_are_audited_and_hard_time_filter_is_numeric(tmp_path):
     store = KnowledgeStore(tmp_path)
     def fact(pos):
-        return [{"domain": "content", "claim": "林舟节奏", "source_event_ids": ["ev1"],
+        return [{"classifications": [{"domain": "content", "categories": ["setting"]}], "claim": "林舟节奏", "source_event_ids": ["ev1"],
                  "entities": [{"name": "林舟", "kind": "person", "aliases": ["阿舟"]}],
                  "times": [{"dimension": "chapter", "start": pos}]}]
-    one = save(store, "节奏一", facts=fact("1.2.1"))
-    two = save(store, "节奏二", facts=fact("1.12.1"))
+    one = save(store, "节奏一", statements=fact("1.2.1"))
+    two = save(store, "节奏二", statements=fact("1.12.1"))
     retrieval = KnowledgeRetrieval(store, Embedding(), "model")
     result = await retrieval.recall("阿舟节奏 1.2.1", purpose="memory_match", temporal={
         "dimension": "chapter", "start": "1.2.0", "end": "1.2.999999", "hard": True})
@@ -110,12 +111,12 @@ async def test_four_routes_are_audited_and_hard_time_filter_is_numeric(tmp_path)
 @pytest.mark.asyncio
 async def test_reverse_causal_traversal_from_entity_seed(tmp_path):
     store = KnowledgeStore(tmp_path)
-    first = save(store, "甲", facts=[{"domain": "content", "claim": "甲事件", "source_event_ids": ["ev1"],
+    first = save(store, "甲", statements=[{"classifications": [{"domain": "content", "categories": ["setting"]}], "claim": "甲事件", "source_event_ids": ["ev1"],
                                      "entities": [{"name": "源角色"}]}])
     second = save(store, "乙", relations=[{"kind": "causal", "predicate": "caused_by",
-        "target_id": first["id"], "target_version": 1, "source_event_ids": ["ev1"], "source_fact_id": "new:1",
-        "target_fact_id": first["payload"]["facts"][0]["fact_id"]}], facts=[
-            {"fact_id": "new:1", "domain": "writing", "claim": "乙结果", "source_event_ids": ["ev1"]}])
+        "target_id": first["id"], "target_version": 1, "source_event_ids": ["ev1"], "source_statement_id": "new:1",
+        "target_statement_id": first["payload"]["statements"][0]["statement_id"]}], statements=[
+            {"statement_id": "new:1", "classifications": [{"domain": "writing", "categories": ["polishing"]}], "claim": "乙结果", "source_event_ids": ["ev1"]}])
     result = await KnowledgeRetrieval(store, Embedding(), "model").recall("源角色", purpose="memory_match")
     row = next(i for i in result["items"] if i["record"]["id"] == second["id"])
     assert "relation" in row["ranks"] and any("causal" in p for p in row["paths"])
@@ -214,7 +215,7 @@ async def test_history_retains_only_memory_then_independent_insight(tmp_path):
             else:
                 memory = pipeline.store("p").list(("memory",))[0]
                 response = {"insights": [{"payload": learned(memory)}], "withdrawals": []}
-            yield SimpleNamespace(type="text_delta", content=json.dumps(response))
+            yield SimpleNamespace(type="text_delta", content=json.dumps(quoted_memory_response(response, kwargs['messages'])))
     llm = LLM()
     pipeline = KnowledgePipeline(llm, tmp_path, Embedding(), "model")
     unit = {"history_id": "h1", "kind": "conversation", "status": "completed", "events": evidence(), "selected_turns": []}
@@ -231,7 +232,7 @@ async def test_failed_learning_keeps_memory_for_retry(tmp_path):
     class LLM:
         async def chat(self, **kwargs):
             if kwargs["tag"].endswith("retain"):
-                yield SimpleNamespace(type="text_delta", content=json.dumps({"memories": [package()]}))
+                yield SimpleNamespace(type="text_delta", content=json.dumps(quoted_memory_response({"memories": [package()]}, kwargs['messages'])))
             else:
                 yield SimpleNamespace(type="error", error="interrupted")
     pipeline = KnowledgePipeline(LLM(), tmp_path, Embedding(), "model")
@@ -247,18 +248,18 @@ async def test_same_direction_updates_memory_and_direct_insight(tmp_path):
         async def chat(self, **kwargs):
             tag = kwargs["tag"]
             if tag.endswith("retain"):
-                response = {"memories": [package(facts=[{"domain": "writing", "claim": "恢复舒缓",
+                response = {"memories": [package(statements=[{"classifications": [{"domain": "writing", "categories": ["polishing"]}], "claim": "恢复舒缓",
                                                        "source_event_ids": ["ev2"]}])]}
             elif tag.endswith("match"):
                 prior = pipeline.store("p").list(("memory",))[0]
                 merged = deepcopy(prior["payload"])
                 merged["result"] = "再次调整后自然衔接"
-                merged["facts"].append({"domain": "writing", "claim": "再次恢复舒缓", "source_event_ids": ["ev2"]})
+                merged["statements"].append({"classifications": [{"domain": "writing", "categories": ["polishing"]}], "claim": "再次恢复舒缓", "source_event_ids": ["ev2"]})
                 response = {"action": "update", "memory_id": prior["id"], "expected_version": prior["version"], "memory": merged}
             else:
                 current = pipeline.store("p").get(memory["id"])
                 response = {"insights": [{"id": insight["id"], "expected_version": 1, "payload": learned(current)}], "withdrawals": []}
-            yield SimpleNamespace(type="text_delta", content=json.dumps(response))
+            yield SimpleNamespace(type="text_delta", content=json.dumps(quoted_memory_response(response, kwargs['messages'])))
     pipeline = KnowledgePipeline(LLM(), tmp_path, Embedding(), "model")
     store = pipeline.store("p")
     memory = save(store)
@@ -269,7 +270,7 @@ async def test_same_direction_updates_memory_and_direct_insight(tmp_path):
     current = store.get(memory["id"])
     assert current["version"] == 2 and len(store.list(("memory",))) == 1
     assert {e["history_id"] for e in current["evidence"]} == {"h1", "h2"}
-    assert current["payload"]["facts"][0]["fact_id"] == memory["payload"]["facts"][0]["fact_id"]
+    assert current["payload"]["statements"][0]["statement_id"] == memory["payload"]["statements"][0]["statement_id"]
     assert store.get(insight["id"])["payload"]["sources"][0]["version"] == 2
 
 
@@ -280,7 +281,7 @@ async def test_partial_facts_and_supplemented_history_update(tmp_path):
     class LLM:
         async def chat(self, **kwargs):
             if kwargs["tag"].endswith("retain"):
-                response = {"memories": [package(facts=[{"domain": "writing", "claim": "用户要求舒缓",
+                response = {"memories": [package(statements=[{"classifications": [{"domain": "writing", "categories": ["polishing"]}], "claim": "用户要求舒缓",
                     "source_event_ids": [event_id]}], completion="partial", unresolved="正文尚未调整")]}
             elif kwargs["tag"].endswith("match"):
                 prior = pipeline.store("p").list(("memory",))[0]
@@ -288,7 +289,7 @@ async def test_partial_facts_and_supplemented_history_update(tmp_path):
                             "memory": {**prior["payload"], "completion": "complete", "result": "已恢复"}}
             else:
                 response = {"insights": [], "withdrawals": []}
-            yield SimpleNamespace(type="text_delta", content=json.dumps(response))
+            yield SimpleNamespace(type="text_delta", content=json.dumps(quoted_memory_response(response, kwargs['messages'])))
     history = DocumentHistoryStore(tmp_path/"p")
     history.start_request("r", "s", "恢复舒缓")
     history.close_request("r", "interrupted", "尚未写入", session_turn_no=1)
@@ -329,7 +330,7 @@ async def test_temporal_route_can_expand_without_semantic_or_keyword_hits(tmp_pa
         async def encode(self, texts):
             return [[0, 1, 0] for _ in texts]
     store = KnowledgeStore(tmp_path)
-    one = save(store, "甲", facts=[{"domain": "content", "claim": "事件甲", "source_event_ids": ["ev1"],
+    one = save(store, "甲", statements=[{"classifications": [{"domain": "content", "categories": ["setting"]}], "claim": "事件甲", "source_event_ids": ["ev1"],
                                   "times": [{"dimension": "chapter", "start": "1.2.1"}]}])
     two = save(store, "乙", relations=[{"kind": "temporal", "predicate": "after", "target_id": one["id"],
         "target_version": 1, "source_event_ids": ["ev1"]}])
@@ -375,21 +376,21 @@ def test_api_lists_new_and_legacy_separately_and_reads_versions(tmp_path):
     app.include_router(router)
     with TestClient(app) as client:
         rows = client.get("/api/projects/p/memories").json()
-        assert rows[0]["schema"] == "knowledge_v1" and rows[0]["version"] == 2
+        assert rows[0]["schema"] == "knowledge_v2" and rows[0]["version"] == 2
         assert client.get(f"/api/projects/p/knowledge/{one['id']}?version=1").json()["version"] == 1
         assert client.post(f"/api/projects/p/memory/{one['id']}/downgrade").status_code == 409
 
 
 def test_internal_causality_resolves_new_fact_ids_and_entity_identity(tmp_path):
     store = KnowledgeStore(tmp_path)
-    facts = [{"fact_id": f"new:{i}", "domain": "content", "claim": text, "source_event_ids": ["ev1"],
+    statements = [{"statement_id": f"new:{i}", "classifications": [{"domain": "content", "categories": ["setting"]}], "claim": text, "source_event_ids": ["ev1"],
               "entities": [{"name": "林舟", "kind": "person"}]} for i, text in [(1, "家人遭威胁"), (2, "主动调查")]]
-    record = save(store, facts=facts, relations=[{"kind": "causal", "predicate": "causes", "target_version": 1,
-        "source_fact_id": "new:1", "target_fact_id": "new:2", "domains": ["content"], "source_event_ids": ["ev1"]}])
+    record = save(store, statements=statements, relations=[{"kind": "causal", "predicate": "causes", "target_version": 1,
+        "source_statement_id": "new:1", "target_statement_id": "new:2", "domains": ["content"], "source_event_ids": ["ev1"]}])
     relation = record["payload"]["relations"][0]
     assert relation["target_id"] == record["id"]
-    assert relation["source_fact_id"].startswith("fact_") and relation["target_fact_id"].startswith("fact_")
-    assert len({f["entities"][0]["entity_id"] for f in record["payload"]["facts"]}) == 1
+    assert relation["source_statement_id"].startswith("statement_") and relation["target_statement_id"].startswith("statement_")
+    assert len({f["entities"][0]["entity_id"] for f in record["payload"]["statements"]}) == 1
 
 
 def test_explicit_validity_is_not_inferred_from_source_event_time(tmp_path):

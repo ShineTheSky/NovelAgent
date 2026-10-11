@@ -5,6 +5,7 @@ import difflib
 import json
 import re
 import logging
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +16,8 @@ from novelagent.core.llm_turn import build_assistant_message
 from novelagent.history import DocumentHistoryStore
 from novelagent.memory.knowledge_store import KnowledgeStore, fingerprint
 from novelagent.memory.history_input import HistoryBodyReferences
-from novelagent.memory.models import MemoryPackage, MemoryExtractionPackage, Insight, retrieval_text, TimeAnchor
+from novelagent.memory.evidence_text import excerpt_matches, user_excerpt_matches, event_quote_matches
+from novelagent.memory.models import MemoryPackage, MemoryExtractionPackage, Insight, GraphRelation, retrieval_text, TimeAnchor, require_classifications, exclude_dispatch_entities
 from novelagent.memory.retrieval import KnowledgeRetrieval
 from novelagent.trace.agent_run import AgentRunTrace
 from novelagent.llm.json_output import json_object
@@ -24,7 +26,7 @@ from novelagent.tools.base import ToolContext
 from novelagent.tools.search_memory import ReadHistoryTool
 from novelagent.memory.extraction_prompts import (
     RETAIN_CONTRACT_VERSION, MEMORY_RETAIN_PROMPT, MEMORY_MATCH_PROMPT, INSIGHT_CONSOLIDATE_PROMPT,
-    ENTITY_IDENTITY_RULES,
+    ENTITY_IDENTITY_RULES, MEMORY_GRAPH_PROMPT,
 )
 
 
@@ -72,6 +74,7 @@ class KnowledgePipeline:
                                      for e in error.errors(include_input=False)]
             return {"role": "user", "content": "上一轮输出未通过程序校验，请根据以下错误修正，并重新输出完整 JSON。"
                 "版本号和路径由程序按来源事件补填，fragments 只输出 source_event_id/before/after；"
+                "source_event_quotes 必须为每个引用事件提供相关连续原文，不能用摘要、字段名或猜测 ID 代替；"
                 "选择真正对应片段的事件，不能用无关 Edit 代替。缺少原文时保留模型提取的 fragment，"
                 "不要改写真实原文或编造版本。错误信息是诊断数据，不是创作指令。\n校验详情："
                 + json.dumps(details, ensure_ascii=False)}
@@ -82,6 +85,8 @@ class KnowledgePipeline:
             route = {"provider": config.provider, "model": config.model, "base_url": config.base_url,
                      "temperature": config.temperature, "reasoning_effort": config.reasoning_effort}
             anthropic = config.is_anthropic
+            if stage == "retain" and getattr(config, "wire_api", "") == "responses" and not anthropic:
+                route["reasoning_summary"] = "auto"
         reader = ReadHistoryTool(self) if stage == "retain" else None
         tools = None
         if reader:
@@ -99,12 +104,28 @@ class KnowledgePipeline:
                 "session_id": f"knowledge:{project_id}", "trace_ids": [trace.trace_id if trace else request_id],
                 "bad_case_details": {"request_id": request_id, "error_kind": kind,
                     **getattr(error, "details", {}), **details}, "messages": messages}, error, stage)
+        async def record_repairs(repairs, turn):
+            for repair in repairs or []:
+                if trace:
+                    trace.add("event_reference_correction", {"stage": stage, "turn": turn, **repair})
+                self.store(project_id).audit({"stage": stage, "request_id": request_id,
+                    "trace_id": trace.trace_id if trace else "", "event_reference_correction": repair})
+                await record_error(MemoryValidationError("Event reference corrected by unique excerpt", **repair),
+                    "reference_correction", turn=turn)
         cached = self.store(project_id).model_result(request_id)
         if cached:
             try:
                 result = json_object(cached["response"])
-                if validate:
-                    validate(result)
+                repairs = validate(result) if validate else None
+                if repairs and self.trace_store:
+                    trace = await AgentRunTrace.try_start(self.trace_store, session_id=f"knowledge:{project_id}",
+                        project_id=project_id, actor="knowledge:"+stage, position="memory_summary_fallback",
+                        title="[knowledge] cached "+stage)
+                    if trace:
+                        trace.add("cached_response", {"request_id": request_id, "response": cached["response"]})
+                await record_repairs(repairs, 0)
+                if trace:
+                    await trace.finish("completed", cached["response"])
                 return result
             except (ValueError, TypeError, KeyError) as exc:
                 await record_error(exc, "cached_validation")
@@ -133,11 +154,12 @@ class KnowledgePipeline:
                                       messages=messages, tools=active_tools)
                 text, reasoning, calls = [], [], []
                 async for chunk in self.llm.chat(position="memory_summary_fallback", messages=messages, tools=active_tools,
-                                               stream=False, tag=":knowledge/"+stage,
+                                               stream=True, tag=":knowledge/"+stage,
                                                json_mode=True,
                                                bad_case_context={"project_id": project_id, "history_id": history_id,
                                                                  "session_id": f"knowledge:{project_id}",
                                                                  "source_trace_id": trace.trace_id if trace else ""},
+                                               **({"reasoning_summary": "auto"} if stage == "retain" else {}),
                                                max_tokens=self.config.get("analysis_output_tokens", 16384)):
                     if chunk.type == "error":
                         raise RuntimeError(chunk.error or "Knowledge analysis failed")
@@ -162,8 +184,7 @@ class KnowledgePipeline:
                 if not calls:
                     try:
                         result = json_object("".join(text))
-                        if validate:
-                            validate(result)
+                        repairs = validate(result) if validate else None
                     except (ValueError, TypeError, KeyError) as exc:
                         last_error = str(exc)
                         correction = feedback(exc, max_turns - turn - 1)
@@ -174,6 +195,7 @@ class KnowledgePipeline:
                         await record_error(exc, "validation", turn=turn + 1,
                             remaining_turns=max_turns - turn - 1, feedback=correction["content"])
                         continue
+                    await record_repairs(repairs, turn + 1)
                     chunks.extend(text)
                     return
                 assistant = build_assistant_message("".join(text), "".join(reasoning), calls, turn)
@@ -331,39 +353,21 @@ class KnowledgePipeline:
 
     @staticmethod
     def _quote_matches(text, event):
-        def normalize(value):
-            value = value.translate(str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"}))
-            return re.sub(r"\\+([\"'])", r"\1", value)
-        quote = normalize(text)
-        if quote in normalize(event["content"]):
-            return True
         if event["kind"] == "user_answer":
-            try:
-                answers = json.loads(event["content"])
-            except (TypeError, ValueError):
-                return False
-            def contains(value):
-                if isinstance(value, str):
-                    return quote in normalize(value)
-                if isinstance(value, list):
-                    return any(contains(item) for item in value)
-                if isinstance(value, dict):
-                    return any(contains(item) for item in value.values())
-                return False
-            return contains(answers)
-        return False
+            return user_excerpt_matches(text, event["content"])
+        return excerpt_matches(text, event["content"])
 
     @staticmethod
     def _validate_package(payload, evidence):
-        package = MemoryPackage.model_validate(payload).model_dump()
+        package = exclude_dispatch_entities(MemoryPackage.model_validate(payload).model_dump())
         by_id = {e["event_id"]: e for e in evidence}
-        for index, fact in enumerate(package["facts"], 1):
+        for index, fact in enumerate(package["statements"], 1):
             # Keep the extraction's local identities when an old package is prepended during matching.
-            if not fact['fact_id']:
-                fact['fact_id'] = f'new:{index}'
+            if not fact['statement_id']:
+                fact['statement_id'] = f'new:{index}'
             if set(fact["source_event_ids"]) - by_id.keys():
                 raise MemoryValidationError("Memory cites unavailable History evidence",
-                    location=f"facts[{index-1}].source_event_ids",
+                    location=f"statements[{index-1}].source_event_ids",
                     unavailable_ids=sorted(set(fact["source_event_ids"]) - by_id.keys()),
                     correction="引用给定 History 的真实事件 ID，不复制 Trace ID 或编造新事件")
         for index, relation in enumerate(package["relations"]):
@@ -371,10 +375,10 @@ class KnowledgePipeline:
                 raise MemoryValidationError("Relation cites unavailable History evidence",
                     location=f"relations[{index}].source_event_ids",
                     unavailable_ids=sorted(set(relation["source_event_ids"]) - by_id.keys()))
-        for index, change in enumerate(package["fact_changes"]):
+        for index, change in enumerate(package["statement_changes"]):
             if set(change["source_event_ids"]) - by_id.keys():
-                raise MemoryValidationError("Fact change cites unavailable History evidence",
-                    location=f"fact_changes[{index}].source_event_ids",
+                raise MemoryValidationError("MemoryStatement change cites unavailable History evidence",
+                    location=f"statement_changes[{index}].source_event_ids",
                     unavailable_ids=sorted(set(change["source_event_ids"]) - by_id.keys()))
         if package["source_text"] and not any(KnowledgePipeline._quote_matches(package["source_text"], e)
                                               for e in evidence if e["kind"] in {"user_input", "user_answer"}):
@@ -384,17 +388,17 @@ class KnowledgePipeline:
         for path in package["artifact_paths"]:
             if ".." in Path(path).parts or Path(path).is_absolute():
                 raise ValueError("Memory artifact path escapes project")
-        for fact in package["facts"]:
+        for fact in package["statements"]:
             if any(t["dimension"] == "chapter" for t in fact["times"]):
                 continue
             explicit = fact["attributes"].get("artifact_paths", [])
             if not isinstance(explicit, list) or any(not isinstance(p, str) or p not in package["artifact_paths"] for p in explicit):
-                raise ValueError("Fact scope references an unrelated artifact")
+                raise ValueError("MemoryStatement scope references an unrelated artifact")
             paths = set(explicit) | {by_id[eid].get("scope", {}).get("path", "") for eid in fact["source_event_ids"]}
             paths &= set(package["artifact_paths"])
             if not paths and len(package["artifact_paths"]) == 1:
                 paths = set(package["artifact_paths"])
-            # Multi-file facts without a precise scope must not inherit the first file's position.
+            # Multi-file statements without a precise scope must not inherit the first file's position.
             for path in sorted(paths):
                 position = re.search(r"(?:content_|outline_)(\d+\.\d+\.\d+)\.md$", path)
                 if position:
@@ -434,7 +438,7 @@ class KnowledgePipeline:
             for field, parameter in fields:
                 if selection[field] and not isinstance(params.get(parameter), str):
                     event_verified = False
-                elif selection[field] and selection[field] not in params[parameter]:
+                elif selection[field] and not excerpt_matches(selection[field], params[parameter]):
                     raise MemoryValidationError(f"Memory fragment does not match its cited {tool}",
                         field=field, source_event_id=selection["source_event_id"], path=path,
                         supplied_text=selection[field], expected_source_field="params." + parameter,
@@ -443,8 +447,73 @@ class KnowledgePipeline:
         return {**selection, "path": path.replace("\\", "/"), "revision_id": revision_id,
                 "previous_revision_id": previous_id, "verification": "event_verified" if event_verified else "model_trusted"}
 
-    def _model_package(self, project_id, payload, evidence):
-        package = MemoryExtractionPackage.model_validate(payload).model_dump()
+    @staticmethod
+    def _resolve_event_quotes(package, evidence, corrections):
+        referenced = {eid for field in ("statements", "relations", "statement_changes")
+                      for item in package[field] for eid in item["source_event_ids"]}
+        fragment_ids = {f["source_event_id"] for f in package["fragments"]}
+        referenced |= fragment_ids
+        quotes = package.pop("source_event_quotes")
+        quoted = {q["event_id"] for q in quotes}
+        if referenced != quoted:
+            raise MemoryValidationError("Event quote table must cover exactly the cited events",
+                location="source_event_quotes", missing_ids=sorted(referenced - quoted), unused_ids=sorted(quoted - referenced))
+        by_id = {e["event_id"]: e for e in evidence}
+        resolved = {}
+        for index, quote in enumerate(quotes):
+            event_id, excerpt = quote["event_id"], quote["excerpt"]
+            def eligible(event):
+                if event_id not in fragment_ids:
+                    return True
+                if event["kind"] == "document_reference":
+                    return True
+                if event["kind"] != "file_change_attempt":
+                    return False
+                try:
+                    value = json.loads(event["content"])
+                    return isinstance(value, dict) and value.get("success") is True and value.get("tool") in {"Edit", "Write"}
+                except (TypeError, ValueError):
+                    return False
+            def matches(event):
+                return event_quote_matches(excerpt, event["content"])
+            original = by_id.get(event_id)
+            if original and eligible(original) and matches(original):
+                selected = original
+            else:
+                candidates = [e for e in evidence if eligible(e) and matches(e)]
+                if len(candidates) != 1:
+                    raise MemoryValidationError("Event excerpt has no unique allowed source",
+                        location=f"source_event_quotes[{index}]", supplied_id=event_id, supplied_text=excerpt,
+                        minimum_similarity=.90,
+                        status="ambiguous" if candidates else "missing",
+                        candidates=[{"event_id": e["event_id"], "kind": e["kind"], "content_preview": e["content"][:240]}
+                                    for e in candidates])
+                selected = candidates[0]
+            if event_id in resolved and resolved[event_id] != selected["event_id"]:
+                raise MemoryValidationError("Quotes for the same event ID resolve to different events",
+                    location=f"source_event_quotes[{index}]", supplied_id=event_id,
+                    resolved_ids=[resolved[event_id], selected["event_id"]])
+            resolved[event_id] = selected["event_id"]
+            if event_id != selected["event_id"]:
+                corrections.append({"location": f"source_event_quotes[{index}]", "supplied_id": event_id,
+                    "corrected_id": selected["event_id"], "excerpt": excerpt, "kind": selected["kind"]})
+        for field in ("statements", "relations", "statement_changes"):
+            for item in package[field]:
+                item["source_event_ids"] = list(dict.fromkeys(resolved[eid] for eid in item["source_event_ids"]))
+        for fragment in package["fragments"]:
+            fragment["source_event_id"] = resolved[fragment["source_event_id"]]
+        return package
+
+    def _model_package(self, project_id, payload, evidence, *, require_event_quotes=False, corrections=None):
+        raw = deepcopy(payload)
+        has_quotes = isinstance(raw, dict) and "source_event_quotes" in raw
+        if isinstance(raw, dict) and not require_event_quotes and not has_quotes:
+            raw["source_event_quotes"] = []  # Compatibility for already saved/offline packages only.
+        package = MemoryExtractionPackage.model_validate(raw).model_dump()
+        if has_quotes or require_event_quotes:
+            package = self._resolve_event_quotes(package, evidence, corrections if corrections is not None else [])
+        else:
+            package.pop("source_event_quotes")
         for index, fragment in enumerate(package["fragments"]):
             try:
                 package["fragments"][index] = self._bind_fragment(project_id, fragment, evidence)
@@ -453,20 +522,26 @@ class KnowledgePipeline:
                 raise
         return self._validate_package(package, evidence)
 
-    def _checked_model_package(self, project_id, payload, evidence, allowed_paths, location):
+    def _checked_model_package(self, project_id, payload, evidence, allowed_paths, location, *, require_event_quotes=True, corrections=None):
+        repair_start = len(corrections) if corrections is not None else 0
         try:
-            package = self._model_package(project_id, payload, evidence)
+            package = self._model_package(project_id, payload, evidence, require_event_quotes=require_event_quotes, corrections=corrections)
             if set(package["artifact_paths"]) - allowed_paths:
                 raise MemoryValidationError("Memory references an unrelated artifact", field="artifact_paths",
                     supplied_paths=package["artifact_paths"], allowed_paths=sorted(allowed_paths))
             self._validate_fragments(project_id, package, set(package["artifact_paths"]), evidence)
         except (ValueError, TypeError, KeyError) as exc:
             details = dict(getattr(exc, "details", {}))
+            if corrections:
+                details["reference_repairs"] = list(corrections)
             details["location"] = location + ("." + details["location"] if details.get("location") else "")
             if isinstance(exc, ValidationError):
                 details["errors"] = [{"location": list(e["loc"]), "message": e["msg"], "type": e["type"]}
                                      for e in exc.errors(include_input=False)]
             raise MemoryValidationError(str(exc), **details) from exc
+        finally:
+            for repair in (corrections or [])[repair_start:]:
+                repair["location"] = location + "." + repair["location"]
         return package
 
     def _validate_fragments(self, project_id, package, allowed_paths, evidence=()):
@@ -486,7 +561,7 @@ class KnowledgePipeline:
                 raise MemoryValidationError("Memory fragment cannot be verified against the saved document version", **details,
                     status="missing" if not revision else "path_mismatch", allowed_paths=sorted(allowed_paths),
                     correction="片段引用的文件与允许范围或存档版本不匹配；引用对应事件，不能用当前文件代替")
-            if revision and fragment["after"] and fragment["after"] not in revision["body_md"]:
+            if revision and fragment["after"] and not excerpt_matches(fragment["after"], revision["body_md"]):
                 raise MemoryValidationError("Memory fragment cannot be verified against the saved document version", **details,
                     field="after", supplied_text=fragment["after"],
                     correction="after 在该存档版本中不存在；用 ReadHistory 核对原文，保持逐字一致，不复制其他版本的片段")
@@ -496,7 +571,7 @@ class KnowledgePipeline:
                     expected_parent_revision_id=revision["parent_revision_id"] if revision else "",
                     previous_version_status="available" if previous else "missing",
                     correction="事件的修改前版本与存档父版本无法核验；不要猜版本号，移除此不可核验的 fragment")
-            if previous and fragment["before"] and fragment["before"] not in previous["body_md"]:
+            if previous and fragment["before"] and not excerpt_matches(fragment["before"], previous["body_md"]):
                 raise MemoryValidationError("Memory before fragment cannot be verified", **details,
                     field="before", supplied_text=fragment["before"],
                     correction="before 在对应旧版本中不存在；核对旧版本真实原文或移除该 fragment")
@@ -507,7 +582,7 @@ class KnowledgePipeline:
         pending = []
         targets = []
         resolved_aliases = {} if resolved_aliases is None else resolved_aliases
-        for fact in package["facts"]:
+        for fact in package["statements"]:
             for entity in fact["entities"]:
                 alias = entity['entity_id'] if re.fullmatch(r'new:entity:\d+', entity['entity_id']) else ''
                 if alias in resolved_aliases:
@@ -571,11 +646,19 @@ class KnowledgePipeline:
                 if not prepared:
                     allowed_paths = self._allowed_paths(unit, evidence, artifacts)
                     def validate_retain(result):
+                        corrections = []
                         if not isinstance(result.get("memories"), list):
                             raise MemoryValidationError("Retain response missing memories list", location="memories",
                                 correction='输出 {"memories": [...]}，不要返回其他顶层结构')
                         for index, payload in enumerate(result["memories"]):
-                            self._checked_model_package(project_id, payload, evidence, allowed_paths, f"memories[{index}]")
+                            package = self._checked_model_package(project_id, payload, evidence, allowed_paths, f"memories[{index}]",
+                                require_event_quotes=True, corrections=corrections)
+                            for position, statement in enumerate(package["statements"]):
+                                try:
+                                    require_classifications(statement)
+                                except ValueError as exc:
+                                    raise MemoryValidationError(str(exc), location=f"memories[{index}].statements[{position}].classifications") from exc
+                        return corrections
                     bodies = HistoryBodyReferences(DocumentHistoryStore(self.workspace_dir / project_id))
                     context = bodies.context(unit.get("review_workflow", {}).get("context", []))
                     input_events, input_artifacts = bodies.events(evidence), bodies.artifacts(artifacts)
@@ -603,16 +686,22 @@ class KnowledgePipeline:
                     allowed_paths = self._allowed_paths(unit, evidence, artifacts)
                     if set(package["artifact_paths"]) - allowed_paths:
                         raise ValueError("Memory references an unrelated artifact")
-                    recall = await self.retrieval(project_id).recall(retrieval_text("memory", package), purpose="memory_match")
-                    if recall["status"] in {"failed", "timeout"}:
-                        raise RuntimeError(recall.get("error", "Memory matching failed"))
+                    indexed_text = retrieval_text("memory", package)
+                    vector = (await self.embedding.encode([indexed_text]))[0]
+                    candidates_by_vector = await self.retrieval(project_id).vector_candidates(vector,
+                        limit=self.config.get("memory_vector_top_k", 20),
+                        exclude=[e["id"] for e in entries if e.get("id")])
+                    high_similarity = [i for i in candidates_by_vector
+                                       if i["similarity"] > self.config.get("memory_merge_similarity", .97)]
+                    recall = {"items": high_similarity}
                     record_id, expected = "", 0
                     combined_evidence = evidence
                     if recall["items"]:
                         candidates = [{"id": r["record"]["id"], "version": r["record"]["version"], "payload": r["record"]["payload"],
-                                       "evidence": r["record"]["evidence"]}
+                                       "evidence": r["record"]["evidence"], "similarity": r["similarity"]}
                                       for r in recall["items"]]
                         def validate_match(result):
+                            corrections = []
                             action = result.get("action")
                             if action == "defer":
                                 return
@@ -631,7 +720,9 @@ class KnowledgePipeline:
                                 raise MemoryValidationError("Unknown Memory match action", location="action",
                                     supplied_action=action, expected_actions=["new", "update", "defer"])
                             if action == "update" or result.get("memory") is not None:
-                                self._checked_model_package(project_id, result.get("memory"), match_evidence, match_paths, "memory")
+                                self._checked_model_package(project_id, result.get("memory"), match_evidence, match_paths, "memory",
+                                    require_event_quotes=True, corrections=corrections)
+                            return corrections
                         decision = await self._call(project_id,
                             MEMORY_MATCH_PROMPT + "\nSchema:" + json.dumps(MemoryExtractionPackage.model_json_schema(), ensure_ascii=False)
                             + "\nNew:" + json.dumps(package, ensure_ascii=False)
@@ -655,19 +746,21 @@ class KnowledgePipeline:
                             if set(package["artifact_paths"]) - allowed_paths:
                                 raise ValueError("New Memory references an unrelated artifact")
                     await self._resolve_entities(project_id, package, combined_evidence, resolved_aliases)
-                    vector = (await self.embedding.encode([retrieval_text("memory", package)]))[0]
+                    # Matching/entity resolution may have changed the indexed text.
+                    if retrieval_text("memory", package) != indexed_text:
+                        vector = (await self.embedding.encode([retrieval_text("memory", package)]))[0]
                     self._validate_fragments(project_id, package, set(package["artifact_paths"]), combined_evidence)
-                    referenced = {eid for f in package["facts"] for eid in f["source_event_ids"]}
+                    referenced = {eid for f in package["statements"] for eid in f["source_event_ids"]}
                     referenced.update(f["source_event_id"] for f in package["fragments"] if f.get("source_event_id"))
                     referenced.update(eid for r in package["relations"] for eid in r["source_event_ids"])
-                    referenced.update(eid for c in package["fact_changes"] for eid in c["source_event_ids"])
+                    referenced.update(eid for c in package["statement_changes"] for eid in c["source_event_ids"])
                     combined_evidence = [e for e in combined_evidence if e["event_id"] in referenced
                                          or (package["source_text"] and e["kind"] in {"user_input", "user_answer"}
                                              and self._quote_matches(package["source_text"], e))]
                     entries.append({"payload": package, "evidence": combined_evidence, "vector": vector,
                                     "model_id": self.model_id, "id": record_id, "expected_version": expected,
                                     "operation_id": operation_id, "batch_id": f"new:{index+1}"})
-                store.save_memories(entries)
+                store.save_memories(entries, build_graph=True)
                 store.input_state(unit["history_id"], digest, status="complete", error="")
             except DirectionDeferred as exc:
                 store.input_state(unit["history_id"], digest, status="deferred", error=str(exc))
@@ -684,31 +777,146 @@ class KnowledgePipeline:
 
     async def consolidate_pending(self, project_id, *, retry_failed=False):
         async with self._locks.setdefault(project_id, asyncio.Lock()):
-            for job in self.store(project_id).jobs():
+            store = self.store(project_id)
+            for job in store.jobs():
+                graph_job = store.graph_job(job["id"], job["version"])
+                if graph_job and graph_job["status"] != "complete":
+                    if graph_job["status"] == "superseded" or (graph_job["status"] == "failed" and not retry_failed):
+                        continue
+                    try:
+                        await self._build_memory_graph(project_id, graph_job)
+                    except Exception as exc:
+                        for rid, version in graph_job["peers"]:
+                            store.fail_graph_job(rid, version, exc)
+                        await self.capture_failure(project_id, {"history_id": job["id"]}, exc, "memory_graph")
+                        continue
+            for job in store.jobs():
+                current = next((j for j in store.jobs() if j["id"] == job["id"] and j["version"] == job["version"]), None)
+                if not current:
+                    continue  # A preceding batch consolidation may already have completed this job.
+                job = current
+                graph_job = store.graph_job(job["id"], job["version"])
+                if graph_job and graph_job["status"] != "complete":
+                    continue
                 if job["status"] == "failed" and not retry_failed:
                     continue
                 try:
                     await self._consolidate(project_id, job)
                 except Exception as exc:
-                    self.store(project_id).fail_job(job["id"], job["version"], str(exc))
+                    for rid, version in (graph_job["peers"] if graph_job else [(job["id"], job["version"])]):
+                        store.fail_job(rid, version, str(exc))
                     await self.capture_failure(project_id, {"history_id": job["id"]}, exc, "consolidation")
+
+    async def _build_memory_graph(self, project_id, job):
+        store = self.store(project_id)
+        source = store.get(job["id"], job["version"])
+        memories = {source["id"]: source}
+        new_ids = {source["id"]}
+        for rid, version in job["peers"]:
+            peer = store.get(rid)
+            if peer and peer["version"] == version:
+                memories[rid] = peer
+                new_ids.add(rid)
+        new_versions = {rid: memories[rid]["version"] for rid in sorted(new_ids)}
+        candidates_by_id, time_edges = {}, []
+        for rid in sorted(new_ids):
+            memory = memories[rid]
+            candidates = await self.retrieval(project_id).vector_candidates(
+                np.frombuffer(memory["vector"], dtype=np.float32),
+                limit=self.config.get("memory_vector_top_k", 20), exclude=new_ids)
+            for item in candidates:
+                key = item["record"]["id"]
+                if key not in candidates_by_id or item["similarity"] > candidates_by_id[key]["similarity"]:
+                    candidates_by_id[key] = item
+                memories[key] = item["record"]
+            time_edges.extend(store.time_relations(rid, memory["version"],
+                window_hours=self.config.get("memory_time_window_hours", 24),
+                neighbors=self.config.get("memory_time_neighbors", 8)))
+        candidates = list(candidates_by_id.values())
+        response = {"relations": []}
+        if len(memories) > 1:
+            def validate_graph(result):
+                if not isinstance(result.get("relations"), list):
+                    raise MemoryValidationError("Graph response missing relations list", location="relations")
+                for index, raw in enumerate(result["relations"]):
+                    edge = GraphRelation.model_validate(raw)
+                    owner, target = memories.get(edge.owner_id), memories.get(edge.target_id)
+                    location = f"relations[{index}]"
+                    if not owner or not target or edge.owner_version != owner["version"] or edge.target_version != target["version"]:
+                        raise MemoryValidationError("Graph edge must use given Memory IDs and versions", location=location,
+                            candidates=[{"id": r["id"], "version": r["version"]} for r in memories.values()])
+                    if not ({owner["id"], target["id"]} & new_ids):
+                        raise MemoryValidationError("Graph edge must touch a New Memory", location=location)
+                    if edge.kind not in {"semantic", "causal"} or (edge.kind == "semantic" and edge.predicate != "related"):
+                        raise MemoryValidationError("Graph model only adds semantic/related or causal edges", location=location)
+                    statements = [f for r in (owner, target) for f in r["payload"]["statements"]
+                             if f["status"] == "active"]
+                    for memory, fid in ((owner, edge.source_statement_id), (target, edge.target_statement_id)):
+                        if not fid or not any(f["statement_id"] == fid and f["status"] == "active" for f in memory["payload"]["statements"]):
+                            raise MemoryValidationError("Graph edge needs active endpoint statements", location=location,
+                                supplied_fact_id=fid, memory_id=memory["id"])
+                    if owner["id"] == target["id"] and edge.source_statement_id == edge.target_statement_id:
+                        raise MemoryValidationError("Self relation is not evidence", location=location)
+                    events = {eid for f in statements if f["statement_id"] in {edge.source_statement_id, edge.target_statement_id}
+                              for eid in f["source_event_ids"]}
+                    if set(edge.source_event_ids) - events:
+                        raise MemoryValidationError("Graph edge cites unrelated events", location=location,
+                            allowed_event_ids=sorted(events))
+            response = await self._call(project_id, MEMORY_GRAPH_PROMPT + "\nSchema:"
+                + json.dumps(GraphRelation.model_json_schema(), ensure_ascii=False)
+                + "\nNew:" + json.dumps(sorted(new_ids))
+                + "\nCandidates:" + json.dumps([{"id": i["record"]["id"], "similarity": i["similarity"]} for i in candidates])
+                + "\nMemories:" + json.dumps([{k: r[k] for k in ("id", "version", "payload", "evidence")}
+                                             for r in memories.values()], ensure_ascii=False),
+                "memory_graph", validate=validate_graph, history_id=source["id"])
+        for edge in time_edges:
+            target = store.get(edge["target_id"])
+            if target:
+                memories[target["id"]] = target
+        relations = [GraphRelation.model_validate(r).model_dump() for r in response["relations"]] + time_edges
+        store.finish_graph_job(source["id"], source["version"], relations,
+            {rid: r["version"] for rid, r in memories.items()}, completed_jobs=new_versions)
 
     async def _consolidate(self, project_id, job, extra_existing=None, coordination_round=0):
         store = self.store(project_id)
         source = store.get(job["id"], job["version"])
-        recall = await self.retrieval(project_id).recall(retrieval_text("memory", source["payload"]), purpose="knowledge_reconcile")
-        if recall["status"] in {"failed", "timeout"}:
-            raise RuntimeError(recall.get("error", "Knowledge reconciliation failed"))
-        existing = {r["id"]: r for r in [*store.derived(source["id"]), *(i["record"] for i in recall["items"]),
-                                        *(extra_existing or {}).values()]}
-        sources = {source["id"]: source}
+        new_sources = {source["id"]: source}
+        graph_job = store.graph_job(source["id"], source["version"])
+        if graph_job and graph_job["status"] == "complete":
+            pending = {(j["id"], j["version"]) for j in store.jobs()
+                       if j["status"] == "pending" or job["status"] == "failed"}
+            for rid, version in graph_job["peers"]:
+                if (rid, version) in pending:
+                    new_sources[rid] = store.get(rid, version)
+        direct, existing = {}, dict(extra_existing or {})
+        for memory in new_sources.values():
+            recall = await self.retrieval(project_id).recall(retrieval_text("memory", memory["payload"]), purpose="knowledge_reconcile")
+            if recall["status"] in {"failed", "timeout"}:
+                raise RuntimeError(recall.get("error", "Knowledge reconciliation failed"))
+            direct.update({r["id"]: r for r in store.derived(memory["id"])})
+            existing.update({i["record"]["id"]: i["record"] for i in recall["items"]})
+        existing.update(direct)
+        sources = {}
+        for memory in new_sources.values():
+            sources.update({r["id"]: r for r in store.related_memories(memory["id"], memory["version"],
+                                                                      limit=self.config.get("memory_vector_top_k", 20))})
+        sources.update(new_sources)
         for record in existing.values():
             for ref in record["payload"]["sources"]:
                 sources[ref["memory_id"]] = store.get(ref["memory_id"])
+        def validate_classifications(result):
+            if not isinstance(result.get("insights"), list) or not isinstance(result.get("withdrawals"), list):
+                raise ValueError("Consolidation response missing operations")
+            for index, proposal in enumerate(result["insights"]):
+                try:
+                    require_classifications(Insight.model_validate(proposal["payload"]).model_dump())
+                except ValueError as exc:
+                    raise MemoryValidationError(str(exc), location=f"insights[{index}].payload.classifications") from exc
+
         response = await self._call(project_id,
             INSIGHT_CONSOLIDATE_PROMPT + "\nSchema:"+json.dumps(Insight.model_json_schema(), ensure_ascii=False)+"\nMemories:"
             +json.dumps([{ "id":r["id"],"version":r["version"],"payload":r["payload"],"evidence":r["evidence"]} for r in sources.values()], ensure_ascii=False)
-            +"\nExisting:"+json.dumps([{ "id":r["id"],"version":r["version"],"layer":r["layer"],"payload":r["payload"]} for r in existing.values()], ensure_ascii=False), "consolidate")
+            +"\nExisting:"+json.dumps([{ "id":r["id"],"version":r["version"],"layer":r["layer"],"payload":r["payload"]} for r in existing.values()], ensure_ascii=False), "consolidate", validate=validate_classifications)
         if not isinstance(response.get("insights"), list) or not isinstance(response.get("withdrawals"), list):
             raise ValueError("Consolidation response missing operations")
         # Newly learned wording can find conflicts not visible from the source Memory.
@@ -728,7 +936,7 @@ class KnowledgePipeline:
                 raise ValueError("Insight coordination did not converge; old published knowledge remains active")
             return await self._consolidate(project_id, job, {**existing, **additional}, coordination_round+1)
         touched = {e.get("id") for e in response["insights"]} | set(response["withdrawals"])
-        if {r["id"] for r in store.derived(source["id"])} - touched:
+        if direct.keys() - touched:
             raise ValueError("Consolidation did not update all directly derived knowledge")
         if set(response["withdrawals"]) - existing.keys():
             raise ValueError("Cannot withdraw knowledge outside the reconciliation candidates")
@@ -743,10 +951,10 @@ class KnowledgePipeline:
                 memory = sources.get(ref["memory_id"])
                 if not memory or memory["version"] != ref["version"]:
                     raise ValueError("Insight source version is not the analyzed Memory")
-                fact_ids = set(ref["fact_ids"]) or {f["fact_id"] for f in memory["payload"]["facts"]}
-                if fact_ids - {f["fact_id"] for f in memory["payload"]["facts"]}:
-                    raise ValueError("Insight cites unknown facts")
-                ev_ids = {eid for f in memory["payload"]["facts"] if f["fact_id"] in fact_ids for eid in f["source_event_ids"]}
+                statement_ids = set(ref["statement_ids"]) or {f["statement_id"] for f in memory["payload"]["statements"]}
+                if statement_ids - {f["statement_id"] for f in memory["payload"]["statements"]}:
+                    raise ValueError("Insight cites unknown statements")
+                ev_ids = {eid for f in memory["payload"]["statements"] if f["statement_id"] in statement_ids for eid in f["source_event_ids"]}
                 evidence.extend(e for e in memory["evidence"] if e["event_id"] in ev_ids)
                 if ref["role"] == "support":
                     selected_events.extend(e for e in memory["evidence"] if e["event_id"] in ev_ids)
@@ -757,14 +965,14 @@ class KnowledgePipeline:
             if reviewer and not human:
                 payload["authority"], payload["human_confirmed"], payload["roles"] = "reviewer", False, ["reviewer"]
             if not selected_events:
-                raise ValueError("Insight has no supporting facts")
+                raise ValueError("Insight has no supporting statements")
             evidence = list({e["event_id"]: e for e in evidence}.values())
             vector = (await self.embedding.encode([retrieval_text("insight", payload)]))[0]
             entries.append({"id": raw.get("id", ""), "expected_version": raw.get("expected_version", 0),
                             "payload": payload, "evidence": evidence, "vector": vector, "model_id": self.model_id,
                             "replaces": raw.get("replaces", []), "replacement_reason": raw.get("replacement_reason", "")})
         store.publish_insights(entries, {rid:r["version"] for rid,r in sources.items()}, response["withdrawals"],
-                               completed_jobs={job["id"]: job["version"]},
+                               completed_jobs={rid: r["version"] for rid, r in new_sources.items()},
                                withdrawal_versions={rid: existing[rid]["version"] for rid in response["withdrawals"]})
 
     async def recover(self):

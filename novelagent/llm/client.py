@@ -67,6 +67,7 @@ class LLMClient:
         max_tokens: int | None = None,
         json_mode: bool = False,
         bad_case_context: dict | None = None,
+        reasoning_summary: str | None = None,
     ) -> AsyncIterator[LLMResponse]:
         self._log_tag = tag
         request_id = uuid.uuid4().hex
@@ -87,6 +88,7 @@ class LLMClient:
                     params={**context, "request_id": request_id, "position": position,
                             "sub_type": sub_type, "tag": tag, "error_kind": kind,
                             "attempt": attempt, "stream": stream,
+                            "reasoning_summary": reasoning_summary,
                             "provider": config.provider if config else "",
                             "model": config.model if config else "",
                             "wire_api": config.wire_api if config else "",
@@ -110,6 +112,8 @@ class LLMClient:
             if max_tokens is not None:
                 config = replace(config, max_tokens=max_tokens)
             body = self._build_request(config, messages, tools, stream)
+            if reasoning_summary and config.wire_api == "responses" and not config.is_anthropic:
+                body.setdefault("reasoning", {})["summary"] = reasoning_summary
             if json_mode and config.provider == "deepseek":
                 body["response_format"] = {"type": "json_object"}
             if json_mode and config.wire_api == "responses" and not config.is_anthropic:

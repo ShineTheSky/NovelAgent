@@ -9,13 +9,13 @@ import uuid
 import re
 from copy import deepcopy
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import numpy as np
 from pydantic import ValidationError
 
-from novelagent.memory.models import MemoryPackage, Insight, render_knowledge, time_key
+from novelagent.memory.models import MemoryPackage, Insight, GraphRelation, render_knowledge, time_key, knowledge_payload, normalize_statement_keys, exclude_dispatch_entities
 from novelagent.history.sources import root_history_ids
 
 INITIAL_KNOWLEDGE_WEIGHT = 65
@@ -82,6 +82,10 @@ class KnowledgeStore:
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT NOT NULL, version INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
                 error TEXT NOT NULL DEFAULT '', PRIMARY KEY(id,version));
+            CREATE TABLE IF NOT EXISTS graph_jobs (
+                id TEXT NOT NULL, version INTEGER NOT NULL, peers TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', error TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(id,version), FOREIGN KEY(id,version) REFERENCES versions(id,version));
             CREATE TABLE IF NOT EXISTS operations (
                 operation_id TEXT PRIMARY KEY, id TEXT NOT NULL, version INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS inputs (
@@ -116,16 +120,16 @@ class KnowledgeStore:
                 PRIMARY KEY(id,version,previous_fact_id,current_fact_id),
                 FOREIGN KEY(id,version) REFERENCES versions(id,version));
         """)
-        # Backfill only structural metadata from already saved payloads, never infer facts.
+        # Backfill only structural metadata from already saved payloads, never infer statements.
         for row in db.execute("SELECT id,version,payload FROM versions v WHERE NOT EXISTS (SELECT 1 FROM facts f WHERE f.id=v.id AND f.version=v.version)").fetchall():
-            payload = json.loads(row["payload"])
-            metadata = payload.get("facts", [])
+            payload = knowledge_payload(json.loads(row["payload"]))
+            metadata = payload.get("statements", [])
             for source in payload.get("sources", []):
                 saved = db.execute("SELECT payload FROM versions WHERE id=? AND version=?", (source["memory_id"], source["version"])).fetchone()
                 if saved:
-                    metadata.extend(f for f in json.loads(saved[0])["facts"] if not source["fact_ids"] or f["fact_id"] in source["fact_ids"])
+                    metadata.extend(f for f in knowledge_payload(json.loads(saved[0]))["statements"] if not source["statement_ids"] or f["statement_id"] in source["statement_ids"])
             for fact in metadata:
-                db.execute("INSERT OR IGNORE INTO facts VALUES (?,?,?,?,?,?,?)", (row["id"], row["version"], fact["fact_id"], fact["claim"], fact.get("status", "active"), fact["domain"], json.dumps(fact["source_event_ids"])))
+                db.execute("INSERT OR IGNORE INTO facts VALUES (?,?,?,?,?,?,?)", (row["id"], row["version"], fact["statement_id"], fact["claim"], fact.get("status", "active"), fact["classifications"][0]["domain"], json.dumps(fact["source_event_ids"])))
         try:
             yield db
             db.commit()
@@ -139,7 +143,9 @@ class KnowledgeStore:
     def _decode(row):
         if not row:
             return None
-        record = {**dict(row), "payload": json.loads(row["payload"]), "evidence": json.loads(row["evidence"])}
+        raw_payload = json.loads(row["payload"])
+        record = {**normalize_statement_keys(dict(row)), "payload": knowledge_payload(json.loads(row["payload"])), "evidence": json.loads(row["evidence"])}
+        record["legacy_classification"] = {key: raw_payload[key] for key in ("category", "domain", "knowledge_domains") if key in raw_payload}
         try:
             schema = MemoryPackage if record['layer'] == 'memory' else Insight
             record['payload'] = schema.model_validate(record['payload']).model_dump()
@@ -187,9 +193,9 @@ class KnowledgeStore:
                 for row in db.execute("""SELECT DISTINCT v.payload FROM entity_links l JOIN records r ON r.id=l.id
                     JOIN versions v ON v.id=l.id AND v.version=l.version
                     WHERE l.entity_id=? AND r.layer='memory' AND r.published_version=l.version AND r.status='active' LIMIT 4""", (entity["id"],)):
-                    payload = json.loads(row[0])
+                    payload = knowledge_payload(json.loads(row[0]))
                     contexts.append({"background": payload["background"], "artifact_paths": payload["artifact_paths"],
-                                     "facts": [f["claim"] for f in payload["facts"] if any(e["entity_id"] == entity["id"] for e in f["entities"])]})
+                                     "statements": [f["claim"] for f in payload["statements"] if any(e["entity_id"] == entity["id"] for e in f["entities"])]})
                 result.append({**dict(entity), "contexts": contexts})
             return result
 
@@ -197,7 +203,7 @@ class KnowledgeStore:
         return self.save_memories([{"payload": payload, "evidence": evidence, "vector": vector, "model_id": model_id,
                                    "id": record_id, "expected_version": expected_version, "operation_id": operation_id}])[0]
 
-    def save_memories(self, entries):
+    def save_memories(self, entries, *, build_graph=False):
         """Resolve same-batch record/fact aliases, then publish the whole batch atomically."""
         entries = deepcopy(entries)
         resolved, aliases, fact_aliases, identities = [], {}, {}, set()
@@ -213,27 +219,27 @@ class KnowledgeStore:
                 if alias in aliases:
                     raise ValueError("Duplicate batch Memory alias")
                 aliases[alias] = (rid, version)
-                payload = MemoryPackage.model_validate(entry["payload"]).model_dump()
-                saved = json.loads(db.execute("SELECT payload FROM versions WHERE id=? AND version=?", (rid, version)).fetchone()[0]) if previous else None
+                payload = exclude_dispatch_entities(MemoryPackage.model_validate(entry["payload"]).model_dump())
+                saved = knowledge_payload(json.loads(db.execute("SELECT payload FROM versions WHERE id=? AND version=?", (rid, version)).fetchone()[0])) if previous else None
                 mapping, allocated = {}, set()
-                for position, fact in enumerate(payload["facts"], 1):
-                    key = fact["fact_id"] or f"new:{position}"
+                for position, fact in enumerate(payload["statements"], 1):
+                    key = fact["statement_id"] or f"new:{position}"
                     if re.fullmatch(r"new:\d+", key):
                         if key in mapping:
                             raise ValueError("Duplicate temporary fact identity")
-                        stable = saved["facts"][position-1]["fact_id"] if saved else "fact_" + uuid.uuid4().hex
+                        stable = saved["statements"][position-1]["statement_id"] if saved else "statement_" + uuid.uuid4().hex
                         mapping[key] = stable
                         allocated.add(stable)
-                        fact["fact_id"] = stable
+                        fact["statement_id"] = stable
                     elif previous:
                         # A partially committed legacy batch may be replayed with its saved stable IDs.
-                        mapping[f"new:{position}"] = saved["facts"][position-1]["fact_id"]
+                        mapping[f"new:{position}"] = saved["statements"][position-1]["statement_id"]
                 fact_aliases[alias] = mapping
                 resolved.append({**entry, "id": rid, "version": version, "payload": payload, "allocated": allocated,
                                  "alias": alias, "skip": bool(previous)})
             entity_aliases = {}
             for entry in resolved:
-                for fact in entry['payload']['facts']:
+                for fact in entry['payload']['statements']:
                     for entity in fact['entities']:
                         key = entity['entity_id']
                         if entry['skip']:
@@ -258,16 +264,16 @@ class KnowledgeStore:
                     continue
                 payload = entry["payload"]
                 local = fact_aliases[entry["alias"]]
-                for change in payload["fact_changes"]:
-                    change["current_fact_ids"] = [local.get(fid, fid) for fid in change["current_fact_ids"]]
+                for change in payload["statement_changes"]:
+                    change["current_statement_ids"] = [local.get(fid, fid) for fid in change["current_statement_ids"]]
                 for relation in payload["relations"]:
                     target_alias = relation["target_id"]
                     internal = not target_alias
-                    relation["source_fact_id"] = local.get(relation["source_fact_id"], relation["source_fact_id"])
+                    relation["source_statement_id"] = local.get(relation["source_statement_id"], relation["source_statement_id"])
                     if internal or target_alias in aliases:
                         target_alias = entry["alias"] if internal else target_alias
                         relation["target_id"], relation["target_version"] = aliases[target_alias]
-                        relation["target_fact_id"] = fact_aliases[target_alias].get(relation["target_fact_id"], relation["target_fact_id"])
+                        relation["target_statement_id"] = fact_aliases[target_alias].get(relation["target_statement_id"], relation["target_statement_id"])
                     elif re.fullmatch(r"new:\d+", target_alias):
                         raise ValueError("Unknown batch Memory alias")
                 self._put(db, "memory", payload, entry["evidence"], entry["vector"], entry["model_id"],
@@ -276,9 +282,13 @@ class KnowledgeStore:
                 if entry["skip"]:
                     continue
                 rid, version = entry["id"], entry["version"]
-                self._insert_relations(db, rid, version, entry["payload"]["relations"], entry["payload"]["facts"])
+                self._insert_relations(db, rid, version, entry["payload"]["relations"], entry["payload"]["statements"])
                 db.execute("UPDATE jobs SET status='superseded' WHERE id=? AND version<? AND status IN ('pending','failed')", (rid, version))
                 db.execute("INSERT OR IGNORE INTO jobs(id,version) VALUES (?,?)", (rid, version))
+                if build_graph:
+                    db.execute("UPDATE graph_jobs SET status='superseded' WHERE id=? AND version<?", (rid, version))
+                    db.execute("INSERT OR IGNORE INTO graph_jobs(id,version,peers) VALUES (?,?,?)",
+                               (rid, version, json.dumps([[e['id'], e['version']] for e in resolved])))
                 if entry.get("operation_id"):
                     db.execute("INSERT INTO operations VALUES (?,?,?)", (entry["operation_id"], rid, version))
         return [self.get(e["id"], e["version"]) for e in resolved]
@@ -338,20 +348,20 @@ class KnowledgeStore:
         schema = MemoryPackage if layer == "memory" else Insight
         payload = schema.model_validate(payload).model_dump()
         evidence_ids = {e["event_id"] for e in evidence}
-        for fact in payload.get("facts", []):
+        for fact in payload.get("statements", []):
             if set(fact["source_event_ids"]) - evidence_ids:
-                raise ValueError("Fact cites unavailable evidence")
+                raise ValueError("MemoryStatement cites unavailable evidence")
         for relation in payload["relations"]:
             if set(relation["source_event_ids"]) - evidence_ids:
                 raise ValueError("Relation cites unavailable evidence")
-        for change in payload.get("fact_changes", []):
+        for change in payload.get("statement_changes", []):
             if set(change["source_event_ids"]) - evidence_ids:
-                raise ValueError("Fact change cites unavailable evidence")
+                raise ValueError("MemoryStatement change cites unavailable evidence")
         current = db.execute("SELECT current_version,layer FROM records WHERE id=?", (record_id,)).fetchone()
         if (current[0] if current else 0) != expected_version:
             raise ValueError("Knowledge version conflict")
         if current and (current[1] == "memory") != (layer == "memory"):
-            raise ValueError("Fact packages and learned knowledge cannot change identity")
+            raise ValueError("MemoryStatement packages and learned knowledge cannot change identity")
         vector = np.asarray(vector, dtype=np.float32)
         if vector.ndim != 1 or not len(vector) or not np.isfinite(vector).all() or not np.linalg.norm(vector):
             raise ValueError("Invalid knowledge embedding")
@@ -359,59 +369,59 @@ class KnowledgeStore:
         stamp = now()
         if layer == "memory":
             old = db.execute("SELECT payload FROM versions WHERE id=? AND version=?", (record_id, expected_version)).fetchone()
-            old_ids = {f["fact_id"] for f in json.loads(old[0])["facts"]} if old else set()
+            old_ids = {f["statement_id"] for f in knowledge_payload(json.loads(old[0]))["statements"]} if old else set()
             new_ids = {}
-            for index, fact in enumerate(payload["facts"], 1):
-                if not fact["fact_id"]:
-                    fact["fact_id"] = f"new:{index}"
-                temporary = bool(re.fullmatch(r"new:\d+", fact["fact_id"]))
-                if fact["fact_id"] and not temporary and fact["fact_id"] not in old_ids and fact["fact_id"] not in allocated:
+            for index, fact in enumerate(payload["statements"], 1):
+                if not fact["statement_id"]:
+                    fact["statement_id"] = f"new:{index}"
+                temporary = bool(re.fullmatch(r"new:\d+", fact["statement_id"]))
+                if fact["statement_id"] and not temporary and fact["statement_id"] not in old_ids and fact["statement_id"] not in allocated:
                     raise ValueError("Unknown prior fact identity")
                 if temporary:
-                    if fact["fact_id"] in new_ids:
+                    if fact["statement_id"] in new_ids:
                         raise ValueError("Duplicate temporary fact identity")
-                    new_ids[fact["fact_id"]] = "fact_" + uuid.uuid4().hex
-                fact["fact_id"] = new_ids[fact["fact_id"]] if temporary else fact["fact_id"] or "fact_" + uuid.uuid4().hex
+                    new_ids[fact["statement_id"]] = "statement_" + uuid.uuid4().hex
+                fact["statement_id"] = new_ids[fact["statement_id"]] if temporary else fact["statement_id"] or "statement_" + uuid.uuid4().hex
             for relation in payload["relations"]:
-                relation["source_fact_id"] = new_ids.get(relation["source_fact_id"], relation["source_fact_id"])
+                relation["source_statement_id"] = new_ids.get(relation["source_statement_id"], relation["source_statement_id"])
                 if not relation["target_id"]:
-                    relation["target_fact_id"] = new_ids.get(relation["target_fact_id"], relation["target_fact_id"])
+                    relation["target_statement_id"] = new_ids.get(relation["target_statement_id"], relation["target_statement_id"])
                     relation["target_id"], relation["target_version"] = record_id, version
-            if len({f["fact_id"] for f in payload["facts"]}) != len(payload["facts"]):
+            if len({f["statement_id"] for f in payload["statements"]}) != len(payload["statements"]):
                 raise ValueError("Duplicate fact identity")
-            active_ids = {f["fact_id"] for f in payload["facts"] if f["status"] == "active"}
-            old_facts = {f["fact_id"]: f for f in json.loads(old[0])["facts"]} if old else {}
+            active_ids = {f["statement_id"] for f in payload["statements"] if f["status"] == "active"}
+            old_facts = {f["statement_id"]: f for f in knowledge_payload(json.loads(old[0]))["statements"]} if old else {}
             changed_ids = set()
-            for change in payload["fact_changes"]:
-                change["current_fact_ids"] = [new_ids.get(fid, fid) for fid in change["current_fact_ids"]]
-                previous_ids, current_ids = set(change["previous_fact_ids"]), set(change["current_fact_ids"])
+            for change in payload["statement_changes"]:
+                change["current_statement_ids"] = [new_ids.get(fid, fid) for fid in change["current_statement_ids"]]
+                previous_ids, current_ids = set(change["previous_statement_ids"]), set(change["current_statement_ids"])
                 if previous_ids - old_ids or current_ids - active_ids:
-                    raise ValueError("Fact change references an unknown versioned fact")
+                    raise ValueError("MemoryStatement change references an unknown versioned fact")
                 if previous_ids & changed_ids:
                     raise ValueError("Conflicting fact changes")
                 changed_ids.update(previous_ids)
                 if change["kind"] == "withdrawn":
                     if current_ids or previous_ids & active_ids:
-                        raise ValueError("Withdrawn facts cannot remain active")
+                        raise ValueError("Withdrawn statements cannot remain active")
                 elif not current_ids:
-                    raise ValueError("Fact replacement requires active successors")
+                    raise ValueError("MemoryStatement replacement requires active successors")
                 elif change["kind"] == "split" and (len(previous_ids) != 1 or len(current_ids) < 2):
-                    raise ValueError("Fact split requires one predecessor and multiple successors")
+                    raise ValueError("MemoryStatement split requires one predecessor and multiple successors")
                 elif change["kind"] == "merged" and (len(previous_ids) < 2 or len(current_ids) != 1):
-                    raise ValueError("Fact merge requires multiple predecessors and one successor")
+                    raise ValueError("MemoryStatement merge requires multiple predecessors and one successor")
                 elif change["kind"] == "corrected" and (len(previous_ids) != 1 or len(current_ids) != 1):
-                    raise ValueError("Fact correction requires one predecessor and one successor")
+                    raise ValueError("MemoryStatement correction requires one predecessor and one successor")
                 if change["kind"] != "corrected" and previous_ids & active_ids:
-                    raise ValueError("Replaced facts cannot remain active")
+                    raise ValueError("Replaced statements cannot remain active")
                 if change["kind"] == "corrected" and (previous_ids - current_ids) & active_ids:
-                    raise ValueError("Superseded facts cannot remain active")
-            old_active = {f["fact_id"] for f in json.loads(old[0])["facts"] if f.get("status", "active") == "active"} if old else set()
+                    raise ValueError("Superseded statements cannot remain active")
+            old_active = {f["statement_id"] for f in knowledge_payload(json.loads(old[0]))["statements"] if f.get("status", "active") == "active"} if old else set()
             if old_active - active_ids - changed_ids:
-                raise ValueError("Removed facts require an explicit withdrawal or replacement")
-            for fact in payload["facts"]:
-                prior = old_facts.get(fact["fact_id"])
-                if prior and fact["status"] == "active" and (prior["claim"] != fact["claim"] or prior.get("status", "active") != "active") and fact["fact_id"] not in changed_ids:
-                    raise ValueError("Changed or restored facts require an explicit correction")
+                raise ValueError("Removed statements require an explicit withdrawal or replacement")
+            for fact in payload["statements"]:
+                prior = old_facts.get(fact["statement_id"])
+                if prior and fact["status"] == "active" and (prior["claim"] != fact["claim"] or prior.get("status", "active") != "active") and fact["statement_id"] not in changed_ids:
+                    raise ValueError("Changed or restored statements require an explicit correction")
         else:
             for solution in payload["solutions"]:
                 solution["solution_id"] = solution["solution_id"] or "sol_" + uuid.uuid4().hex
@@ -429,27 +439,27 @@ class KnowledgeStore:
             db.execute("INSERT OR IGNORE INTO maturity(id) VALUES (?)", (record_id,))
             if current and current[1] == "pattern" and payload["status"] == "active":
                 db.execute("UPDATE records SET layer='pattern' WHERE id=?", (record_id,))
-        facts = payload.get("facts", [])
+        statements = payload.get("statements", [])
         if layer != "memory":
             for source in payload["sources"]:
                 row = db.execute("SELECT payload FROM versions WHERE id=? AND version=?", (source["memory_id"], source["version"])).fetchone()
                 if not row:
                     raise ValueError("Source Memory version not found")
-                source_facts = json.loads(row[0])["facts"]
-                if set(source["fact_ids"]) - {f["fact_id"] for f in source_facts}:
+                source_facts = knowledge_payload(json.loads(row[0]))["statements"]
+                if set(source["statement_ids"]) - {f["statement_id"] for f in source_facts}:
                     raise ValueError("Source fact not found")
                 db.execute("INSERT INTO derivations VALUES (?,?,?,?,?)", (record_id, version, source["memory_id"], source["version"], source["role"]))
-                selected = [f for f in source_facts if not source["fact_ids"] or f["fact_id"] in source["fact_ids"]]
+                selected = [f for f in source_facts if not source["statement_ids"] or f["statement_id"] in source["statement_ids"]]
                 if source["role"] == "support" and any(f.get("status", "active") != "active" for f in selected):
-                    raise ValueError("Withdrawn facts cannot support current knowledge")
-                facts.extend(selected)
+                    raise ValueError("Withdrawn statements cannot support current knowledge")
+                statements.extend(selected)
                 for fact in selected:
                     db.execute("INSERT INTO edges VALUES (?,?,?,?,?,?)", (record_id, version, source["memory_id"], source["version"],
                                "semantic", json.dumps({"predicate": source["role"], "inferred": False,
-                                "source_fact_id": fact["fact_id"], "target_fact_id": fact["fact_id"]})))
-        for fact in facts:
-            db.execute("INSERT OR IGNORE INTO facts VALUES (?,?,?,?,?,?,?)", (record_id, version, fact["fact_id"], fact["claim"],
-                       fact.get("status", "active"), fact["domain"], json.dumps(fact["source_event_ids"])))
+                                "source_statement_id": fact["statement_id"], "target_statement_id": fact["statement_id"]})))
+        for fact in statements:
+            db.execute("INSERT OR IGNORE INTO facts VALUES (?,?,?,?,?,?,?)", (record_id, version, fact["statement_id"], fact["claim"],
+                       fact.get("status", "active"), fact["classifications"][0]["domain"], json.dumps(fact["source_event_ids"])))
             if fact.get("status", "active") != "active":
                 continue
             for entity in fact["entities"]:
@@ -473,15 +483,22 @@ class KnowledgeStore:
                     db.execute("INSERT OR IGNORE INTO entity_aliases VALUES (?,?)", (alias, eid))
                 entity["entity_id"] = eid
                 entity["new_identity"] = False
-                db.execute("INSERT OR IGNORE INTO entity_links VALUES (?,?,?,?)", (record_id, version, fact["fact_id"], eid))
+                db.execute("INSERT OR IGNORE INTO entity_links VALUES (?,?,?,?)", (record_id, version, fact["statement_id"], eid))
             for anchor in fact["times"]:
                 if anchor["start"]:
                     start = time_key(anchor["dimension"], anchor["start"])
                     end = time_key(anchor["dimension"], anchor["end"] or anchor["start"])
                     if end < start:
                         raise ValueError("Reversed time range")
-                    db.execute("INSERT INTO times VALUES (?,?,?,?,?,?,?)", (record_id, version, fact["fact_id"],
+                    db.execute("INSERT INTO times VALUES (?,?,?,?,?,?,?)", (record_id, version, fact["statement_id"],
                                anchor["dimension"], start, end, json.dumps(anchor, ensure_ascii=False)))
+            if layer == "memory":
+                stamps = {time_key("observed", e["occurred_at"]) for e in evidence
+                          if e["event_id"] in fact["source_event_ids"] and e.get("occurred_at")}
+                for stamp_value in sorted(stamps):
+                    db.execute("INSERT INTO times VALUES (?,?,?,'observed',?,?,?)",
+                               (record_id, version, fact["statement_id"], stamp_value, stamp_value,
+                                json.dumps({"origin": "source_event"})))
         db.execute("INSERT INTO times VALUES (?,?,?,'created',?,?,?)", (record_id, version, "", stamp, stamp, '{}'))
         for anchor in payload.get("times", []):
             if anchor["start"]:
@@ -491,13 +508,13 @@ class KnowledgeStore:
                     raise ValueError("Reversed knowledge time range")
                 db.execute("INSERT INTO times VALUES (?,?,?,?,?,?,?)", (record_id, version, "", anchor["dimension"],
                            start, end, json.dumps(anchor, ensure_ascii=False)))
-        for change in payload.get("fact_changes", []):
-            for previous_id in change["previous_fact_ids"]:
-                for successor in change["current_fact_ids"] or [""]:
+        for change in payload.get("statement_changes", []):
+            for previous_id in change["previous_statement_ids"]:
+                for successor in change["current_statement_ids"] or [""]:
                     db.execute("INSERT INTO fact_changes VALUES (?,?,?,?,?,?,?,?)", (record_id, expected_version, version, previous_id,
                                successor, change["kind"], change["reason"], json.dumps(change["source_event_ids"])))
         if not defer_relations:
-            self._insert_relations(db, record_id, version, payload["relations"], facts)
+            self._insert_relations(db, record_id, version, payload["relations"], statements)
         # Entity IDs are resolved inside this transaction before the immutable version becomes visible.
         if layer == "memory":
             db.execute("UPDATE versions SET payload=? WHERE id=? AND version=?",
@@ -505,83 +522,217 @@ class KnowledgeStore:
         return {"id": record_id, "version": version}
 
     @staticmethod
-    def _insert_relations(db, record_id, version, relations, facts):
+    def _insert_relations(db, record_id, version, relations, statements):
         for relation in relations:
             if (relation["target_id"] == record_id and relation["target_version"] == version
-                and (not relation["source_fact_id"] or not relation["target_fact_id"]
-                     or relation["source_fact_id"] == relation["target_fact_id"])):
+                and (not relation["source_statement_id"] or not relation["target_statement_id"]
+                     or relation["source_statement_id"] == relation["target_statement_id"])):
                 raise ValueError("Self relation is not evidence")
-            if relation["kind"] == "causal" and (not relation["source_fact_id"] or not relation["target_fact_id"]):
-                raise ValueError("Causal relations require concrete source and target facts")
+            if relation["kind"] == "causal" and (not relation["source_statement_id"] or not relation["target_statement_id"]):
+                raise ValueError("Causal relations require concrete source and target statements")
             target = db.execute("SELECT payload FROM versions WHERE id=? AND version=?", (relation["target_id"], relation["target_version"])).fetchone()
             if not target:
                 raise ValueError("Relation target not found")
-            if relation["source_fact_id"] and relation["source_fact_id"] not in {f["fact_id"] for f in facts}:
+            if relation["source_statement_id"] and relation["source_statement_id"] not in {f["statement_id"] for f in statements}:
                 raise ValueError("Relation source fact not found")
-            target_facts = json.loads(target[0]).get("facts", [])
-            if relation["target_fact_id"] and relation["target_fact_id"] not in {f["fact_id"] for f in target_facts}:
+            target_facts = knowledge_payload(json.loads(target[0])).get("statements", [])
+            if relation["target_statement_id"] and relation["target_statement_id"] not in {f["statement_id"] for f in target_facts}:
                 raise ValueError("Relation target fact not found")
+            endpoint_domains = [c["domain"] for items, sid in (
+                (statements, relation["source_statement_id"]), (target_facts, relation["target_statement_id"]))
+                for statement in items if sid and statement["statement_id"] == sid
+                for c in statement["classifications"]]
+            if endpoint_domains:
+                relation["domains"] = list(dict.fromkeys(endpoint_domains))
             if relation["status"] != "refuted" and (
-                any(f["fact_id"] == relation["source_fact_id"] and f.get("status", "active") != "active" for f in facts)
-                or any(f["fact_id"] == relation["target_fact_id"] and f.get("status", "active") != "active" for f in target_facts)):
-                raise ValueError("Active relation cannot use withdrawn facts")
-            db.execute("INSERT INTO edges VALUES (?,?,?,?,?,?)", (record_id, version, relation["target_id"], relation["target_version"],
-                       relation["kind"], json.dumps(relation, ensure_ascii=False)))
+                any(f["statement_id"] == relation["source_statement_id"] and f.get("status", "active") != "active" for f in statements)
+                or any(f["statement_id"] == relation["target_statement_id"] and f.get("status", "active") != "active" for f in target_facts)):
+                raise ValueError("Active relation cannot use withdrawn statements")
+            KnowledgeStore._insert_edge(db, record_id, version, relation)
 
-    def fact_history(self, memory_id, fact_id):
+    @staticmethod
+    def _insert_edge(db, record_id, version, relation):
+        relation = deepcopy(relation)
+        target_id, target_version = relation["target_id"], relation["target_version"]
+        if relation.get("direction") == "undirected" and (
+            record_id, version, relation.get("source_statement_id", "")
+        ) > (target_id, target_version, relation.get("target_statement_id", "")):
+            record_id, target_id = target_id, record_id
+            version, target_version = target_version, version
+            relation["source_statement_id"], relation["target_statement_id"] = relation.get("target_statement_id", ""), relation.get("source_statement_id", "")
+            relation["target_id"], relation["target_version"] = target_id, target_version
+        # Metadata/confidence changes must not create duplicate topology.
+        for row in db.execute("SELECT properties FROM edges WHERE owner_id=? AND owner_version=? AND target_id=? AND target_version=? AND kind=?",
+                              (record_id, version, target_id, target_version, relation["kind"])):
+            old = normalize_statement_keys(json.loads(row[0]))
+            if all(old.get(key, "") == relation.get(key, "") for key in ("predicate", "source_statement_id", "target_statement_id")):
+                return
+        db.execute("INSERT INTO edges VALUES (?,?,?,?,?,?)", (record_id, version, target_id, target_version,
+                   relation["kind"], json.dumps(relation, ensure_ascii=False)))
+
+    def graph_job(self, record_id, version):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM graph_jobs WHERE id=? AND version=?", (record_id, version)).fetchone()
+            return {**normalize_statement_keys(dict(row)), "peers": json.loads(row["peers"])} if row else None
+
+    def fail_graph_job(self, record_id, version, error):
+        with self.connect() as db:
+            db.execute("UPDATE graph_jobs SET status='failed',error=? WHERE id=? AND version=? AND status!='superseded'",
+                       (str(error), record_id, version))
+
+    def finish_graph_job(self, record_id, version, relations, source_versions, *, completed_jobs=None):
+        """Append version-pinned graph evidence, without rewriting immutable Memory payloads."""
+        with self.connect() as db:
+            job = db.execute("SELECT status FROM graph_jobs WHERE id=? AND version=?", (record_id, version)).fetchone()
+            if not job or job[0] in {"complete", "superseded"}:
+                return
+            for rid, expected in source_versions.items():
+                current = db.execute("SELECT published_version FROM records WHERE id=?", (rid,)).fetchone()
+                if not current or current[0] != expected:
+                    raise ValueError("Graph source version changed")
+            for raw in relations:
+                edge = GraphRelation.model_validate(raw).model_dump()
+                owner_id, owner_version = edge.pop("owner_id"), edge.pop("owner_version")
+                if source_versions.get(owner_id) != owner_version or source_versions.get(edge["target_id"]) != edge["target_version"]:
+                    raise ValueError("Graph edge is not pinned to analyzed versions")
+                saved = db.execute("SELECT payload,evidence FROM versions WHERE id=? AND version=?", (owner_id, owner_version)).fetchone()
+                other = db.execute("SELECT evidence FROM versions WHERE id=? AND version=?", (edge["target_id"], edge["target_version"])).fetchone()
+                if not saved or not other:
+                    raise ValueError("Graph endpoint not found")
+                event_ids = {e["event_id"] for e in [*json.loads(saved["evidence"]), *json.loads(other["evidence"])]}
+                if set(edge["source_event_ids"]) - event_ids:
+                    raise ValueError("Graph relation cites unavailable evidence")
+                self._insert_relations(db, owner_id, owner_version, [edge], knowledge_payload(json.loads(saved["payload"]))["statements"])
+            for rid, expected in (completed_jobs or {record_id: version}).items():
+                db.execute("UPDATE graph_jobs SET status='complete',error='' WHERE id=? AND version=? AND status!='superseded'", (rid, expected))
+
+    def time_relations(self, record_id, version, *, window_hours=24, neighbors=8):
+        """Exact section membership / source-time proximity; never use ingestion time."""
+        relations = []
+        with self.connect() as db:
+            anchors = db.execute("SELECT * FROM times WHERE id=? AND version=? AND fact_id!='' AND dimension IN ('chapter','observed','occurred')",
+                                 (record_id, version)).fetchall()
+            counts = {"same_section": 0, "near_time": 0}
+            seen = set()
+            for anchor in anchors:
+                anchor = normalize_statement_keys(dict(anchor))
+                chapter = anchor["dimension"] == "chapter"
+                if chapter and anchor["start"] != anchor["end"]:
+                    continue
+                predicate = "same_section" if chapter else "near_time"
+                if counts[predicate] >= neighbors:
+                    continue
+                if chapter:
+                    lo = hi = anchor["start"]
+                else:
+                    delta = timedelta(hours=window_hours)
+                    lo = (datetime.fromisoformat(anchor["start"]) - delta).isoformat()
+                    hi = (datetime.fromisoformat(anchor["end"]) + delta).isoformat()
+                exact = " AND t.start=t.end" if chapter else ""
+                rows = db.execute("""SELECT t.* FROM times t JOIN records r ON r.id=t.id AND r.published_version=t.version
+                    JOIN facts f ON f.id=t.id AND f.version=t.version AND f.fact_id=t.fact_id
+                    WHERE r.layer='memory' AND r.status='active' AND f.status='active' AND t.id!=?
+                    AND t.dimension=? AND t.start<=? AND t.end>=?""" + exact + """
+                    ORDER BY ABS(julianday(t.start)-julianday(?)),t.id,t.fact_id LIMIT ?""",
+                    (record_id, anchor["dimension"], hi, lo, anchor["start"], neighbors*2)).fetchall()
+                for target in rows:
+                    target = normalize_statement_keys(dict(target))
+                    if chapter and (target["start"] != lo or target["end"] != hi):
+                        continue
+                    key = (predicate, target["id"], target["version"])
+                    if key in seen or counts[predicate] >= neighbors:
+                        continue
+                    seen.add(key)
+                    counts[predicate] += 1
+                    fact = db.execute("SELECT source_event_ids FROM facts WHERE id=? AND version=? AND fact_id=?",
+                                      (record_id, version, anchor["statement_id"])).fetchone()
+                    relations.append({"owner_id": record_id, "owner_version": version, "kind": "temporal",
+                        "predicate": predicate, "direction": "undirected", "target_id": target["id"],
+                        "target_version": target["version"], "source_statement_id": anchor["statement_id"],
+                        "target_statement_id": target["statement_id"], "source_event_ids": json.loads(fact[0]),
+                        "scope": anchor["dimension"], "confidence": 1})
+        return relations
+
+    def related_memories(self, record_id, version, *, limit=20):
+        with self.connect() as db:
+            rows = db.execute("""SELECT e.* FROM edges e WHERE (owner_id=? AND owner_version=?) OR (target_id=? AND target_version=?)""",
+                              (record_id, version, record_id, version)).fetchall()
+        keys = []
+        for row in rows:
+            props = normalize_statement_keys(json.loads(row["properties"]))
+            if props.get("confidence", 1) < .5 or props.get("status") in {"refuted", "withdrawn"}:
+                continue
+            key = (row["target_id"], row["target_version"]) if row["owner_id"] == record_id and row["owner_version"] == version else (row["owner_id"], row["owner_version"])
+            if key not in keys and key != (record_id, version):
+                keys.append(key)
+        memories = []
+        for rid, expected in keys:
+            memory = self.get(rid)
+            if memory and memory["layer"] == "memory" and memory["status"] == "active" and memory["version"] == expected:
+                memories.append(memory)
+            if len(memories) >= limit:
+                break
+        return memories
+
+    def statement_history(self, memory_id, statement_id):
         """Exact predecessor/successor versions; never resolve by claim similarity."""
         if not self.db_path.exists():
             return {"versions": [], "changes": []}
         with self.connect() as db:
-            versions = [dict(r) for r in db.execute("SELECT * FROM facts WHERE id=? AND fact_id=? ORDER BY version", (memory_id, fact_id))]
-            changes = [dict(r) for r in db.execute("SELECT * FROM fact_changes WHERE id=? AND (previous_fact_id=? OR current_fact_id=?) ORDER BY version,previous_fact_id,current_fact_id", (memory_id, fact_id, fact_id))]
+            versions = [normalize_statement_keys(dict(r)) for r in db.execute("SELECT * FROM facts WHERE id=? AND fact_id=? ORDER BY version", (memory_id, statement_id))]
+            changes = [normalize_statement_keys(dict(r)) for r in db.execute("SELECT * FROM fact_changes WHERE id=? AND (previous_fact_id=? OR current_fact_id=?) ORDER BY version,previous_fact_id,current_fact_id", (memory_id, statement_id, statement_id))]
             for row in [*versions, *changes]:
                 row["source_event_ids"] = json.loads(row["source_event_ids"])
             return {"versions": versions, "changes": changes}
 
+    def fact_history(self, memory_id, fact_id):
+        """Compatibility for callers using the old endpoint name."""
+        return self.statement_history(memory_id, fact_id)
+
     def graph(self):
         if not self.db_path.exists():
-            return {"entities": [], "links": [], "edges": [], "times": [], "facts": []}
+            return {"entities": [], "links": [], "edges": [], "times": [], "statements": []}
         with self.connect() as db:
             # Old source versions remain visible while published knowledge still cites them.
             visible = """SELECT id,published_version AS version FROM records WHERE status='active'
                 UNION SELECT d.memory_id,d.memory_version FROM derivations d JOIN records r
                 ON r.id=d.knowledge_id AND r.published_version=d.knowledge_version WHERE r.status='active'"""
-            return self._active_graph({"entities": [dict(r) for r in db.execute("SELECT * FROM entity_aliases")],
-                    "links": [dict(r) for r in db.execute(f"SELECT l.* FROM entity_links l JOIN ({visible}) v ON v.id=l.id AND v.version=l.version")],
-                    "edges": [{**dict(r), "properties": json.loads(r["properties"])} for r in db.execute(
+            return self._active_graph({"entities": [normalize_statement_keys(dict(r)) for r in db.execute("SELECT * FROM entity_aliases")],
+                    "links": [normalize_statement_keys(dict(r)) for r in db.execute(f"SELECT l.* FROM entity_links l JOIN ({visible}) v ON v.id=l.id AND v.version=l.version")],
+                    "edges": [{**normalize_statement_keys(dict(r)), "properties": json.loads(r["properties"])} for r in db.execute(
                         f"SELECT e.* FROM edges e JOIN ({visible}) v ON v.id=e.owner_id AND v.version=e.owner_version")],
-                    "times": [dict(r) for r in db.execute(f"SELECT t.* FROM times t JOIN ({visible}) v ON v.id=t.id AND v.version=t.version")],
-                    "facts": [dict(r) for r in db.execute(f"SELECT f.* FROM facts f JOIN ({visible}) v ON v.id=f.id AND v.version=f.version")]})
+                    "times": [normalize_statement_keys(dict(r)) for r in db.execute(f"SELECT t.* FROM times t JOIN ({visible}) v ON v.id=t.id AND v.version=t.version")],
+                    "statements": [normalize_statement_keys(dict(r)) for r in db.execute(f"SELECT f.* FROM facts f JOIN ({visible}) v ON v.id=f.id AND v.version=f.version")]})
 
     @staticmethod
     def _active_graph(graph):
-        withdrawn = {(f['id'], f['version'], f['fact_id']) for f in graph['facts'] if f['status'] != 'active'}
+        graph = normalize_statement_keys(graph)
+        withdrawn = {(f['id'], f['version'], f['statement_id']) for f in graph['statements'] if f['status'] != 'active'}
         members = {}
-        for fact in graph['facts']:
-            members.setdefault((fact['id'], fact['version']), set()).add(fact['fact_id'])
+        for fact in graph['statements']:
+            members.setdefault((fact['id'], fact['version']), set()).add(fact['statement_id'])
         projected = []
         for edge in graph['edges']:
             properties = edge['properties']
             if (edge['kind'] == 'semantic' and properties.get('predicate') in {'support', 'context', 'against'}
-                and 'kind' not in properties and not properties.get('source_fact_id') and not properties.get('target_fact_id')):
-                # Legacy derivation edges were record-level. Project only their actually cited facts.
+                and 'kind' not in properties and not properties.get('source_statement_id') and not properties.get('target_statement_id')):
+                # Legacy derivation edges were record-level. Project only their actually cited statements.
                 common = members.get((edge['owner_id'], edge['owner_version']), set()) & members.get((edge['target_id'], edge['target_version']), set())
                 for fid in sorted(common):
-                    projected.append({**edge, 'properties': {**properties, 'source_fact_id': fid, 'target_fact_id': fid}})
+                    projected.append({**edge, 'properties': {**properties, 'source_statement_id': fid, 'target_statement_id': fid}})
             else:
                 projected.append(edge)
         graph['edges'] = projected
-        graph['facts'] = [{**f, 'source_event_ids': json.loads(f['source_event_ids'])} for f in graph['facts'] if f['status'] == 'active']
-        graph['links'] = [l for l in graph['links'] if (l['id'], l['version'], l['fact_id']) not in withdrawn]
-        graph['times'] = [t for t in graph['times'] if (t['id'], t['version'], t['fact_id']) not in withdrawn]
-        graph['edges'] = [e for e in graph['edges'] if (e['owner_id'], e['owner_version'], e['properties'].get('source_fact_id', '')) not in withdrawn
-                          and (e['target_id'], e['target_version'], e['properties'].get('target_fact_id', '')) not in withdrawn]
+        graph['statements'] = [{**f, 'source_event_ids': json.loads(f['source_event_ids'])} for f in graph['statements'] if f['status'] == 'active']
+        graph['links'] = [l for l in graph['links'] if (l['id'], l['version'], l['statement_id']) not in withdrawn]
+        graph['times'] = [t for t in graph['times'] if (t['id'], t['version'], t['statement_id']) not in withdrawn]
+        graph['edges'] = [e for e in graph['edges'] if (e['owner_id'], e['owner_version'], e['properties'].get('source_statement_id', '')) not in withdrawn
+                          and (e['target_id'], e['target_version'], e['properties'].get('target_statement_id', '')) not in withdrawn]
         return graph
 
     def graph_neighborhood(self, seeds, query, temporal=None, *, depth=3, nodes=128, candidates=40):
         """Load a bounded SQL frontier, not the entire project's graph into Python."""
-        empty = {"entities": [], "links": [], "edges": [], "times": [], "facts": []}
+        empty = {"entities": [], "links": [], "edges": [], "times": [], "statements": []}
         if not self.db_path.exists():
             return empty
         with self.connect() as db:
@@ -589,7 +740,7 @@ class KnowledgeStore:
             db.execute("""INSERT INTO graph_visible SELECT id,published_version FROM records WHERE status='active'
                 UNION SELECT d.memory_id,d.memory_version FROM derivations d JOIN records r
                 ON r.id=d.knowledge_id AND r.published_version=d.knowledge_version WHERE r.status='active'""")
-            aliases = [dict(r) for r in db.execute("SELECT * FROM entity_aliases WHERE name!='' AND instr(?,name)>0 ORDER BY name,entity_id LIMIT ?", (query, candidates))]
+            aliases = [normalize_statement_keys(dict(r)) for r in db.execute("SELECT * FROM entity_aliases WHERE name!='' AND instr(?,name)>0 ORDER BY name,entity_id LIMIT ?", (query, candidates))]
             links, edges, times = {}, {}, []
             seeds = list(dict.fromkeys(tuple(key) for key in seeds))
             semantic_seeds = list(seeds)
@@ -597,8 +748,8 @@ class KnowledgeStore:
                 for row in db.execute("""SELECT l.* FROM entity_links l JOIN graph_visible v ON v.id=l.id AND v.version=l.version
                     WHERE l.entity_id=? AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.id=l.id AND f.version=l.version AND f.fact_id=l.fact_id AND f.status!='active')
                     ORDER BY l.id,l.version,l.fact_id LIMIT ?""", (alias['entity_id'], candidates)):
-                    link = dict(row)
-                    links[(link['id'], link['version'], link['fact_id'], link['entity_id'])] = link
+                    link = normalize_statement_keys(dict(row))
+                    links[(link['id'], link['version'], link['statement_id'], link['entity_id'])] = link
                     seeds.append((link['id'], link['version']))
             if temporal:
                 dimension = temporal['dimension']
@@ -606,7 +757,7 @@ class KnowledgeStore:
                 hi = time_key(dimension, temporal.get('end') or temporal['start'])
                 if hi < lo:
                     raise ValueError('Reversed query time range')
-                times = [dict(r) for r in db.execute("""SELECT t.* FROM times t JOIN graph_visible v ON v.id=t.id AND v.version=t.version
+                times = [normalize_statement_keys(dict(r)) for r in db.execute("""SELECT t.* FROM times t JOIN graph_visible v ON v.id=t.id AND v.version=t.version
                     WHERE t.dimension=? AND t.start<=? AND t.end>=?
                     AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.id=t.id AND f.version=t.version AND f.fact_id=t.fact_id AND f.status!='active')
                     ORDER BY t.start DESC,t.id LIMIT ?""", (dimension, hi, lo, candidates))]
@@ -627,14 +778,14 @@ class KnowledgeStore:
                     'SELECT e.* FROM edges e JOIN graph_frontier f ON f.id=e.target_id AND f.version=e.target_version JOIN graph_visible v ON v.id=e.owner_id AND v.version=e.owner_version JOIN graph_visible t ON t.id=e.target_id AND t.version=e.target_version ORDER BY e.owner_id,e.target_id LIMIT ?',
                 ):
                     for row in db.execute(query_sql, (limit,)):
-                        edge = dict(row)
-                        properties = json.loads(edge['properties'])
+                        edge = normalize_statement_keys(dict(row))
+                        properties = normalize_statement_keys(json.loads(edge['properties']))
                         if properties.get('confidence', 1) < .5 or properties.get('status') == 'refuted':
                             continue
                         if db.execute("""SELECT 1 FROM facts WHERE status!='active' AND
                             ((id=? AND version=? AND fact_id=?) OR (id=? AND version=? AND fact_id=?)) LIMIT 1""",
-                            (edge['owner_id'], edge['owner_version'], properties.get('source_fact_id', ''),
-                             edge['target_id'], edge['target_version'], properties.get('target_fact_id', ''))).fetchone():
+                            (edge['owner_id'], edge['owner_version'], properties.get('source_statement_id', ''),
+                             edge['target_id'], edge['target_version'], properties.get('target_statement_id', ''))).fetchone():
                             continue
                         key = (edge['owner_id'], edge['owner_version'], edge['target_id'], edge['target_version'], edge['kind'], edge['properties'])
                         edges[key] = {**edge, 'properties': properties}
@@ -643,15 +794,15 @@ class KnowledgeStore:
                 for row in db.execute("""SELECT l.* FROM entity_links l JOIN graph_frontier n ON n.id=l.id AND n.version=l.version
                     WHERE NOT EXISTS (SELECT 1 FROM facts f WHERE f.id=l.id AND f.version=l.version AND f.fact_id=l.fact_id AND f.status!='active')
                     ORDER BY l.id,l.fact_id LIMIT ?""", (limit,)):
-                    link = dict(row)
-                    links[(link['id'], link['version'], link['fact_id'], link['entity_id'])] = link
+                    link = normalize_statement_keys(dict(row))
+                    links[(link['id'], link['version'], link['statement_id'], link['entity_id'])] = link
                     entity_ids.add(link['entity_id'])
                 for eid in sorted(entity_ids)[:nodes]:
                     for row in db.execute("""SELECT l.* FROM entity_links l JOIN graph_visible v ON v.id=l.id AND v.version=l.version WHERE l.entity_id=?
                         AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.id=l.id AND f.version=l.version AND f.fact_id=l.fact_id AND f.status!='active')
                         ORDER BY l.id,l.version LIMIT ?""", (eid, candidates)):
-                        link = dict(row)
-                        links[(link['id'], link['version'], link['fact_id'], link['entity_id'])] = link
+                        link = normalize_statement_keys(dict(row))
+                        links[(link['id'], link['version'], link['statement_id'], link['entity_id'])] = link
                         discovered.add((link['id'], link['version']))
                 if hop == depth:
                     break
@@ -661,8 +812,8 @@ class KnowledgeStore:
             edges = [e for e in edges.values() if (e['owner_id'], e['owner_version']) in visited and (e['target_id'], e['target_version']) in visited]
             db.execute('DELETE FROM graph_frontier')
             db.executemany('INSERT INTO graph_frontier VALUES (?,?)', sorted(visited))
-            facts = [dict(r) for r in db.execute('SELECT f.* FROM facts f JOIN graph_frontier n ON n.id=f.id AND n.version=f.version')]
-            return self._active_graph({'entities': aliases, 'links': links, 'edges': edges, 'times': times, 'facts': facts,
+            statements = [normalize_statement_keys(dict(r)) for r in db.execute('SELECT f.* FROM facts f JOIN graph_frontier n ON n.id=f.id AND n.version=f.version')]
+            return self._active_graph({'entities': aliases, 'links': links, 'edges': edges, 'times': times, 'statements': statements,
                                       'loaded_nodes': len(visited)})
 
     def input_state(self, history_id, digest, **updates):
@@ -711,11 +862,11 @@ class KnowledgeStore:
         if not self.db_path.exists():
             return []
         with self.connect() as db:
-            return [dict(r) for r in db.execute("SELECT * FROM jobs WHERE status IN ('pending','failed')")]
+            return [normalize_statement_keys(dict(r)) for r in db.execute("SELECT * FROM jobs WHERE status IN ('pending','failed')")]
 
     def fail_job(self, record_id, version, error):
         with self.connect() as db:
-            db.execute("UPDATE jobs SET status='failed',error=? WHERE id=? AND version=? AND status!='superseded'", (error, record_id, version))
+            db.execute("UPDATE jobs SET status='failed',error=? WHERE id=? AND version=? AND status IN ('pending','failed')", (error, record_id, version))
 
     def audit(self, payload):
         audit_id = uuid.uuid4().hex
@@ -757,7 +908,7 @@ class KnowledgeStore:
             return
         with self.connect() as db:
             marks = ','.join('?' for _ in aliases)
-            uses = [dict(r) for r in db.execute(f"SELECT * FROM uses WHERE task_id IN ({marks}) ORDER BY created", aliases)]
+            uses = [normalize_statement_keys(dict(r)) for r in db.execute(f"SELECT * FROM uses WHERE task_id IN ({marks}) ORDER BY created", aliases)]
             db.execute(f"DELETE FROM uses WHERE task_id IN ({marks})", aliases)
             for use in uses:
                 if not db.execute("SELECT 1 FROM uses WHERE id=? AND task_id=?", (use['id'], root_id)).fetchone():
@@ -774,12 +925,12 @@ class KnowledgeStore:
         with self.connect() as db:
             used = self._use_count(db, record["id"])
             weight = self._weight(db, record["id"]) if record['layer'] != 'memory' else 0
-            replacements = [dict(r) for r in db.execute("SELECT new_id,new_version,reason FROM knowledge_replacements WHERE old_id=? AND old_version=?",
+            replacements = [normalize_statement_keys(dict(r)) for r in db.execute("SELECT new_id,new_version,reason FROM knowledge_replacements WHERE old_id=? AND old_version=?",
                                                        (record["id"], record["version"]))]
         return {"id": record["id"], "layer": record["layer"], "version": record["version"],
-                "previous_version": record["previous_version"], "schema": "knowledge_v1", "status": record["status"],
+                "previous_version": record["previous_version"], "schema": "knowledge_v2", "status": record["status"],
                 "title": payload.get("title", "待核验历史知识"), "claim": payload.get("claim", payload.get("direction", "")),
-                "category": payload.get("category", "project"), "domain": payload.get("domain", "overall"), "kind": payload.get("kind", "fact_package"),
+                "classifications": payload.get("classifications", []), "legacy_classification": record.get("legacy_classification", {}), "kind": payload.get("kind", "fact_package"),
                 "weight": weight, "updated": record["updated"], "file_path": "",
                 "content": ("此历史知识结构未通过当前校验，仅供核验，不参与召回。\n\n" + json.dumps(payload, ensure_ascii=False)
                             if record.get('schema_errors') else render_knowledge(record)),

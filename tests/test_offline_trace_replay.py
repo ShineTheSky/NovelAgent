@@ -23,7 +23,7 @@ def replay_fixture(tmp_path, *, trace_status="completed", source_id=None, reques
     response = {"memories": [{
         "title": "段落衔接要求", "direction": "保持自然衔接", "background": "用户提出正文要求",
         "requirement": "保持自然衔接", "source_text": "保持自然衔接",
-        "facts": [{"domain": "writing", "claim": "用户要求保持自然衔接",
+        "statements": [{"domain": "writing", "claim": "用户要求保持自然衔接",
                    "source_event_ids": [package_source], "modality": "asserted"}],
     }]}
     trace = tmp_path / "trace.sqlite3"
@@ -52,7 +52,7 @@ def replay_fixture(tmp_path, *, trace_status="completed", source_id=None, reques
 
 
 def test_fragment_sources_are_mapped_even_when_not_cited_by_facts():
-    raw = {"facts": [{"source_event_ids": ["user"]}],
+    raw = {"statements": [{"source_event_ids": ["user"]}],
            "fragments": [{"source_event_id": "edit", "before": "旧正文", "after": "新正文"}]}
     assert _package_source_ids(raw) == ["user", "edit"]
     mapped = _remap_package_sources(raw, {"user": "history:user", "edit": "history:edit"})

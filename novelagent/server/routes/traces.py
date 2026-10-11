@@ -116,16 +116,21 @@ async def get_knowledge_record(project_id: str, record_id: str, request: Request
     return store.view(record)
 
 
-@router.get("/projects/{project_id}/knowledge/{record_id}/facts/{fact_id}")
-async def get_fact_history(project_id: str, record_id: str, fact_id: str, request: Request):
+@router.get("/projects/{project_id}/knowledge/{record_id}/statements/{statement_id}")
+async def get_statement_history(project_id: str, record_id: str, statement_id: str, request: Request):
     store = KnowledgeStore(_history(request, project_id).project_dir)
     record = store.get(record_id)
     if not record or record["layer"] != "memory":
         raise HTTPException(status_code=404, detail="事实包不存在")
-    history = store.fact_history(record_id, fact_id)
+    history = store.statement_history(record_id, statement_id)
     if not history["versions"] and not history["changes"]:
         raise HTTPException(status_code=404, detail="事实历史不存在")
     return history
+
+
+@router.get("/projects/{project_id}/knowledge/{record_id}/facts/{fact_id}")
+async def get_fact_history(project_id: str, record_id: str, fact_id: str, request: Request):
+    return await get_statement_history(project_id, record_id, fact_id, request)
 
 
 class MigrationRequest(BaseModel):

@@ -25,7 +25,7 @@ def snapshots(tmp_path):
 
 def fragment_input():
     return {"title": "调整正文", "direction": "表达调整", "background": "旧表达", "requirement": "换成新表达",
-            "artifact_paths": ["world/a.md"], "facts": [{"domain": "writing", "claim": "用户要求调整表达",
+            "artifact_paths": ["world/a.md"], "statements": [{"classifications": [{"domain": "writing", "categories": ["polishing"]}], "claim": "用户要求调整表达",
                 "source_event_ids": ["user"]}],
             "fragments": [{"source_event_id": "edit", "before": "旧正文", "after": "新正文"}]}
 
@@ -126,7 +126,7 @@ def test_missing_event_text_and_versions_trust_model_but_do_not_invent_versions(
     del payload["params"]["old_string"]
     del payload["params"]["new_string"]
     evidence[1]["content"] = json.dumps(payload)
-    package = pipeline._checked_model_package("p", fragment_input(), evidence, {"world/a.md"}, "memories[0]")
+    package = pipeline._checked_model_package("p", fragment_input(), evidence, {"world/a.md"}, "memories[0]", require_event_quotes=False)
     fragment = package["fragments"][0]
     assert fragment["verification"] == "model_trusted"
     assert (fragment["before"], fragment["after"]) == ("旧正文", "新正文")
@@ -139,7 +139,7 @@ def test_missing_previous_version_keeps_before_fragment(tmp_path):
     history.record_revision(tmp_path / "p" / "world/a.md", "v2", None, "新正文", "新正文")
     evidence = fragment_evidence()
     package = KnowledgePipeline(None, tmp_path, None, "test")._checked_model_package(
-        "p", fragment_input(), evidence, {"world/a.md"}, "memories[0]")
+        "p", fragment_input(), evidence, {"world/a.md"}, "memories[0]", require_event_quotes=False)
     assert package["fragments"][0]["before"] == "旧正文"
     assert package["fragments"][0]["verification"] == "event_verified"
 
@@ -150,7 +150,7 @@ def test_available_empty_body_is_not_treated_as_missing(tmp_path):
     evidence = fragment_evidence()
     with pytest.raises(ValueError, match="cannot be verified"):
         KnowledgePipeline(None, tmp_path, None, "test")._checked_model_package(
-            "p", fragment_input(), evidence, {"world/a.md"}, "memories[0]")
+            "p", fragment_input(), evidence, {"world/a.md"}, "memories[0]", require_event_quotes=False)
 
 
 def test_available_write_content_still_rejects_wrong_fragment_without_archive(tmp_path):
@@ -159,7 +159,7 @@ def test_available_write_content_still_rejects_wrong_fragment_without_archive(tm
     raw["fragments"][0]["after"] = "另一段正文"
     with pytest.raises(ValueError, match="does not match its cited Write"):
         KnowledgePipeline(None, tmp_path, None, "test")._checked_model_package(
-            "p", raw, evidence, {"world/a.md"}, "memories[0]")
+            "p", raw, evidence, {"world/a.md"}, "memories[0]", require_event_quotes=False)
 
 
 def test_stored_fragment_cannot_override_its_source_versions(tmp_path):
@@ -250,6 +250,8 @@ async def test_retain_reads_multiple_versions_missing_and_caches_final_only(tmp_
     pipeline = KnowledgePipeline(model, tmp_path, None, "test")
     assert await pipeline._call("p", "提取 Memory JSON", "retain") == {"memories": []}
     assert len(model.calls) == 2
+    assert all(call["stream"] is True for call in model.calls)
+    assert all(call["reasoning_summary"] == "auto" for call in model.calls)
     sent = model.calls[1]["messages"]
     assistant = next(m for m in sent if m.get("tool_calls"))
     replies = [m for m in sent if m["role"] == "tool_result"]
@@ -351,6 +353,8 @@ async def test_tool_and_validation_rounds_share_the_same_limit(tmp_path, max_tur
         with pytest.raises(RuntimeError, match="max_turns=2"):
             await pipeline._call("p", "提取", "retain", validate=validate)
     assert len(model.calls) == max_turns
+    assert all(call["stream"] is True for call in model.calls)
+    assert all(call["reasoning_summary"] == "auto" for call in model.calls)
     assert all(c["tools"] == model.calls[0]["tools"] for c in model.calls)
 
 

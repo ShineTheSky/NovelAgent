@@ -12,6 +12,7 @@ from pathlib import Path
 from novelagent.history.store import DocumentHistoryStore
 from novelagent.llm.json_output import json_object
 from novelagent.llm.failures import llm_failure_context
+from novelagent.memory.evidence_text import excerpt_matches, user_excerpt_matches
 from novelagent.trace.file_lifecycle import FileLifecycleStore, PATTERN_PROMOTION_WEIGHT
 from novelagent.trace.semantic_extraction import (
     build_semantic_extraction_section,
@@ -318,7 +319,7 @@ class HistoryAnalyzer:
             if isinstance(selected_turns, dict):
                 user_sources.extend(str(row.get("user_content") or "")
                                     for row in selected_turns.get("turns", []))
-            if source_text and not any(source_text in content for content in user_sources):
+            if source_text and not any(user_excerpt_matches(source_text, content) for content in user_sources):
                 source_text = ""
             references = [json.loads(e["content"]) for e in unit["events"] if e["kind"] == "document_reference"]
             known_paths = {str(row.get("path") or "") for row in references}
@@ -327,7 +328,7 @@ class HistoryAnalyzer:
             artifact_revision = unit["final_revision_id"] or unit["base_revision_id"]
             if not artifact_revision and artifact_path:
                 artifact_revision = next((str(row.get("revision_id") or "") for row in references
-                                          if row.get("path") == artifact_path and source_text and source_text in str(row.get("content") or "")), "")
+                                          if row.get("path") == artifact_path and source_text and excerpt_matches(source_text, str(row.get("content") or ""))), "")
             selected_events = [e for e in unit["events"] if e["event_id"] in ids]
             if unit["kind"] == "document" and selected_events and all(e.get("inherited_requirement") or e.get("inherited_review") for e in selected_events):
                 continue

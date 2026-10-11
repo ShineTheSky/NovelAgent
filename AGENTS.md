@@ -9,6 +9,46 @@ NovelAgent2 is an AI-powered novel writing agent that orchestrates specialized s
 ## Core Tradeoff
 These guidelines bias toward **caution over speed**. For trivial tasks, use judgment.
 
+## Prompt backup workflow (mandatory for Codex prompt edits)
+
+Prompt backups live in the independent sibling repository `../NovelAgent2-PromptHistory`.
+The source project's normal Git workflow and runtime prompt loading stay unchanged.
+
+- Only when editing `novelagent/memory/extraction_prompts.py`, `novelagent/trace/semantic_extraction.py`,
+  `config/subagent_presets.yaml`, or `prompts/**/*.j2`, register ONE task before the first edit:
+  `python scripts/prompt_history.py begin --session-id <session> --turn-id <turn> --reason "<requested change>"`.
+  Use the exact IDs injected by the UserPromptSubmit Hook; never infer them from the latest stored task.
+  If Hook context is unavailable, request Hook activation or use an explicit ungrouped backup command;
+  do not invent a session/turn binding. Ordinary conversation must not create prompt tasks.
+- If the backup repository is missing, run `python scripts/prompt_history.py init --reason "Initial prompt baseline"` first.
+  Do not edit prompts if backup fails; report the problem and resolve it first.
+- Trusted project Hooks silently snapshot before/after edits. They group multiple files and tool calls under
+  the task bound to THIS session and turn only. Without registration, after-edit snapshots remain unassigned.
+  `begin` can adopt only unassigned after-edit snapshots from this exact session/turn; pre-edit drift is a baseline.
+- When the requirement is complete (including unsuccessful experiments), run:
+  `python scripts/prompt_history.py finish --session-id <session> --turn-id <turn> --reason "<actual changes and why>"`.
+  It saves changes before offline tests and adds a shared business summary/test result using Git notes,
+  without rewriting snapshot commit IDs. Failed tests do not discard snapshots. Empty tasks are removed.
+- If interrupted or awaiting input, leave the task active, report its ID, and do not pretend it is complete.
+  To continue in a later turn, explicitly run `bind <task-id> --session-id <session> --turn-id <new-turn>`.
+  Closed tasks and other sessions' tasks must never be reused. A turn end does not itself close a requirement.
+- The Stop Hook reminds at most once per turn if prompt edits lack grouping or a completed summary.
+  Respond to that reminder once for the whole requirement, not once per file. Do not create a separate LLM call.
+- Use the `novelagent` virtual environment. Backup and offline checks must not call models, start the backend,
+  write production memories, push repositories, or commit the source project automatically.
+- `check` reports whether backup is needed; `list` and `compare <before> [after]` inspect saved versions.
+  `tasks --session-id <session> --turn-id <turn>` shows exact-turn grouping and snapshot IDs.
+  `restore <ref> [--file <relative path>]` only previews; use `--apply` only when the user requests restoration.
+  Applied restoration first preserves current files and only writes the managed files shown in the preview.
+- `branch codex/<experiment>` preserves current prompts and creates/switches a branch in the BACKUP repository only.
+  It does not switch the source project or change its files. Experiments still use begin/finish.
+- Python/YAML sources are backed up as whole files, including non-prompt fields. Always inspect restore diffs;
+  do not overwrite unrelated code/config changes. The backup is not a filesystem watcher or a hard editing gate.
+- Install project-local Hook definitions with `python scripts/install_prompt_history_hooks.py --apply`,
+  then review/trust them in Codex. Never bypass trust automatically or change global Codex settings.
+- If changing prompts embedded in another file, extend the script's managed file list and offline tests first.
+  Real-model regression tests require separate user authorization; do not run `scripts/test_trace_prompt.py` automatically.
+
 ## 1. Think Before Coding
 Don't assume. Don't hide confusion. Surface tradeoffs.
 

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { fetchMemories, fetchPatterns } from '../api/client';
-import type { LifecycleRecord } from '../types/insights';
+import { classificationLabel, type LifecycleRecord } from '../types/insights';
 import type { ProjectInfo, SessionInfo } from '../types/chat';
 
 interface ProjectOverviewProps {
@@ -23,8 +23,8 @@ export function ProjectOverview({ project, sessions, onNewSession, onSelectSessi
     void Promise.all([fetchPatterns(project.project_id), fetchMemories(project.project_id)])
       .then(([nextPatterns, nextMemories]) => {
         if (cancelled) return;
-        setPatterns(nextPatterns.filter(item => item.category !== 'agent'));
-        setMemories(nextMemories.filter(item => item.category !== 'agent'));
+        setPatterns(nextPatterns);
+        setMemories(nextMemories);
       })
       .catch(() => {
         if (cancelled) return;
@@ -51,7 +51,7 @@ export function ProjectOverview({ project, sessions, onNewSession, onSelectSessi
         <div className="grid gap-3 sm:grid-cols-3 mb-8">
           <StatCard label="会话" value={sessions.length} detail="该项目下的任务" />
           <StatCard label="Pattern" value={patterns.length} detail="稳定规则，会注入后续上下文" />
-          <StatCard label="原子记忆" value={memories.length} detail="均可回溯到 Trace" />
+          <StatCard label="Memory" value={memories.length} detail="事实包，可回溯到 History" />
         </div>
 
         <div className="grid gap-5 lg:grid-cols-2">
@@ -64,20 +64,20 @@ export function ProjectOverview({ project, sessions, onNewSession, onSelectSessi
                   <p className="text-sm leading-5 text-gray-700">{pattern.title || pattern.claim}</p>
                 </div>
               ))}
-              {patterns.length === 0 && <p className="py-4 text-sm leading-6 text-gray-400">强烈反馈会先成为记忆；多次相似证据支持后会提升为项目规则。</p>}
+              {patterns.length === 0 && <p className="py-4 text-sm leading-6 text-gray-400">Memory 提炼为 Insight；实际进入上下文使用后累计成熟度，达到阈值成为 Pattern。</p>}
             </div>
           </section>
 
           <section className="rounded-xl border border-gray-100 bg-[#fafbfc] p-5">
-            <div className="mb-4 flex items-center justify-between"><h2 className="text-sm font-semibold text-gray-700">最近记忆</h2><span className="text-xs text-gray-400">Trace 支持</span></div>
+            <div className="mb-4 flex items-center justify-between"><h2 className="text-sm font-semibold text-gray-700">最近记忆</h2><span className="text-xs text-gray-400">History 支持</span></div>
             <div className="space-y-3">
               {recentMemories.map(memory => (
                 <div key={memory.id} className="rounded-lg bg-white px-3 py-2.5 border border-gray-100">
-                  <div className="mb-1 text-[11px] text-violet-600">{kindLabel(memory.kind ?? '')} · {memory.domain}</div>
+                  <div className="mb-1 text-[11px] text-violet-600">{kindLabel(memory.kind ?? '')} · {classificationLabel(memory)}</div>
                   <p className="text-sm leading-5 text-gray-700">{memory.title || memory.claim}</p>
                 </div>
               ))}
-              {memories.length === 0 && <p className="py-4 text-sm leading-6 text-gray-400">暂无长期记忆。普通聊天和一次性指令不会被保存。</p>}
+              {memories.length === 0 && <p className="py-4 text-sm leading-6 text-gray-400">暂无 Memory 事实包。有保存价值的需求与对话会从 History 中提取。</p>}
             </div>
           </section>
         </div>

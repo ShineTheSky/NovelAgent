@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from tests.conftest import quoted_memory_response
 
 from novelagent.memory.consolidation import KnowledgePipeline
 from novelagent.memory.knowledge_store import KnowledgeStore
@@ -18,7 +19,7 @@ def evidence():
 
 def package(**kwargs):
     return MemoryPackage.model_validate({'title': '调整', 'direction': '承接', 'background': '原有段落',
-        'requirement': '调整', 'facts': [{'domain': 'writing', 'claim': '保持承接', 'source_event_ids': ['e']}],
+        'requirement': '调整', 'statements': [{'classifications': [{'domain': 'writing', 'categories': ['polishing']}], 'claim': '保持承接', 'source_event_ids': ['e']}],
         **kwargs}).model_dump()
 
 
@@ -27,9 +28,9 @@ def entry(payload=None, **kwargs):
 
 
 def publish(store, memory, **kwargs):
-    payload = Insight.model_validate({'title': '承接方法', 'claim': '保持承接', 'kind': 'method', 'purpose': '流畅',
+    payload = Insight.model_validate({'title': '承接方法', 'claim': '保持承接', 'kind': 'method', 'classifications': [{'domain': 'writing', 'categories': ['polishing']}], 'purpose': '流畅',
         'sources': [{'memory_id': memory['id'], 'version': memory['version'],
-                     'fact_ids': [f['fact_id'] for f in memory['payload']['facts'] if f['status'] == 'active']}]}).model_dump()
+                     'statement_ids': [f['statement_id'] for f in memory['payload']['statements'] if f['status'] == 'active']}]}).model_dump()
     return store.publish_insights([{**entry(payload), **kwargs}], {memory['id']: memory['version']},
                                   kwargs.get('replaces', []))[0]
 
@@ -38,22 +39,22 @@ def test_same_batch_forward_backward_fact_references_and_idempotency(tmp_path):
     store = KnowledgeStore(tmp_path)
     def raw(target):
         return package(relations=[{'kind': 'causal', 'predicate': 'supports', 'target_id': target,
-            'target_version': 1, 'source_fact_id': 'new:1', 'target_fact_id': 'new:1', 'source_event_ids': ['e']}])
+            'target_version': 1, 'source_statement_id': 'new:1', 'target_statement_id': 'new:1', 'source_event_ids': ['e']}])
     entries = [entry(raw('new:2'), operation_id='a'), entry(raw('new:1'), operation_id='b')]
     first, second = store.save_memories(entries)
     assert first['payload']['relations'][0]['target_id'] == second['id']
-    assert first['payload']['relations'][0]['target_fact_id'] == second['payload']['facts'][0]['fact_id']
-    assert second['payload']['relations'][0]['source_fact_id'] != first['payload']['relations'][0]['source_fact_id']
+    assert first['payload']['relations'][0]['target_statement_id'] == second['payload']['statements'][0]['statement_id']
+    assert second['payload']['relations'][0]['source_statement_id'] != first['payload']['relations'][0]['source_statement_id']
     repeated = store.save_memories(entries)
     assert [r['id'] for r in repeated] == [first['id'], second['id']]
     assert len(store.list()) == 2 and len(store.graph()['edges']) == 2
 
 
-@pytest.mark.parametrize('target,fact_id,error', [('new:3', 'new:1', 'Unknown batch'), ('new:2', 'new:9', 'target fact')])
-def test_bad_cross_batch_endpoint_rolls_back_every_record(tmp_path, target, fact_id, error):
+@pytest.mark.parametrize('target,statement_id,error', [('new:3', 'new:1', 'Unknown batch'), ('new:2', 'new:9', 'target fact')])
+def test_bad_cross_batch_endpoint_rolls_back_every_record(tmp_path, target, statement_id, error):
     store = KnowledgeStore(tmp_path)
     raw = package(relations=[{'kind': 'causal', 'predicate': 'causes', 'target_id': target, 'target_version': 1,
-                             'source_fact_id': 'new:1', 'target_fact_id': fact_id, 'source_event_ids': ['e']}])
+                             'source_statement_id': 'new:1', 'target_statement_id': statement_id, 'source_event_ids': ['e']}])
     with pytest.raises(ValueError, match=error):
         store.save_memories([entry(raw, operation_id='a'), entry(operation_id='b')])
     assert store.list() == [] and store.jobs() == [] and store.operation('a') is None
@@ -63,7 +64,7 @@ def test_external_temporary_fact_is_not_mistaken_for_local_fact(tmp_path):
     store = KnowledgeStore(tmp_path)
     other = store.save_memories([entry()])[0]
     raw = package(relations=[{'kind': 'causal', 'predicate': 'causes', 'target_id': other['id'], 'target_version': 1,
-                             'source_fact_id': 'new:1', 'target_fact_id': 'new:1', 'source_event_ids': ['e']}])
+                             'source_statement_id': 'new:1', 'target_statement_id': 'new:1', 'source_event_ids': ['e']}])
     with pytest.raises(ValueError, match='target fact'):
         store.save_memories([entry(raw)])
     assert len(store.list()) == 1
@@ -73,10 +74,10 @@ def test_partial_legacy_batch_replay_can_reference_already_committed_package(tmp
     store = KnowledgeStore(tmp_path)
     first = store.save_memories([entry(operation_id='already')])[0]
     raw = package(relations=[{'kind': 'causal', 'predicate': 'depends_on', 'target_id': 'new:1', 'target_version': 1,
-                             'source_fact_id': 'new:1', 'target_fact_id': 'new:1', 'source_event_ids': ['e']}])
+                             'source_statement_id': 'new:1', 'target_statement_id': 'new:1', 'source_event_ids': ['e']}])
     replayed = store.save_memories([entry(first['payload'], operation_id='already'), entry(raw, operation_id='new')])
     assert replayed[0]['id'] == first['id']
-    assert replayed[1]['payload']['relations'][0]['target_fact_id'] == first['payload']['facts'][0]['fact_id']
+    assert replayed[1]['payload']['relations'][0]['target_statement_id'] == first['payload']['statements'][0]['statement_id']
     assert len(store.list()) == 2
 
 
@@ -84,10 +85,10 @@ def test_partial_legacy_batch_replay_can_reference_already_committed_package(tmp
 def test_same_batch_entity_identity_needs_explicit_shared_alias(tmp_path, explicit_shared):
     store = KnowledgeStore(tmp_path)
     person = {'name': '林舟', 'kind': 'person', 'entity_id': 'new:entity:1' if explicit_shared else ''}
-    raw = package(facts=[{'domain': 'content', 'claim': '林舟的身份', 'source_event_ids': ['e'], 'entities': [person]}])
+    raw = package(statements=[{'classifications': [{'domain': 'content', 'categories': ['setting']}], 'claim': '林舟的身份', 'source_event_ids': ['e'], 'entities': [person]}])
     a, b = store.save_memories([entry(raw), entry(raw)])
-    aid = a['payload']['facts'][0]['entities'][0]['entity_id']
-    bid = b['payload']['facts'][0]['entities'][0]['entity_id']
+    aid = a['payload']['statements'][0]['entities'][0]['entity_id']
+    bid = b['payload']['statements'][0]['entities'][0]['entity_id']
     assert (aid == bid) == explicit_shared
     assert aid.startswith('ent_') and bid.startswith('ent_')
 
@@ -95,7 +96,7 @@ def test_same_batch_entity_identity_needs_explicit_shared_alias(tmp_path, explic
 def test_conflicting_batch_entity_kind_rolls_back(tmp_path):
     store = KnowledgeStore(tmp_path)
     def raw(kind):
-        return package(facts=[{'domain': 'content', 'claim': '对象', 'source_event_ids': ['e'],
+        return package(statements=[{'classifications': [{'domain': 'content', 'categories': ['setting']}], 'claim': '对象', 'source_event_ids': ['e'],
                               'entities': [{'name': '林舟', 'kind': kind, 'entity_id': 'new:entity:1'}]}])
     with pytest.raises(ValueError, match='entity identity conflicts'):
         store.save_memories([entry(raw('person')), entry(raw('place'))])
@@ -105,10 +106,10 @@ def test_conflicting_batch_entity_kind_rolls_back(tmp_path):
 def test_unpublished_old_graph_version_is_not_reintroduced_by_incoming_edge(tmp_path):
     store = KnowledgeStore(tmp_path)
     a, b = store.save_memories([entry(), entry(package(relations=[{'kind': 'causal', 'predicate': 'caused_by',
-        'target_id': 'new:1', 'target_version': 1, 'source_fact_id': 'new:1', 'target_fact_id': 'new:1', 'source_event_ids': ['e']}]))])
+        'target_id': 'new:1', 'target_version': 1, 'source_statement_id': 'new:1', 'target_statement_id': 'new:1', 'source_event_ids': ['e']}]))])
     store.save_memories([entry(a['payload'], id=a['id'], expected_version=1)])
     current_graph = store.graph_neighborhood([(b['id'], 1)], '未知')
-    assert not any(f['id'] == a['id'] and f['version'] == 1 for f in current_graph['facts'])
+    assert not any(f['id'] == a['id'] and f['version'] == 1 for f in current_graph['statements'])
     assert not current_graph['edges']
     assert store.get(b['id'])['payload']['relations'][0]['target_version'] == 1
 
@@ -118,10 +119,10 @@ async def test_shared_new_entity_alias_can_resolve_to_existing_identity_once(tmp
     pipeline = KnowledgePipeline(None, tmp_path, None, 'test')
     store = pipeline.store('p')
     def raw(entity_id=''):
-        return package(facts=[{'domain': 'content', 'claim': '主角林舟', 'source_event_ids': ['e'],
+        return package(statements=[{'classifications': [{'domain': 'content', 'categories': ['setting']}], 'claim': '主角林舟', 'source_event_ids': ['e'],
                               'entities': [{'name': '林舟', 'kind': 'person', 'entity_id': entity_id}]}])
     old = store.save_memories([entry(raw())])[0]
-    eid = old['payload']['facts'][0]['entities'][0]['entity_id']
+    eid = old['payload']['statements'][0]['entities'][0]['entity_id']
     class Model:
         calls = 0
         async def chat(self, **kwargs):
@@ -133,32 +134,32 @@ async def test_shared_new_entity_alias_can_resolve_to_existing_identity_once(tmp
     a, b, aliases = raw('new:entity:1'), raw('new:entity:1'), {}
     await pipeline._resolve_entities('p', a, evidence(), aliases)
     await pipeline._resolve_entities('p', b, evidence(), aliases)
-    assert model.calls == 1 and a['facts'][0]['entities'][0]['entity_id'] == eid
-    assert b['facts'][0]['entities'][0]['entity_id'] == eid
+    assert model.calls == 1 and a['statements'][0]['entities'][0]['entity_id'] == eid
+    assert b['statements'][0]['entities'][0]['entity_id'] == eid
 
 
 def test_split_merge_withdrawal_have_exact_versioned_fact_lineage(tmp_path):
     store = KnowledgeStore(tmp_path)
     first = store.save_memories([entry()])[0]
-    old_id = first['payload']['facts'][0]['fact_id']
-    split = package(facts=[{'domain': 'writing', 'claim': text, 'source_event_ids': ['e']}
-                           for text in ('动作承接', '信息承接')], fact_changes=[{'kind': 'split',
-        'previous_fact_ids': [old_id], 'current_fact_ids': ['new:1', 'new:2'], 'reason': '区分两种承接', 'source_event_ids': ['e']}])
+    old_id = first['payload']['statements'][0]['statement_id']
+    split = package(statements=[{'classifications': [{'domain': 'writing', 'categories': ['polishing']}], 'claim': text, 'source_event_ids': ['e']}
+                           for text in ('动作承接', '信息承接')], statement_changes=[{'kind': 'split',
+        'previous_statement_ids': [old_id], 'current_statement_ids': ['new:1', 'new:2'], 'reason': '区分两种承接', 'source_event_ids': ['e']}])
     second = store.save_memories([entry(split, id=first['id'], expected_version=1)])[0]
-    ids = [f['fact_id'] for f in second['payload']['facts']]
-    assert len(store.fact_history(first['id'], old_id)['changes']) == 2
-    merged = package(fact_changes=[{'kind': 'merged', 'previous_fact_ids': ids, 'current_fact_ids': ['new:1'],
+    ids = [f['statement_id'] for f in second['payload']['statements']]
+    assert len(store.statement_history(first['id'], old_id)['changes']) == 2
+    merged = package(statement_changes=[{'kind': 'merged', 'previous_statement_ids': ids, 'current_statement_ids': ['new:1'],
                                    'reason': '综合条件', 'source_event_ids': ['e']}])
     third = store.save_memories([entry(merged, id=first['id'], expected_version=2)])[0]
-    current = third['payload']['facts'][0]['fact_id']
+    current = third['payload']['statements'][0]['statement_id']
     withdrawn = deepcopy(third['payload'])
-    withdrawn['facts'][0]['status'] = 'withdrawn'
-    withdrawn['fact_changes'] = [{'kind': 'withdrawn', 'previous_fact_ids': [current], 'reason': '人类否定', 'source_event_ids': ['e']}]
+    withdrawn['statements'][0]['status'] = 'withdrawn'
+    withdrawn['statement_changes'] = [{'kind': 'withdrawn', 'previous_statement_ids': [current], 'reason': '人类否定', 'source_event_ids': ['e']}]
     fourth = store.save_memories([entry(withdrawn, id=first['id'], expected_version=3)])[0]
-    assert store.fact_history(first['id'], current)['changes'][-1]['current_fact_id'] == ''
-    assert not store.graph()['facts'] and not store.graph()['links']
-    assert store.get(first['id'], 1)['payload']['facts'][0]['status'] == 'active'
-    assert fourth['payload']['facts'][0]['status'] == 'withdrawn'
+    assert store.statement_history(first['id'], current)['changes'][-1]['current_statement_id'] == ''
+    assert not store.graph()['statements'] and not store.graph()['links']
+    assert store.get(first['id'], 1)['payload']['statements'][0]['status'] == 'active'
+    assert fourth['payload']['statements'][0]['status'] == 'withdrawn'
 
 
 def test_missing_fact_governance_or_invented_previous_fact_rejected(tmp_path):
@@ -166,7 +167,7 @@ def test_missing_fact_governance_or_invented_previous_fact_rejected(tmp_path):
     first = store.save_memories([entry()])[0]
     with pytest.raises(ValueError, match='explicit withdrawal'):
         store.save_memories([entry(id=first['id'], expected_version=1)])
-    invalid = package(fact_changes=[{'kind': 'corrected', 'previous_fact_ids': ['invented'], 'current_fact_ids': ['new:1'],
+    invalid = package(statement_changes=[{'kind': 'corrected', 'previous_statement_ids': ['invented'], 'current_statement_ids': ['new:1'],
                                     'reason': '修改', 'source_event_ids': ['e']}])
     with pytest.raises(ValueError, match='unknown versioned fact'):
         store.save_memories([entry(invalid, id=first['id'], expected_version=1)])
@@ -177,17 +178,17 @@ def test_changed_fact_retains_identity_only_with_correction_evidence(tmp_path):
     store = KnowledgeStore(tmp_path)
     first = store.save_memories([entry()])[0]
     raw = deepcopy(first['payload'])
-    fid = raw['facts'][0]['fact_id']
-    raw['facts'][0]['claim'] = '根据场景调整承接'
+    fid = raw['statements'][0]['statement_id']
+    raw['statements'][0]['claim'] = '根据场景调整承接'
     with pytest.raises(ValueError, match='explicit correction'):
         store.save_memories([entry(raw, id=first['id'], expected_version=1)])
-    raw['fact_changes'] = [{'kind': 'corrected', 'previous_fact_ids': [fid], 'current_fact_ids': [fid],
+    raw['statement_changes'] = [{'kind': 'corrected', 'previous_statement_ids': [fid], 'current_statement_ids': [fid],
                             'reason': '补充适用条件', 'source_event_ids': ['e']}]
     second = store.save_memories([entry(raw, id=first['id'], expected_version=1)])[0]
-    lineage = store.fact_history(first['id'], fid)
+    lineage = store.statement_history(first['id'], fid)
     assert [r['version'] for r in lineage['versions']] == [1, 2]
     assert lineage['changes'][0]['kind'] == 'corrected'
-    assert second['payload']['facts'][0]['fact_id'] == fid
+    assert second['payload']['statements'][0]['statement_id'] == fid
 
 
 def test_withdrawn_fact_cannot_support_new_insight_but_pinned_old_version_remains(tmp_path):
@@ -195,16 +196,16 @@ def test_withdrawn_fact_cannot_support_new_insight_but_pinned_old_version_remain
     first = store.save_memories([entry()])[0]
     old = publish(store, first)
     raw = deepcopy(first['payload'])
-    fid = raw['facts'][0]['fact_id']
-    raw['facts'][0]['status'] = 'withdrawn'
-    raw['fact_changes'] = [{'kind': 'withdrawn', 'previous_fact_ids': [fid], 'reason': '明确否定', 'source_event_ids': ['e']}]
+    fid = raw['statements'][0]['statement_id']
+    raw['statements'][0]['status'] = 'withdrawn'
+    raw['statement_changes'] = [{'kind': 'withdrawn', 'previous_statement_ids': [fid], 'reason': '明确否定', 'source_event_ids': ['e']}]
     second = store.save_memories([entry(raw, id=first['id'], expected_version=1)])[0]
     payload = deepcopy(old['payload'])
     payload['sources'][0]['version'] = 2
-    with pytest.raises(ValueError, match='Withdrawn facts'):
+    with pytest.raises(ValueError, match='Withdrawn statements'):
         store.publish_insights([entry(payload)], {first['id']: 2})
-    assert any(f['id'] == first['id'] and f['version'] == 1 for f in store.graph()['facts'])
-    assert not any(f['id'] == first['id'] and f['version'] == 2 for f in store.graph()['facts'])
+    assert any(f['id'] == first['id'] and f['version'] == 1 for f in store.graph()['statements'])
+    assert not any(f['id'] == first['id'] and f['version'] == 2 for f in store.graph()['statements'])
     assert second['version'] == 2
 
 
@@ -295,11 +296,11 @@ async def test_pipeline_saves_cross_package_graph_before_learning_and_retry_is_f
             self.calls.append(kwargs['tag'])
             if kwargs['tag'].endswith('retain'):
                 one = package(relations=[{'kind': 'causal', 'predicate': 'causes', 'target_id': 'new:2',
-                    'target_version': 1, 'source_fact_id': 'new:1', 'target_fact_id': 'new:1', 'source_event_ids': ['e']}])
+                    'target_version': 1, 'source_statement_id': 'new:1', 'target_statement_id': 'new:1', 'source_event_ids': ['e']}])
                 response = {'memories': [one, package(title='信息承接', direction='信息承接')]}
             else:
                 response = {'insights': [], 'withdrawals': []}
-            yield SimpleNamespace(type='text_delta', content=json.dumps(response))
+            yield SimpleNamespace(type='text_delta', content=json.dumps(quoted_memory_response(response, kwargs['messages'])))
     model = Model()
     pipeline = KnowledgePipeline(model, tmp_path, Embedding(), 'test')
     unit = {'history_id': 'h', 'kind': 'requirement', 'status': 'completed', 'events': evidence()}
@@ -315,13 +316,13 @@ def test_matching_keeps_new_fact_alias_when_existing_facts_are_prepended(tmp_pat
     store = KnowledgeStore(tmp_path)
     old = store.save_memories([entry()])[0]
     incoming = KnowledgePipeline._validate_package(package(relations=[{'kind': 'causal', 'predicate': 'supports',
-        'target_id': 'new:2', 'target_version': 1, 'source_fact_id': 'new:1', 'target_fact_id': 'new:1',
+        'target_id': 'new:2', 'target_version': 1, 'source_statement_id': 'new:1', 'target_statement_id': 'new:1',
         'source_event_ids': ['e']}]), evidence())
-    incoming['facts'] = [*old['payload']['facts'], *incoming['facts']]
+    incoming['statements'] = [*old['payload']['statements'], *incoming['statements']]
     updated, other = store.save_memories([entry(incoming, id=old['id'], expected_version=1), entry()])
     relation = updated['payload']['relations'][0]
-    assert relation['source_fact_id'] == updated['payload']['facts'][1]['fact_id']
-    assert relation['target_fact_id'] == other['payload']['facts'][0]['fact_id']
+    assert relation['source_statement_id'] == updated['payload']['statements'][1]['statement_id']
+    assert relation['target_statement_id'] == other['payload']['statements'][0]['statement_id']
 
 
 @pytest.mark.asyncio
@@ -354,14 +355,15 @@ def test_fact_lineage_api_reads_exact_fact_history(tmp_path):
     from novelagent.server.routes.traces import router
     store = KnowledgeStore(tmp_path / 'p')
     memory = store.save_memories([entry()])[0]
-    fid = memory['payload']['facts'][0]['fact_id']
+    fid = memory['payload']['statements'][0]['statement_id']
     app = FastAPI()
     app.include_router(router)
     app.state.agent_loop = SimpleNamespace(working_dir=str(tmp_path))
     with TestClient(app) as client:
-        response = client.get(f"/api/projects/p/knowledge/{memory['id']}/facts/{fid}")
+        response = client.get(f"/api/projects/p/knowledge/{memory['id']}/statements/{fid}")
         assert response.status_code == 200 and response.json()['versions'][0]['version'] == 1
-        assert client.get(f"/api/projects/p/knowledge/{memory['id']}/facts/missing").status_code == 404
+        assert client.get(f"/api/projects/p/knowledge/{memory['id']}/facts/{fid}").json() == response.json()
+        assert client.get(f"/api/projects/p/knowledge/{memory['id']}/statements/missing").status_code == 404
 
 
 def test_old_payload_defaults_are_read_compatibly_without_rewriting_versions(tmp_path):

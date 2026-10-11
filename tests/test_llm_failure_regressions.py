@@ -143,9 +143,10 @@ def test_structured_ask_answer_verbatim_quote_is_accepted():
     ('系统不再报\\"随身物：某某，属性：无\\"。', '系统不再报"随身物：某某，属性：无"。'),
     ('系统不再报\\\\"随身物：某某，属性：无\\\\"。', '系统不再报\\"随身物：某某，属性：无\\"。'),
     ("不写‘未知’。", "不写'未知'。"),
+    ('系统不再报“随身物：某某，属性：无”。', '系统不再报“随身物:某某，属性：无”。'),
 ])
 @pytest.mark.parametrize("kind", ["user_input", "user_answer"])
-def test_source_quote_accepts_only_quote_format_differences(source, quote, kind):
+def test_source_quote_accepts_equivalent_punctuation_differences(source, quote, kind):
     raw = package()
     raw["source_text"] = quote
     content = source if kind == "user_input" else json.dumps([{"answer": source}], ensure_ascii=False)
@@ -156,7 +157,6 @@ def test_source_quote_accepts_only_quote_format_differences(source, quote, kind)
 
 @pytest.mark.parametrize("quote", [
     '系统确认“随身物：某某，属性：无”。',
-    '系统不再报“随身物:某某，属性：无”。',
     '用户：系统不再报“随身物：某某，属性：无”。',
     '系统不再报 “随身物：某某，属性：无”。',
     '系统不再报“随身物：某某，属性：无”。进去后确认。',

@@ -35,8 +35,6 @@ class KnowledgeRetrieval:
             return False
         if p.get("authority") == "reviewer" and not p.get("human_confirmed") and role and role != "reviewer":
             return False
-        if p.get("category") == "agent" and role not in {"main", "main_agent"}:
-            return False
         if p.get("artifact_paths") and not set(p["artifact_paths"]) & set(paths):
             return False
         if p.get("content_types") and content_type not in p["content_types"]:
@@ -81,11 +79,114 @@ class KnowledgeRetrieval:
             raise ValueError("Unknown knowledge recall purpose")
         rows = [r for r in self.store.list(layers[purpose])
                 if (purpose != "task_insight" or self.applicable(r, role, paths, content_type))
-                and (r["layer"] != "memory" or any(f.get("status", "active") == "active" for f in r["payload"]["facts"]))]
+                and (r["layer"] != "memory" or any(f.get("status", "active") == "active" for f in r["payload"]["statements"]))]
         if not rows:
             return {"status": "empty", "items": [], "routes": {k: {"count": 0, "elapsed_ms": 0} for k in ("semantic", "keyword", "relation", "temporal")}}
         routes, timings = {}, {}
         start = time.perf_counter()
+        q = np.asarray((await self.embedding.encode([query]))[0], dtype=np.float32)
+        matches, index_cache = await self._vector_matches(rows, q, purpose)
+        semantic_scores = {rows[int(m.key)]["id"]: 1-float(m.distance) for m in matches if 1-float(m.distance) > 0}
+        routes["semantic"] = list(semantic_scores)
+        timings["semantic"] = (time.perf_counter()-start)*1000
+        start = time.perf_counter()
+        query_terms = Counter(tokenize(query))
+        docs = {r["id"]: Counter(tokenize(retrieval_text(r["layer"], r["payload"]))) for r in rows}
+        avg = sum(sum(d.values()) for d in docs.values()) / len(docs)
+        df = Counter(t for doc in docs.values() for t in doc)
+        scores = {}
+        for rid, doc in docs.items():
+            score = sum(math.log(1+(len(docs)-df[t]+.5)/(df[t]+.5)) *
+                        (doc[t]*2.5)/(doc[t]+1.5*(.25+.75*sum(doc.values())/max(avg, 1))) * min(tf, 2)
+                        for t, tf in query_terms.items() if doc[t])
+            if score > 0:
+                scores[rid] = score
+        routes["keyword"] = sorted(scores, key=scores.get, reverse=True)[:self.candidate_limit]
+        timings["keyword"] = (time.perf_counter()-start)*1000
+        start = time.perf_counter()
+        temporal = temporal or self.infer_temporal(query, paths)
+        initial_ids = set(routes["semantic"][:8] + routes["keyword"][:8])
+        initial_keys = [(r["id"], r["version"]) for r in rows if r["id"] in initial_ids]
+        graph = await asyncio.to_thread(self.store.graph_neighborhood, initial_keys, query, temporal,
+                                       depth=self.graph_depth, nodes=self.graph_nodes, candidates=self.candidate_limit)
+        adjacency, members, entity_nodes = self._statement_graph(graph)
+        seeds = {(rid, version, ""): ["seed"] for rid, version in initial_keys}
+        for key in initial_keys:
+            for node in members[key]:
+                seeds[node] = ["seed", self._node_label(node)]
+        for alias in graph["entities"]:
+            if alias["name"] and alias["name"] in query:
+                for node in sorted(entity_nodes[alias["entity_id"]])[:self.candidate_limit]:
+                    seeds[node] = [f"entity:{alias['name']}", self._node_label(node)]
+        record_keys = {(r["id"], r["version"]): r["id"] for r in rows}
+        relation_paths = self._walk_graph(seeds, adjacency, entity_nodes, graph["links"], record_keys)
+        routes["relation"] = sorted(relation_paths, key=lambda rid: (len(relation_paths[rid]), rid))[:self.candidate_limit]
+        timings["relation"] = (time.perf_counter()-start)*1000
+        start = time.perf_counter()
+        temporal = temporal or self.infer_temporal(query, paths)
+        time_hits = {}
+        temporal_paths = {}
+        if temporal:
+            dimension = temporal["dimension"]
+            lo = time_key(dimension, temporal["start"])
+            hi = time_key(dimension, temporal.get("end") or temporal["start"])
+            if hi < lo:
+                raise ValueError("Reversed query time range")
+            temporal_seeds = {}
+            for anchor in graph["times"]:
+                key = (anchor["id"], anchor["version"])
+                if anchor["dimension"] == dimension and anchor["start"] <= hi and anchor["end"] >= lo:
+                    node = (*key, anchor["statement_id"])
+                    if node[2] and node not in members[key]:
+                        continue
+                    temporal_seeds[node] = ["time_anchor", self._node_label(node)]
+                    if key in record_keys:
+                        time_hits[record_keys[key]] = {"dimension": dimension, "start": anchor["start"], "end": anchor["end"]}
+            # Evidence edges project timed Memory statements onto their derived Insight.
+            temporal_paths = self._walk_graph(temporal_seeds, adjacency, {}, [], record_keys, temporal=True)
+        routes["temporal"] = sorted(temporal_paths, key=lambda rid: (len(temporal_paths[rid]), -scores.get(rid, 0), rid))[:self.candidate_limit]
+        timings["temporal"] = (time.perf_counter()-start)*1000
+        rankings = [list(dict.fromkeys(routes[name])) for name in ("semantic", "keyword", "relation", "temporal")]
+        fused = reciprocal_rank_fusion(*rankings)
+        ranked = sorted(fused, key=lambda rid: (-fused[rid], rid))
+        if temporal and temporal.get("hard"):
+            ranked = [rid for rid in ranked if rid in time_hits]
+        by_id = {r["id"]: r for r in rows}
+        items = [{"record": by_id[rid], "score": fused[rid], "ranks": {name: routes[name].index(rid)+1 for name in routes if rid in routes[name]},
+                  "paths": relation_paths.get(rid, []), "temporal": time_hits.get(rid),
+                  "temporal_path": temporal_paths.get(rid, []), "similarity": semantic_scores.get(rid)}
+                 for rid in ranked[:limit]]
+        return {"status": "ok" if items else "empty", "items": items, "index_cache": index_cache,
+                "graph_loaded_nodes": graph.get('loaded_nodes', 0),
+                "routes": {name: {"count": len(routes[name]), "elapsed_ms": round(timings[name], 3)} for name in routes}}
+
+    async def vector_candidates(self, vector, *, limit=20, exclude=()):
+        """Pure cosine ranking for deduplication/graph candidates, never RRF scores."""
+        started = time.perf_counter()
+        excluded = set(exclude)
+        async def search():
+            rows = [r for r in self.store.list(("memory",)) if r["id"] not in excluded
+                    and any(f["status"] == "active" for f in r["payload"]["statements"])]
+            if not rows or limit <= 0:
+                return []
+            q = np.asarray(vector, dtype=np.float32)
+            matches, _ = await self._vector_matches(rows, q, "memory_vector", limit)
+            items = []
+            for match in matches:
+                row = rows[int(match.key)]
+                v = np.frombuffer(row["vector"], dtype=np.float32)
+                # Exact cosine for the strict merge gate, not approximate search distance.
+                similarity = float(np.dot(q.astype(np.float64), v.astype(np.float64)) /
+                                   (np.linalg.norm(q.astype(np.float64))*np.linalg.norm(v.astype(np.float64))))
+                items.append({"record": row, "similarity": similarity})
+            return sorted(items, key=lambda i: (-i["similarity"], i["record"]["id"]))[:limit]
+        items = await asyncio.wait_for(search(), self.timeout)
+        self.store.audit({"purpose": "memory_vector", "elapsed_ms": round((time.perf_counter()-started)*1000, 3),
+                          "candidates": [{"id": i["record"]["id"], "version": i["record"]["version"],
+                                          "similarity": i["similarity"]} for i in items]})
+        return items
+
+    async def _vector_matches(self, rows, q, purpose, limit=None):
         if any(r["model_id"] != self.model_id for r in rows):
             raise ValueError("Embedding model changed; rebuild knowledge vectors before recall")
         signature = tuple((r["id"], r["version"]) for r in rows)
@@ -113,120 +214,50 @@ class KnowledgeRetrieval:
                 return built, metadata
             index, index_cache = await asyncio.to_thread(build_index)
             self._index, self._signature, self._index_rows = index, signature, rows
-        q = np.asarray((await self.embedding.encode([query]))[0], dtype=np.float32)
         if q.shape != (rows[0]["dimensions"],) or not np.isfinite(q).all() or not np.linalg.norm(q):
             raise ValueError("Invalid query embedding")
         # Keep this request's index: concurrent background matching uses another pool.
-        matches = await asyncio.to_thread(index.search, q, min(self.candidate_limit, len(rows)))
-        semantic_scores = {rows[int(m.key)]["id"]: 1-float(m.distance) for m in matches if 1-float(m.distance) > 0}
-        routes["semantic"] = list(semantic_scores)
-        timings["semantic"] = (time.perf_counter()-start)*1000
-        start = time.perf_counter()
-        query_terms = Counter(tokenize(query))
-        docs = {r["id"]: Counter(tokenize(retrieval_text(r["layer"], r["payload"]))) for r in rows}
-        avg = sum(sum(d.values()) for d in docs.values()) / len(docs)
-        df = Counter(t for doc in docs.values() for t in doc)
-        scores = {}
-        for rid, doc in docs.items():
-            score = sum(math.log(1+(len(docs)-df[t]+.5)/(df[t]+.5)) *
-                        (doc[t]*2.5)/(doc[t]+1.5*(.25+.75*sum(doc.values())/max(avg, 1))) * min(tf, 2)
-                        for t, tf in query_terms.items() if doc[t])
-            if score > 0:
-                scores[rid] = score
-        routes["keyword"] = sorted(scores, key=scores.get, reverse=True)[:self.candidate_limit]
-        timings["keyword"] = (time.perf_counter()-start)*1000
-        start = time.perf_counter()
-        temporal = temporal or self.infer_temporal(query, paths)
-        initial_ids = set(routes["semantic"][:8] + routes["keyword"][:8])
-        initial_keys = [(r["id"], r["version"]) for r in rows if r["id"] in initial_ids]
-        graph = await asyncio.to_thread(self.store.graph_neighborhood, initial_keys, query, temporal,
-                                       depth=self.graph_depth, nodes=self.graph_nodes, candidates=self.candidate_limit)
-        adjacency, members, entity_nodes = self._fact_graph(graph)
-        seeds = {(rid, version, ""): ["seed"] for rid, version in initial_keys}
-        for key in initial_keys:
-            for node in members[key]:
-                seeds[node] = ["seed", self._node_label(node)]
-        for alias in graph["entities"]:
-            if alias["name"] and alias["name"] in query:
-                for node in sorted(entity_nodes[alias["entity_id"]])[:self.candidate_limit]:
-                    seeds[node] = [f"entity:{alias['name']}", self._node_label(node)]
-        record_keys = {(r["id"], r["version"]): r["id"] for r in rows}
-        relation_paths = self._walk_graph(seeds, adjacency, entity_nodes, graph["links"], record_keys)
-        routes["relation"] = sorted(relation_paths, key=lambda rid: (len(relation_paths[rid]), rid))[:self.candidate_limit]
-        timings["relation"] = (time.perf_counter()-start)*1000
-        start = time.perf_counter()
-        temporal = temporal or self.infer_temporal(query, paths)
-        time_hits = {}
-        temporal_paths = {}
-        if temporal:
-            dimension = temporal["dimension"]
-            lo = time_key(dimension, temporal["start"])
-            hi = time_key(dimension, temporal.get("end") or temporal["start"])
-            if hi < lo:
-                raise ValueError("Reversed query time range")
-            temporal_seeds = {}
-            for anchor in graph["times"]:
-                key = (anchor["id"], anchor["version"])
-                if anchor["dimension"] == dimension and anchor["start"] <= hi and anchor["end"] >= lo:
-                    node = (*key, anchor["fact_id"])
-                    if node[2] and node not in members[key]:
-                        continue
-                    temporal_seeds[node] = ["time_anchor", self._node_label(node)]
-                    if key in record_keys:
-                        time_hits[record_keys[key]] = {"dimension": dimension, "start": anchor["start"], "end": anchor["end"]}
-            # Evidence edges project timed Memory facts onto their derived Insight.
-            temporal_paths = self._walk_graph(temporal_seeds, adjacency, {}, [], record_keys, temporal=True)
-        routes["temporal"] = sorted(temporal_paths, key=lambda rid: (len(temporal_paths[rid]), -scores.get(rid, 0), rid))[:self.candidate_limit]
-        timings["temporal"] = (time.perf_counter()-start)*1000
-        rankings = [list(dict.fromkeys(routes[name])) for name in ("semantic", "keyword", "relation", "temporal")]
-        fused = reciprocal_rank_fusion(*rankings)
-        ranked = sorted(fused, key=lambda rid: (-fused[rid], rid))
-        if temporal and temporal.get("hard"):
-            ranked = [rid for rid in ranked if rid in time_hits]
-        by_id = {r["id"]: r for r in rows}
-        items = [{"record": by_id[rid], "score": fused[rid], "ranks": {name: routes[name].index(rid)+1 for name in routes if rid in routes[name]},
-                  "paths": relation_paths.get(rid, []), "temporal": time_hits.get(rid),
-                  "temporal_path": temporal_paths.get(rid, []), "similarity": semantic_scores.get(rid)}
-                 for rid in ranked[:limit]]
-        return {"status": "ok" if items else "empty", "items": items, "index_cache": index_cache,
-                "graph_loaded_nodes": graph.get('loaded_nodes', 0),
-                "routes": {name: {"count": len(routes[name]), "elapsed_ms": round(timings[name], 3)} for name in routes}}
+        matches = await asyncio.to_thread(index.search, q, min(limit or self.candidate_limit, len(rows)))
+        return matches, index_cache
 
     @staticmethod
     def _node_label(node):
         return f"{node[0]}@{node[1]}" + (f"#{node[2]}" if node[2] else "")
 
     @staticmethod
-    def _fact_graph(graph):
-        """Keep distinct facts distinct, including causal edges within one package."""
+    def _statement_graph(graph):
+        """Keep distinct statements distinct, including causal edges within one package."""
         adjacency, members, entity_nodes = defaultdict(list), defaultdict(set), defaultdict(set)
-        inactive = {(f["id"], f["version"], f["fact_id"]) for f in graph.get("facts", []) if f.get("status", "active") != "active"}
-        for fact in graph.get("facts", []):
-            node = (fact["id"], fact["version"], fact["fact_id"])
+        inactive = {(f["id"], f["version"], f["statement_id"]) for f in graph.get("statements", []) if f.get("status", "active") != "active"}
+        for fact in graph.get("statements", []):
+            node = (fact["id"], fact["version"], fact["statement_id"])
             if node not in inactive:
                 members[node[:2]].add(node)
         for link in graph["links"]:
-            node = (link["id"], link["version"], link["fact_id"])
+            node = (link["id"], link["version"], link["statement_id"])
             if node not in inactive:
                 entity_nodes[link["entity_id"]].add(node)
                 members[node[:2]].add(node)
         for anchor in graph["times"]:
-            node = (anchor["id"], anchor["version"], anchor["fact_id"])
+            node = (anchor["id"], anchor["version"], anchor["statement_id"])
             if node[2] and node not in inactive:
                 members[node[:2]].add(node)
         for edge in graph["edges"]:
             properties = edge["properties"]
             if properties.get("confidence", 1) < .5 or properties.get("status") in {"refuted", "withdrawn"}:
                 continue
-            a = (edge["owner_id"], edge["owner_version"], properties.get("source_fact_id", ""))
-            b = (edge["target_id"], edge["target_version"], properties.get("target_fact_id", ""))
+            a = (edge["owner_id"], edge["owner_version"], properties.get("source_statement_id", ""))
+            b = (edge["target_id"], edge["target_version"], properties.get("target_statement_id", ""))
             if a in inactive or b in inactive:
                 continue
             label = f"{edge['kind']}:{properties['predicate']}"
             if a[2] or b[2]:
                 label += f"[{a[2]}->{b[2]}]"
             adjacency[a].append((b, label))
-            adjacency[b].append((a, "reverse:"+label))
+            undirected = properties.get("direction") == "undirected" or (
+                edge["kind"] == "semantic" and properties["predicate"] == "related") or (
+                edge["kind"] == "temporal" and properties["predicate"] in {"same_section", "near_time"})
+            adjacency[b].append((a, label if undirected else "reverse:"+label))
             for node in (a, b):
                 if node[2]:
                     members[node[:2]].add(node)
@@ -235,7 +266,7 @@ class KnowledgeRetrieval:
     def _walk_graph(self, seeds, adjacency, entity_nodes, links, record_keys, *, temporal=False):
         node_entities = defaultdict(set)
         for link in links:
-            node = (link["id"], link["version"], link["fact_id"])
+            node = (link["id"], link["version"], link["statement_id"])
             if node in entity_nodes[link["entity_id"]]:
                 node_entities[node].add(link["entity_id"])
         # Equal-hop entity hits precede generic semantic seeds; each record gets one shortest path.
@@ -253,7 +284,7 @@ class KnowledgeRetrieval:
                 continue
             neighbors = list(adjacency[node])
             if node[2]:
-                # A package-level relation applies to this fact too; do not jump to its other facts.
+                # A package-level relation applies to this fact too; do not jump to its other statements.
                 neighbors.extend(adjacency[(*node[:2], "")])
             if temporal:
                 neighbors = [(other, label) for other, label in neighbors if label.removeprefix("reverse:").startswith(

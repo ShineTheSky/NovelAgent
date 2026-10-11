@@ -16,7 +16,7 @@ from novelagent.history.sources import root_history_ids
 from novelagent.memory.consolidation import KnowledgePipeline
 from novelagent.memory.knowledge_store import KnowledgeStore
 from novelagent.memory.offline_migration import _history, _read_db, offline_snapshot, source_manifest
-from novelagent.memory.models import retrieval_text
+from novelagent.memory.models import retrieval_text, knowledge_payload
 
 
 class ReplayRejected(ValueError):
@@ -102,10 +102,11 @@ def _trace_bundle(database, project_id, trace_id):
 
 
 def _package_source_ids(package):
+    package = knowledge_payload(package)
     return list(dict.fromkeys([
-        *(event_id for fact in package.get("facts", []) for event_id in fact.get("source_event_ids", [])),
+        *(event_id for fact in package.get("statements", []) for event_id in fact.get("source_event_ids", [])),
         *(event_id for relation in package.get("relations", []) for event_id in relation.get("source_event_ids", [])),
-        *(event_id for change in package.get("fact_changes", []) for event_id in change.get("source_event_ids", [])),
+        *(event_id for change in package.get("statement_changes", []) for event_id in change.get("source_event_ids", [])),
         *(fragment["source_event_id"] for fragment in package.get("fragments", []) if fragment.get("source_event_id")),
     ]))
 
@@ -132,12 +133,12 @@ def _map_history_source_ids(project, packages, request_text):
 
 
 def _remap_package_sources(package, mapping):
-    package = copy.deepcopy(package)
-    for fact in package.get("facts", []):
+    package = knowledge_payload(copy.deepcopy(package))
+    for fact in package.get("statements", []):
         fact["source_event_ids"] = [mapping.get(event_id, event_id) for event_id in fact.get("source_event_ids", [])]
     for relation in package.get("relations", []):
         relation["source_event_ids"] = [mapping.get(event_id, event_id) for event_id in relation.get("source_event_ids", [])]
-    for change in package.get("fact_changes", []):
+    for change in package.get("statement_changes", []):
         change["source_event_ids"] = [mapping.get(event_id, event_id) for event_id in change.get("source_event_ids", [])]
     for fragment in package.get("fragments", []):
         if fragment.get("source_event_id"):
@@ -237,7 +238,7 @@ def replay_completed_retain_trace(project, trace_database, trace_id):
                 "source_event_ids": sorted(cited), "source_event_mapping": [
                     {"trace_output_id": old, "history_event_id": new}
                     for old, new in sorted(source_mapping.items()) if old in _package_source_ids(raw)],
-                "fact_count": len(package["facts"]),
+                "fact_count": len(package["statements"]),
                 "payload_sha256": _json_hash(package)})
         store = KnowledgeStore(snapshot)
         saved = store.save_memories(entries)
@@ -246,8 +247,8 @@ def replay_completed_retain_trace(project, trace_database, trace_id):
             if (not loaded or loaded["layer"] != "memory"
                     or loaded["payload"]["title"] != package["title"]
                     or loaded["payload"]["direction"] != package["direction"]
-                    or [(f["claim"], f["domain"], f["source_event_ids"], f["status"]) for f in loaded["payload"]["facts"]]
-                    != [(f["claim"], f["domain"], f["source_event_ids"], f["status"]) for f in package["facts"]]):
+                    or [(f["claim"], f["classifications"], f["source_event_ids"], f["status"]) for f in loaded["payload"]["statements"]]
+                    != [(f["claim"], f["classifications"], f["source_event_ids"], f["status"]) for f in package["statements"]]):
                 raise ReplayRejected("memory_readback_mismatch", {"package_index": index})
             if {e["event_id"] for e in loaded["evidence"]} != {e["event_id"] for e in entry["evidence"]}:
                 raise ReplayRejected("memory_evidence_readback_mismatch", {"package_index": index})

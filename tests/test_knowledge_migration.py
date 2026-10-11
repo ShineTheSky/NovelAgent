@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from tests.conftest import quoted_memory_response
 
 from novelagent.history.store import DocumentHistoryStore
 from novelagent.history.analyzer import HistoryAnalyzer
@@ -55,8 +56,8 @@ class LLM:
         if kwargs['tag'].endswith('retain'):
             package = MemoryPackage.model_validate({'title': '承接', 'direction': '承接',
                 'background': '原有段落', 'requirement': '保持自然承接',
-                'facts': [{'domain': 'writing', 'claim': '保持自然承接', 'source_event_ids': [self.event_id]}]}).model_dump()
-            yield SimpleNamespace(type='text_delta', content=json.dumps({'memories': [package]}))
+                'statements': [{'classifications': [{'domain': 'writing', 'categories': ['polishing']}], 'claim': '保持自然承接', 'source_event_ids': [self.event_id]}]}).model_dump()
+            yield SimpleNamespace(type='text_delta', content=json.dumps(quoted_memory_response({'memories': [package]}, kwargs['messages'])))
         elif self.fail_learning:
             yield SimpleNamespace(type='error', error='暂时失败')
         else:
